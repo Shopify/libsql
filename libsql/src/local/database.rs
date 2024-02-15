@@ -63,6 +63,7 @@ impl Database {
             false,
             encryption_key,
             periodic_sync,
+            None,
         )
         .await
     }
@@ -78,6 +79,7 @@ impl Database {
         read_your_writes: bool,
         encryption_key: Option<bytes::Bytes>,
         periodic_sync: Option<std::time::Duration>,
+        namespace: Option<String>,
     ) -> Result<Database> {
         use std::path::PathBuf;
 
@@ -91,6 +93,7 @@ impl Database {
             endpoint.as_str().try_into().unwrap(),
             auth_token,
             version.as_deref(),
+            namespace,
         )
         .unwrap();
         let path = PathBuf::from(db_path);
@@ -159,6 +162,7 @@ impl Database {
             endpoint.as_str().try_into().unwrap(),
             auth_token,
             version.as_deref(),
+            None,
         )
         .unwrap();
 

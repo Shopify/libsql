@@ -50,7 +50,8 @@ impl Builder<()> {
                     },
                     encryption_key: None,
                     read_your_writes: false,
-                    periodic_sync: None
+                    periodic_sync: None,
+                    namespace: None,
                 },
             }
         }
@@ -153,6 +154,7 @@ cfg_replication! {
         encryption_key: Option<bytes::Bytes>,
         read_your_writes: bool,
         periodic_sync: Option<std::time::Duration>,
+        namespace: Option<String>,
     }
 
     /// Local replica configuration type in [`Builder`].
@@ -206,6 +208,11 @@ cfg_replication! {
             self
         }
 
+        pub fn set_namespace(mut self, namespace: &str) -> Builder<RemoteReplica> {
+            self.inner.namespace = Some(namespace.into());
+            self
+        }
+
         /// Build the remote embedded replica database.
         pub async fn build(self) -> Result<Database> {
             let RemoteReplica {
@@ -219,7 +226,8 @@ cfg_replication! {
                     },
                 encryption_key,
                 read_your_writes,
-                periodic_sync
+                periodic_sync,
+                namespace,
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -245,7 +253,8 @@ cfg_replication! {
                 version,
                 read_your_writes,
                 encryption_key.clone(),
-                periodic_sync
+                periodic_sync,
+                namespace,
             )
             .await?;
 

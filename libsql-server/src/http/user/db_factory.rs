@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::extract::{FromRequestParts, Path};
 use hyper::http::request::Parts;
 use hyper::HeaderMap;
+use libsql_replication::rpc::replication::NAMESPACE_METADATA_KEY;
 
 use crate::auth::Authenticated;
 use crate::connection::MakeConnection;
@@ -48,6 +49,15 @@ pub fn namespace_from_headers(
 ) -> crate::Result<NamespaceName> {
     if disable_namespaces {
         return Ok(NamespaceName::default());
+    }
+
+    let namespace_metadata_key = headers
+        .get(NAMESPACE_METADATA_KEY)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_owned());
+
+    if let Some(ns) = namespace_metadata_key {
+        return NamespaceName::from_string(ns);
     }
 
     let host = headers

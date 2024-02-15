@@ -304,7 +304,8 @@ cfg_replication! {
                 version,
                 read_your_writes,
                 encryption_key.clone(),
-                periodic_sync
+                periodic_sync,
+                None,
             ).await?;
 
             Ok(Database {
