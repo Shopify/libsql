@@ -71,18 +71,24 @@ pub(super) async fn handle_initial_hello(
     jwt: Option<String>,
     namespace: NamespaceName,
 ) -> Result<Session> {
+    let ns_store = &server.namespaces;
+    let context = Ok(UserAuthContext::bearer_opt(jwt));
+
     // todo dupe #auth
-    let namespace_jwt_key = server
-        .namespaces
+    // DUPL1 START
+    let decoding_key = ns_store
         .with(namespace.clone(), |ns| ns.jwt_key())
         .await??;
 
-    let auth = namespace_jwt_key
+    let auth_strat = decoding_key
         .map(Jwt::new)
         .map(Auth::new)
-        .unwrap_or(server.user_auth_strategy.clone())
-        .authenticate(Ok(UserAuthContext::bearer_opt(jwt)))
+        .unwrap_or(server.user_auth_strategy.clone());
+
+    let auth = auth_strat
+        .authenticate(context)
         .map_err(|err| anyhow!(ResponseError::Auth { source: err }))?;
+    // DUPL1 END (error mapping differs)
 
     Ok(Session {
         auth,
@@ -105,19 +111,25 @@ pub(super) async fn handle_repeated_hello(
             min_version: Version::Hrana2,
         })
     }
+    let ns_store = &server.namespaces;
+    let context = Ok(UserAuthContext::bearer_opt(jwt));
+
     // todo dupe #auth
-    let namespace_jwt_key = server
-        .namespaces
+    // DUPL1 START
+    let decoding_key = ns_store
         .with(namespace.clone(), |ns| ns.jwt_key())
         .await??;
 
-    session.auth = namespace_jwt_key
+    let auth_strat = decoding_key
         .map(Jwt::new)
         .map(Auth::new)
-        .unwrap_or_else(|| server.user_auth_strategy.clone())
-        .authenticate(Ok(UserAuthContext::bearer_opt(jwt)))
-        .map_err(|err| anyhow!(ResponseError::Auth { source: err }))?;
+        .unwrap_or_else(|| server.user_auth_strategy.clone());
 
+    let auth = auth_strat
+        .authenticate(context)
+        .map_err(|err| anyhow!(ResponseError::Auth { source: err }))?;
+    // DUPL1 END
+    session.auth = auth;
     Ok(())
 }
 

@@ -10,6 +10,7 @@ use tower::ServiceBuilder;
 use tower_http::trace::DefaultOnResponse;
 use tracing::Span;
 
+use crate::auth::{Auth, Disabled};
 use crate::config::TlsConfig;
 use crate::metrics::CLIENT_VERSION;
 use crate::namespace::{NamespaceName, NamespaceStore};
@@ -36,7 +37,7 @@ pub async fn run_rpc_server<A: crate::net::Accept>(
     let logger_service = ReplicationLogService::new(
         namespaces.clone(),
         idle_shutdown_layer.clone(),
-        None,
+        Auth::new(Disabled::new()),
         disable_namespaces,
         false,
     );

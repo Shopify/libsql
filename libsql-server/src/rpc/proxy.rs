@@ -16,10 +16,11 @@ use libsql_replication::rpc::proxy::{
 use libsql_replication::rpc::replication::NAMESPACE_DOESNT_EXIST;
 use rusqlite::types::ValueRef;
 use tokio::time::Duration;
+use tonic::Status;
 use uuid::Uuid;
 
 use crate::auth::parsers::parse_grpc_auth_header;
-use crate::auth::{Auth, Authenticated, Jwt};
+use crate::auth::{Auth, Authenticated, Jwt, ProxyGrpc};
 use crate::connection::{Connection as _, RequestContext};
 use crate::database::Connection;
 use crate::namespace::NamespaceStore;
@@ -312,34 +313,28 @@ impl ProxyService {
         req: &mut tonic::Request<T>,
     ) -> Result<RequestContext, tonic::Status> {
         let namespace = super::extract_namespace(self.disable_namespaces, req)?;
-        // todo dupe #auth
-        let namespace_jwt_key = self
-            .namespaces
-            .with(namespace.clone(), |ns| ns.jwt_key())
-            .await;
+        let ns_store = &self.namespaces;
 
-        let auth = match namespace_jwt_key {
-            Ok(Ok(Some(key))) => Some(Auth::new(Jwt::new(key))),
-            Ok(Ok(None)) => self.user_auth_strategy.clone(),
-            Err(e) => match e.as_ref() {
-                crate::error::Error::NamespaceDoesntExist(_) => None,
-                _ => Err(tonic::Status::internal(format!(
-                    "Error fetching jwt key for a namespace: {}",
-                    e
-                )))?,
-            },
-            Ok(Err(e)) => Err(tonic::Status::internal(format!(
-                "Error fetching jwt key for a namespace: {}",
+        // todo dupe #auth
+        let jwt_result = ns_store.with(namespace.clone(), |ns| ns.jwt_key()).await;
+
+        let key = match jwt_result.and_then(|s| s) {
+            Ok(k) => k,
+            Err(crate::error::Error::NamespaceDoesntExist(_)) => None,
+            Err(e) => Err(Status::internal(format!(
+                "Can't fetch jwt key for a namespace: {}",
                 e
             )))?,
         };
 
-        let auth = if let Some(auth) = auth {
-            let context = parse_grpc_auth_header(req.metadata());
-            auth.authenticate(context)?
-        } else {
-            Authenticated::from_proxy_grpc_request(req)?
-        };
+        let auth_strat = None
+            .or_else(|| key.map(|k| Auth::new(Jwt::new(k))))
+            .or_else(|| self.user_auth_strategy.clone())
+            .or_else(|| Some(Auth::new(ProxyGrpc::new(req.metadata().clone()))))
+            .unwrap();
+
+        let context = parse_grpc_auth_header(req.metadata());
+        let auth = auth_strat.authenticate(context)?;
 
         Ok(RequestContext::new(
             auth,

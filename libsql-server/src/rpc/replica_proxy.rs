@@ -36,29 +36,29 @@ impl ReplicaProxyService {
 
     async fn do_auth<T>(&self, req: &mut Request<T>) -> Result<(), Status> {
         let namespace = super::extract_namespace(self.disable_namespaces, req)?;
+        let ns_store = &self.namespaces;
 
         // todo dupe #auth
-        let jwt_result = self
-            .namespaces
-            .with(namespace.clone(), |ns| ns.jwt_key())
-            .await;
+        let jwt_result = ns_store.with(namespace.clone(), |ns| ns.jwt_key()).await;
 
-        let namespace_jwt_key = jwt_result.and_then(|s| s);
-
-        let auth_strategy = match namespace_jwt_key {
-            Ok(Some(key)) => Ok(Auth::new(Jwt::new(key))),
-            Ok(None) | Err(crate::error::Error::NamespaceDoesntExist(_)) => {
-                Ok(self.user_auth_strategy.clone())
-            }
+        let decoding_key = match jwt_result.and_then(|s| s) {
+            Ok(k) => k,
+            Err(crate::error::Error::NamespaceDoesntExist(_)) => None,
             Err(e) => Err(Status::internal(format!(
                 "Can't fetch jwt key for a namespace: {}",
                 e
-            ))),
-        }?;
+            )))?,
+        };
 
-        let auth_context = parse_grpc_auth_header(req.metadata());
-        auth_strategy
-            .authenticate(auth_context)?
+        let auth_strat = decoding_key
+            .map(Jwt::new)
+            .map(Auth::new)
+            .unwrap_or_else(|| self.user_auth_strategy.clone());
+
+        let context = || parse_grpc_auth_header(req.metadata());
+
+        auth_strat
+            .authenticate(context())?
             .upgrade_grpc_request(req);
         return Ok(());
     }

@@ -510,7 +510,7 @@ where
                 let replication_svc = ReplicationLogService::new(
                     namespace_store.clone(),
                     idle_shutdown_kicker.clone(),
-                    Some(user_auth_strategy.clone()),
+                    user_auth_strategy.clone(),
                     self.disable_namespaces,
                     true,
                 );

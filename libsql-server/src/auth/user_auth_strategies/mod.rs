@@ -1,10 +1,12 @@
 pub mod disabled;
 pub mod http_basic;
 pub mod jwt;
+pub mod proxy_grpc;
 
 pub use disabled::Disabled;
 pub use http_basic::HttpBasic;
 pub use jwt::Jwt;
+pub use proxy_grpc::ProxyGrpc;
 
 use super::{AuthError, Authenticated};
 
@@ -48,6 +50,13 @@ impl UserAuthContext {
         UserAuthContext {
             scheme: Some("Bearer".into()),
             token: token,
+        }
+    }
+
+    pub fn proxy(token: &str) -> UserAuthContext {
+        UserAuthContext {
+            scheme: Some("Proxy".into()),
+            token: Some(token.into()),
         }
     }
 

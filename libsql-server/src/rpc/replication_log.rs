@@ -33,7 +33,7 @@ use super::extract_namespace;
 pub struct ReplicationLogService {
     namespaces: NamespaceStore,
     idle_shutdown_layer: Option<IdleShutdownKicker>,
-    user_auth_strategy: Option<Auth>,
+    user_auth_strategy: Auth,
     disable_namespaces: bool,
     session_token: Bytes,
     collect_stats: bool,
@@ -49,7 +49,7 @@ impl ReplicationLogService {
     pub fn new(
         namespaces: NamespaceStore,
         idle_shutdown_layer: Option<IdleShutdownKicker>,
-        user_auth_strategy: Option<Auth>,
+        user_auth_strategy: Auth,
         disable_namespaces: bool,
         collect_stats: bool,
     ) -> Self {
@@ -71,32 +71,25 @@ impl ReplicationLogService {
         req: &tonic::Request<T>,
         namespace: NamespaceName,
     ) -> Result<(), Status> {
-        // todo dupe #auth
-        let namespace_jwt_key = self
-            .namespaces
-            .with(namespace.clone(), |ns| ns.jwt_key())
-            .await;
+        let ns_store = &self.namespaces;
 
-        let auth = match namespace_jwt_key {
-            Ok(Ok(Some(key))) => Some(Auth::new(Jwt::new(key))),
-            Ok(Ok(None)) => self.user_auth_strategy.clone(),
-            Err(e) => match e.as_ref() {
-                crate::error::Error::NamespaceDoesntExist(_) => self.user_auth_strategy.clone(),
-                _ => Err(Status::internal(format!(
-                    "Error fetching jwt key for a namespace: {}",
-                    e
-                )))?,
-            },
-            Ok(Err(e)) => Err(Status::internal(format!(
-                "Error fetching jwt key for a namespace: {}",
-                e
-            )))?,
+        // todo dupe #auth
+        let jwt_result = ns_store.with(namespace.clone(), |ns| ns.jwt_key()).await;
+
+        let decoding_key = match jwt_result.and_then(|s| s) {
+            Ok(k) => k,
+            Err(crate::error::Error::NamespaceDoesntExist(_)) => None,
+            Err(e) => return Err(Status::internal(format!("Can't fetch jwt key for a namespace: {}", e))),
         };
 
-        if let Some(auth) = auth {
-            let user_credential = parse_grpc_auth_header(req.metadata());
-            auth.authenticate(user_credential)?;
-        }
+        let auth_strat = decoding_key
+            .map(Jwt::new)
+            .map(Auth::new)
+            .unwrap_or_else(|| self.user_auth_strategy.clone());
+
+        let context = parse_grpc_auth_header(req.metadata());
+
+        auth_strat.authenticate(context)?;
 
         Ok(())
     }

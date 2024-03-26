@@ -9,18 +9,14 @@ async fn main() {
     // The local database path where the data will be stored.
     let db_path = std::env::var("LIBSQL_DB_PATH")
         .map_err(|_| {
-            eprintln!(
-                "Please set the LIBSQL_DB_PATH environment variable to set to local database path."
-            )
+            eprintln!("Please set the LIBSQL_DB_PATH environment variable to local database path.")
         })
         .unwrap();
 
     // The remote sync URL to use.
     let sync_url = std::env::var("LIBSQL_SYNC_URL")
         .map_err(|_| {
-            eprintln!(
-                "Please set the LIBSQL_SYNC_URL environment variable to set to remote sync URL."
-            )
+            eprintln!("Please set the LIBSQL_SYNC_URL environment variable to remote sync URL.")
         })
         .unwrap();
 

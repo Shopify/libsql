@@ -24,21 +24,6 @@ pub struct LegacyAuth {
 }
 
 impl Authenticated {
-    pub fn from_proxy_grpc_request<T>(req: &tonic::Request<T>) -> Result<Self, Status> {
-        let auth = match req
-            .metadata()
-            .get(GRPC_PROXY_AUTH_HEADER)
-            .map(|v| v.to_str())
-            .transpose()
-            .map_err(|_| Status::invalid_argument("missing authorization header"))?
-        {
-            Some(s) => serde_json::from_str::<Authenticated>(s).unwrap(),
-            None => return Err(Status::invalid_argument("x-proxy-authorization not set")),
-        };
-
-        Ok(auth)
-    }
-
     pub fn upgrade_grpc_request<T>(&self, req: &mut tonic::Request<T>) {
         let key = tonic::metadata::AsciiMetadataKey::from_static(GRPC_PROXY_AUTH_HEADER);
 

@@ -24,8 +24,10 @@ pub enum AuthError {
     JwtImmature,
     #[error("Auth string does not conform to '<scheme> <token>' form")]
     AuthStringMalformed,
-    #[error("Expected authorization header but none given")]
+    #[error("Expected x-authorization header but none given")]
     AuthHeaderNotFound,
+    #[error("Expected x-proxy-authorization header but none given")]
+    AuthProxyHeaderNotFound,
     #[error("Non-ASCII auth header")]
     AuthHeaderNonAscii,
     #[error("Authentication failed")]
@@ -47,6 +49,7 @@ impl AuthError {
             Self::JwtImmature => "AUTH_JWT_IMMATURE",
             Self::AuthStringMalformed => "AUTH_HEADER_MALFORMED",
             Self::AuthHeaderNotFound => "AUTH_HEADER_NOT_FOUND",
+            Self::AuthProxyHeaderNotFound => "AUTH_PROXY_HEADER_NOT_FOUND",
             Self::AuthHeaderNonAscii => "AUTH_HEADER_MALFORMED",
             Self::Other => "AUTH_FAILED",
         }

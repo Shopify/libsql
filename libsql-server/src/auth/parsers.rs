@@ -91,7 +91,7 @@ mod tests {
         let result = parse_grpc_auth_header(&map);
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Expected authorization header but none given"
+            "Expected x-authorization header but none given"
         );
     }
 
