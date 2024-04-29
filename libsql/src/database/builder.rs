@@ -56,12 +56,12 @@ impl Builder<()> {
                         auth_token,
                         connector: None,
                         version: None,
+                        http_request_callback: None,
+                        namespace: None
                     },
                     encryption_config: None,
                     read_your_writes: true,
                     sync_interval: None,
-                    http_request_callback: None,
-                    namespace: None
                 },
             }
         }
@@ -74,7 +74,7 @@ impl Builder<()> {
                     flags: crate::OpenFlags::default(),
                     remote: None,
                     encryption_config: None,
-                    http_request_callback: None
+                    http_request_callback: None,
                 },
             }
         }
@@ -89,6 +89,8 @@ impl Builder<()> {
                     auth_token,
                     connector: None,
                     version: None,
+                    http_request_callback: None,
+                    namespace: None,
                 },
             }
         }
@@ -102,6 +104,8 @@ cfg_replication_or_remote! {
         auth_token: String,
         connector: Option<crate::util::ConnectorService>,
         version: Option<String>,
+        http_request_callback: None,
+        namespace: None,
     }
 }
 
@@ -166,8 +170,6 @@ cfg_replication! {
         encryption_config: Option<EncryptionConfig>,
         read_your_writes: bool,
         sync_interval: Option<std::time::Duration>,
-        http_request_callback: Option<crate::util::HttpRequestCallback>,
-        namespace: Option<String>,
     }
 
     /// Local replica configuration type in [`Builder`].
@@ -252,12 +254,12 @@ cfg_replication! {
                         auth_token,
                         connector,
                         version,
+                        http_request_callback,
+                        namespace
                     },
                 encryption_config,
                 read_your_writes,
                 sync_interval,
-                http_request_callback,
-                namespace
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -318,7 +320,7 @@ cfg_replication! {
                 flags,
                 remote,
                 encryption_config,
-                http_request_callback
+                http_request_callback, // TODO: ??? what happens to this?
             } = self.inner;
 
             let path = path.to_str().ok_or(crate::Error::InvalidUTF8Path)?.to_owned();
@@ -328,6 +330,8 @@ cfg_replication! {
                 auth_token,
                 connector,
                 version,
+                http_request_callback,
+                namespace
             }) = remote
             {
                 let connector = if let Some(connector) = connector {
@@ -385,6 +389,22 @@ cfg_remote! {
             self
         }
 
+        pub fn http_request_callback<F>(mut self, f: F) -> Builder<RemoteReplica>
+        where
+            F: Fn(&mut http::Request<()>) + Send + Sync + 'static
+        {
+            self.inner.http_request_callback = Some(std::sync::Arc::new(f));
+            self
+
+        }
+
+        /// Set the namespace that will be communicated to remote replica in the http header.
+        pub fn namespace(mut self, namespace: impl Into<String>) -> Builder<RemoteReplica>
+        {
+            self.inner.namespace = Some(namespace.into());
+            self
+        }
+
         /// Build the remote database client.
         pub async fn build(self) -> Result<Database> {
             let Remote {
@@ -392,6 +412,8 @@ cfg_remote! {
                 auth_token,
                 connector,
                 version,
+                http_request_callback,
+                namespace,
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
