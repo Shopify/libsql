@@ -31,6 +31,7 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::auth::parse_jwt_key;
+use crate::auth::user_auth_strategies::jwt::DecodingKeyContainer;
 use crate::connection::config::DatabaseConfig;
 use crate::connection::libsql::{open_conn, MakeLibSqlConn};
 use crate::connection::write_proxy::MakeWriteProxyConn;
@@ -222,7 +223,7 @@ impl Namespace {
         self.db_config_store.version()
     }
 
-    pub fn jwt_key(&self) -> crate::Result<Option<jsonwebtoken::DecodingKey>> {
+    pub fn jwt_key(&self) -> crate::Result<Option<DecodingKeyContainer>> {
         let config = self.db_config_store.get();
         if let Some(jwt_key) = config.jwt_key.as_deref() {
             Ok(Some(
