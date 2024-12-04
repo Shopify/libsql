@@ -88,6 +88,7 @@ enum DbType {
         auth_token: String,
         connector: crate::util::ConnectorService,
         version: Option<String>,
+        namespace: Option<String>,
     },
 }
 
@@ -229,6 +230,7 @@ cfg_replication! {
                 None,
                 OpenFlags::default(),
                 encryption_config.clone(),
+                None,
                 None,
             ).await?;
 
@@ -514,6 +516,7 @@ cfg_remote! {
                     auth_token: auth_token.into(),
                     connector: crate::util::ConnectorService::new(svc),
                     version,
+                    namespace: None,
                 },
                 max_write_replication_index: Default::default(),
             })
@@ -650,6 +653,7 @@ impl Database {
                 auth_token,
                 connector,
                 version,
+                namespace,
             } => {
                 let conn = std::sync::Arc::new(
                     crate::hrana::connection::HttpConnection::new_with_connector(
@@ -657,6 +661,7 @@ impl Database {
                         auth_token,
                         connector.clone(),
                         version.as_ref().map(|s| s.as_str()),
+                        namespace.as_ref().map(|s| s.as_str()),
                     ),
                 );
 

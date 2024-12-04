@@ -190,6 +190,7 @@ impl Database {
         flags: OpenFlags,
         encryption_config: Option<EncryptionConfig>,
         http_request_callback: Option<crate::util::HttpRequestCallback>,
+        namespace: Option<String>,
     ) -> Result<Database> {
         use std::path::PathBuf;
 
@@ -208,7 +209,7 @@ impl Database {
             auth_token,
             version.as_deref(),
             http_request_callback,
-            None,
+            namespace,
         )
         .map_err(|e| crate::Error::Replication(e.into()))?;
 

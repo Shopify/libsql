@@ -59,12 +59,12 @@ impl Builder<()> {
                         auth_token,
                         connector: None,
                         version: None,
+                        namespace: None,
                     },
                     encryption_config: None,
                     read_your_writes: true,
                     sync_interval: None,
                     http_request_callback: None,
-                    namespace: None
                 },
             }
         }
@@ -99,6 +99,7 @@ impl Builder<()> {
                         auth_token,
                         connector: None,
                         version: None,
+                        namespace: None,
                     },
                     connector:None,
                 },
@@ -115,6 +116,7 @@ impl Builder<()> {
                     auth_token,
                     connector: None,
                     version: None,
+                    namespace: None,
                 },
             }
         }
@@ -128,6 +130,7 @@ cfg_replication_or_remote_or_sync! {
         auth_token: String,
         connector: Option<crate::util::ConnectorService>,
         version: Option<String>,
+        namespace: Option<String>,
     }
 }
 
@@ -195,7 +198,6 @@ cfg_replication! {
         read_your_writes: bool,
         sync_interval: Option<std::time::Duration>,
         http_request_callback: Option<crate::util::HttpRequestCallback>,
-        namespace: Option<String>,
     }
 
     /// Local replica configuration type in [`Builder`].
@@ -260,7 +262,7 @@ cfg_replication! {
         /// Set the namespace that will be communicated to remote replica in the http header.
         pub fn namespace(mut self, namespace: impl Into<String>) -> Builder<RemoteReplica>
         {
-            self.inner.namespace = Some(namespace.into());
+            self.inner.remote.namespace = Some(namespace.into());
             self
         }
 
@@ -280,12 +282,12 @@ cfg_replication! {
                         auth_token,
                         connector,
                         version,
+                        namespace,
                     },
                 encryption_config,
                 read_your_writes,
                 sync_interval,
                 http_request_callback,
-                namespace
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -357,6 +359,7 @@ cfg_replication! {
                 auth_token,
                 connector,
                 version,
+                namespace,
             }) = remote
             {
                 let connector = if let Some(connector) = connector {
@@ -381,6 +384,7 @@ cfg_replication! {
                     flags,
                     encryption_config.clone(),
                     http_request_callback,
+                    namespace,
                 )
                 .await?
             } else {
@@ -434,6 +438,7 @@ cfg_sync! {
                         auth_token,
                         connector: _,
                         version: _,
+                        namespace: _,
                     },
                 connector,
             } = self.inner;
@@ -490,6 +495,13 @@ cfg_remote! {
             self
         }
 
+        /// Set the namespace that will be communicated to the remote in the http header.
+        pub fn namespace(mut self, namespace: impl Into<String>) -> Builder<Remote>
+        {
+            self.inner.namespace = Some(namespace.into());
+            self
+        }
+
         /// Build the remote database client.
         pub async fn build(self) -> Result<Database> {
             let Remote {
@@ -497,6 +509,7 @@ cfg_remote! {
                 auth_token,
                 connector,
                 version,
+                namespace,
             } = self.inner;
 
             let connector = if let Some(connector) = connector {
@@ -518,6 +531,7 @@ cfg_remote! {
                     auth_token,
                     connector,
                     version,
+                    namespace,
                 },
                 max_write_replication_index: Default::default(),
             })
