@@ -16,7 +16,7 @@ aws-sdk-s3 = { version = "1" }
 bytes = "1"
 libsql-sys = { path = "../libsql-sys" }
 libsql_replication = { path = "../libsql-replication" }
-tokio = { version = "1.22.2", features = ["rt-multi-thread", "net", "io-std", "io-util", "time", "macros", "sync", "fs"] }
+tokio = { version = "1.38.2", features = ["rt-multi-thread", "net", "io-std", "io-util", "time", "macros", "sync", "fs"] }
 tokio-util = "0.7"
 tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
