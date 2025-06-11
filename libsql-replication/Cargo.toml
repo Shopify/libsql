@@ -17,7 +17,7 @@ bytes = { version = "1.5.0", features = ["serde"] }
 serde = { version = "1.0.189", features = ["derive"] }
 thiserror = "1.0.49"
 tracing = "0.1.40"
-tokio = { version = "1.33.0", features = ["full"] }
+tokio = { version = "1.38.2", features = ["full"] }
 tokio-stream = "0.1.14"
 async-trait = "0.1.74"
 uuid = { version = "1.5.0", features = ["v4"] }
