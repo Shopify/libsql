@@ -51,6 +51,7 @@ impl Connection {
     pub(crate) fn connect(db: &Database) -> Result<Connection> {
         let mut raw = std::ptr::null_mut();
         let db_path = db.db_path.clone();
+        let flags: c_int = ffi::SQLITE_OPEN_FULLMUTEX | db.flags.bits();
         let err = unsafe {
             ffi::sqlite3_open_v2(
                 std::ffi::CString::new(db_path.as_str())
@@ -58,7 +59,7 @@ impl Connection {
                     .as_c_str()
                     .as_ptr() as *const _,
                 &mut raw,
-                db.flags.bits() as c_int,
+                flags,
                 std::ptr::null(),
             )
         };
