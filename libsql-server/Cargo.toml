@@ -35,7 +35,7 @@ hyper = { workspace = true, features = ["http2"] }
 hyper-rustls = { git = "https://github.com/rustls/hyper-rustls.git", rev = "163b3f5", features = ["http2"] }
 hyper-tungstenite = "0.11"
 itertools = "0.10.5"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 libsql = { path = "../libsql/", optional = true }
 libsql_replication = { path = "../libsql-replication" }
 metrics = "0.21.1"
