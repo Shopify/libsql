@@ -98,7 +98,7 @@ modern-full = [
 ]
 
 [dependencies]
-time = { version = "0.3.0", features = ["formatting", "macros", "parsing"], optional = true }
+time = { version = "0.3.47", features = ["formatting", "macros", "parsing"], optional = true }
 bitflags = "2.0"
 hashlink = "0.8"
 chrono = { version = "0.4", optional = true, default-features = false, features = ["clock"] }
