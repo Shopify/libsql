@@ -139,8 +139,31 @@ impl Namespace {
             self.checkpoint().await?;
         }
         self.db.shutdown().await?;
-        if let Err(e) = tokio::fs::remove_file(self.path.join(".sentinel")).await {
-            tracing::error!("unable to remove .sentinel file: {}", e);
+        // Historically `.sentinel` was removed unconditionally on graceful
+        // shutdown. This makes the documented `touch .sentinel + kubectl
+        // delete pod` operator recovery path silently ineffective, because
+        // kubectl sends SIGTERM first which invokes this graceful shutdown
+        // and removes the sentinel before the pod actually stops.
+        //
+        // Guard the removal behind `LIBSQL_PRESERVE_SENTINEL_ON_SHUTDOWN`.
+        // When set, the sentinel survives graceful shutdown, so the next
+        // namespace init will correctly trigger dirty-recovery from the
+        // live `data` file.
+        //
+        // Default remains: remove (preserves existing behavior for the
+        // 99% of deployments that don't need this recovery path, now that
+        // `POST /v1/namespaces/:ns/reset-replication` is the primary
+        // recovery primitive).
+        let preserve_sentinel =
+            std::env::var("LIBSQL_PRESERVE_SENTINEL_ON_SHUTDOWN").is_ok();
+        if !preserve_sentinel {
+            if let Err(e) = tokio::fs::remove_file(self.path.join(".sentinel")).await {
+                tracing::error!("unable to remove .sentinel file: {}", e);
+            }
+        } else {
+            tracing::info!(
+                "LIBSQL_PRESERVE_SENTINEL_ON_SHUTDOWN set; keeping .sentinel for recovery"
+            );
         }
         Ok(())
     }
