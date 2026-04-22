@@ -271,6 +271,9 @@ impl NamespaceStore {
             return Err(Error::NamespaceDoesntExist(namespace.to_string()));
         }
 
+        let start = Instant::now();
+        tracing::info!("reset_replication: starting for namespace {namespace}");
+
         // Load the namespace first so we can resolve its on-disk path
         // cleanly. This is effectively a no-op if it's already hot.
         let db_config = self.inner.metadata.handle(namespace.clone()).await;
@@ -390,7 +393,10 @@ impl NamespaceStore {
             .await?;
         lock.replace(ns);
 
-        tracing::info!("reset_replication: rebuilt replication log for namespace {namespace}");
+        let elapsed_ms = start.elapsed().as_millis();
+        tracing::info!(
+            "reset_replication: rebuilt replication log for namespace {namespace} in {elapsed_ms}ms"
+        );
         Ok(())
     }
 
