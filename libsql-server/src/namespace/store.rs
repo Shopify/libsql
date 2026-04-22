@@ -267,6 +267,16 @@ impl NamespaceStore {
             return Err(Error::NamespaceStoreShutdown);
         }
 
+        // reset-replication rebuilds the primary's replication log from
+        // its live data file. On a replica node the `.sentinel` sentinel
+        // is not consumed by `ReplicaConfigurator`, so the re-init path
+        // does nothing useful and we'd only destroy wallog/snapshots that
+        // the replica still needs. Reject the call with 400 NotAPrimary
+        // instead of producing confusing behavior.
+        if !matches!(self.inner.db_kind, DatabaseKind::Primary) {
+            return Err(Error::NotAPrimary);
+        }
+
         if !self.inner.metadata.exists(&namespace).await {
             return Err(Error::NamespaceDoesntExist(namespace.to_string()));
         }
@@ -308,6 +318,16 @@ impl NamespaceStore {
             match ns.checkpoint().await {
                 Ok(()) => {}
                 Err(e) => {
+                    // TODO(follow-up): classify corruption via a typed
+                    // `rusqlite::ErrorCode` (DatabaseCorrupt / NotADatabase)
+                    // or a dedicated `Error::DatabaseCorrupt` variant. See
+                    // <https://github.com/tursodatabase/libsql/pull/2230>
+                    // review thread for the design. The current
+                    // `checkpoint()` path boxes through `anyhow::Error`
+                    // which erases the source type, so we match the
+                    // rendered message for now. False-positive risk here
+                    // is low: all substrings below come from SQLite's own
+                    // error text for genuine live-DB corruption.
                     let msg = e.to_string();
                     let is_live_db_corrupt = msg.contains("malformed")
                         || msg.contains("DatabaseCorrupt")
@@ -370,8 +390,11 @@ impl NamespaceStore {
         let sentinel = ns_path.join(".sentinel");
         let _ = tokio::fs::remove_file(&sentinel).await;
         // Ensure parent dir exists (it should, because data still lives
-        // there, but be defensive).
-        if !ns_path.exists() {
+        // there, but be defensive). Use async `try_exists` rather than the
+        // sync `Path::exists()` so we don't block the Tokio worker on a
+        // filesystem stat.
+        let parent_exists = tokio::fs::try_exists(&ns_path).await.unwrap_or(false);
+        if !parent_exists {
             tokio::fs::create_dir_all(&ns_path).await.map_err(|e| {
                 Error::Internal(format!(
                     "reset_replication: create_dir_all {} failed: {e}",

@@ -113,16 +113,27 @@ impl Namespace {
             }
         };
         let pragma = if full { "integrity_check" } else { "quick_check" };
-        let result = conn.with_raw(move |raw| -> rusqlite::Result<Vec<String>> {
-            let mut stmt = raw.prepare(&format!("PRAGMA {pragma}"))?;
-            let mut rows = stmt.query([])?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                let s: String = row.get(0)?;
-                out.push(s);
-            }
-            Ok(out)
-        });
+        // `with_raw` holds a parking_lot mutex and runs the closure on the
+        // current thread. `PRAGMA integrity_check` scans the full database
+        // and can take seconds on large DBs, which would stall a Tokio
+        // worker. Move the work to the blocking thread pool so Tokio's
+        // async workers keep making progress (consistent with the
+        // `checkpoint` / `vacuum_if_needed` paths on `LegacyConnection`).
+        let pragma_owned = pragma.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            conn.with_raw(move |raw| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = raw.prepare(&format!("PRAGMA {pragma_owned}"))?;
+                let mut rows = stmt.query([])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let s: String = row.get(0)?;
+                    out.push(s);
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("integrity_check join failure: {e}"))?;
         match result {
             Ok(rows) => Ok(rows.join("\n")),
             Err(e) => {
