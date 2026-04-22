@@ -262,7 +262,7 @@ impl NamespaceStore {
     /// Brief unavailability window: from the moment we take the write lock
     /// until `make_namespace` returns. Other namespaces on the pod are
     /// completely unaffected.
-    pub async fn reset_replication(&self, namespace: NamespaceName) -> crate::Result<()> {
+    pub async fn reset_replication(&self, namespace: NamespaceName) -> crate::Result<u64> {
         if self.inner.has_shutdown.load(Ordering::Relaxed) {
             return Err(Error::NamespaceStoreShutdown);
         }
@@ -393,11 +393,11 @@ impl NamespaceStore {
             .await?;
         lock.replace(ns);
 
-        let elapsed_ms = start.elapsed().as_millis();
+        let elapsed_ms = start.elapsed().as_millis() as u64;
         tracing::info!(
             "reset_replication: rebuilt replication log for namespace {namespace} in {elapsed_ms}ms"
         );
-        Ok(())
+        Ok(elapsed_ms)
     }
 
     // This is only called on replica
