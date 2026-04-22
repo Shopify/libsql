@@ -256,9 +256,34 @@ impl NamespaceStore {
 
         // (1) Checkpoint before we tear down in-memory state so the data
         //     file has everything the WAL was holding.
+        //
+        //     If checkpoint fails with a `DatabaseCorrupt` / `malformed`
+        //     error, the live data file itself is corrupt. Rebuilding the
+        //     wallog from a corrupt data file would just propagate the
+        //     corruption — so bail out BEFORE we destroy the in-memory
+        //     namespace. The caller should fall back to a restore-from-
+        //     backup path (Mode B), not this endpoint.
         if let Some(ns) = lock.as_ref() {
-            if let Err(e) = ns.checkpoint().await {
-                tracing::warn!("reset_replication: checkpoint failed: {e}; proceeding anyway");
+            match ns.checkpoint().await {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_live_db_corrupt = msg.contains("malformed")
+                        || msg.contains("DatabaseCorrupt")
+                        || msg.contains("database disk image")
+                        || msg.contains("file is not a database");
+                    if is_live_db_corrupt {
+                        return Err(Error::Internal(format!(
+                            "reset_replication: live data file appears corrupt \
+                             (checkpoint failed: {e}); refusing to rebuild \
+                             replication log from corrupt data. Use a \
+                             restore-from-backup procedure instead."
+                        )));
+                    }
+                    tracing::warn!(
+                        "reset_replication: checkpoint failed: {e}; proceeding anyway"
+                    );
+                }
             }
         }
 
