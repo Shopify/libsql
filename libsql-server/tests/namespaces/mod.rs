@@ -304,6 +304,50 @@ fn reset_replication_on_nonexistent_namespace_returns_404() {
 }
 
 #[test]
+fn integrity_check_defaults_to_quick_when_full_omitted() {
+    // Verifies backward compatibility: if the request body is {} (no
+    // `full` field), the server defaults to quick_check. This preserves
+    // the contract for any older/simpler client that doesn't send the
+    // field, and is also the documented default in the admin API.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/defchk/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://defchk.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+
+        // Empty body: no `full` field at all.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/defchk/integrity-check",
+                json!({}),
+            )
+            .await?;
+        assert_eq!(resp.status(), hyper::http::StatusCode::OK);
+        let v = resp.json_value().await?;
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["check"], json!("quick"));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
 fn reset_replication_is_idempotent() {
     // An operator (or the streamer's retry-after-reset path) may call
     // reset-replication multiple times in quick succession. Each call
