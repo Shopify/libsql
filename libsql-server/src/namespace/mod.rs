@@ -72,6 +72,12 @@ impl Namespace {
         &self.name
     }
 
+    /// On-disk path of this namespace's files (data, wallog, snapshots/,
+    /// to_compact/, .sentinel).
+    pub(crate) fn path(&self) -> &Arc<Path> {
+        &self.path
+    }
+
     async fn destroy(mut self) -> anyhow::Result<()> {
         self.tasks.shutdown().await;
         self.db.destroy();
