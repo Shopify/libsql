@@ -153,6 +153,44 @@ impl NamespaceStore {
         Ok(())
     }
 
+    /// Run `PRAGMA quick_check` (or `integrity_check` if `full=true`) on
+    /// the namespace's live DB and return the result string. Takes only
+    /// a read lock on the namespace; other operations (including other
+    /// namespaces on this pod) are unaffected.
+    ///
+    /// A healthy DB returns `"ok"`. Any other text is diagnostic output
+    /// from SQLite. Use this to classify Mode A (wallog/snapshot
+    /// corruption, live DB OK) vs Mode B (live DB corruption) before
+    /// deciding on a recovery procedure.
+    pub async fn integrity_check(
+        &self,
+        namespace: NamespaceName,
+        full: bool,
+    ) -> crate::Result<String> {
+        if !self.inner.metadata.exists(&namespace).await {
+            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+        }
+        // Force-load the namespace so we can run a query against it.
+        let db_config = self.inner.metadata.handle(namespace.clone()).await;
+        let _ = self
+            .load_namespace(&namespace, db_config, RestoreOption::Latest)
+            .await?;
+
+        let entry = self
+            .inner
+            .store
+            .get_with(namespace.clone(), async { Default::default() })
+            .await;
+        let lock = entry.read().await;
+        if let Some(ns) = &*lock {
+            ns.integrity_check(full)
+                .await
+                .map_err(|e| Error::Internal(format!("integrity_check: {e}")))
+        } else {
+            Err(Error::NamespaceDoesntExist(namespace.to_string()))
+        }
+    }
+
     pub async fn reset(
         &self,
         namespace: NamespaceName,

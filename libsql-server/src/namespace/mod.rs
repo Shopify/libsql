@@ -91,6 +91,48 @@ impl Namespace {
         Ok(())
     }
 
+    /// Run `PRAGMA quick_check` (or `integrity_check` if `full=true`) on
+    /// the namespace's live DB file and return the result string.
+    ///
+    /// For a healthy DB this returns `"ok"`. Anything else is an
+    /// integrity diagnostic message from SQLite.
+    ///
+    /// A catastrophically corrupt DB can fail before PRAGMA runs (e.g.
+    /// `malformed database schema` raised while the prepared statement
+    /// is parsing the schema). We normalize that into the same
+    /// `Ok(String)` return path so callers get a uniform classification
+    /// signal instead of a server error.
+    async fn integrity_check(&self, full: bool) -> anyhow::Result<String> {
+        // Even creating a connection can fail ("malformed database schema")
+        // when the DB is badly corrupt — that IS an integrity signal so we
+        // surface it as `Ok(String)` rather than an Err that becomes a 500.
+        let conn = match self.db.connection_maker().create().await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(format!("connection failed: {e}"));
+            }
+        };
+        let pragma = if full { "integrity_check" } else { "quick_check" };
+        let result = conn.with_raw(move |raw| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = raw.prepare(&format!("PRAGMA {pragma}"))?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let s: String = row.get(0)?;
+                out.push(s);
+            }
+            Ok(out)
+        });
+        match result {
+            Ok(rows) => Ok(rows.join("\n")),
+            Err(e) => {
+                // SQLite surfaces integrity failures as prepare/query errors
+                // rather than PRAGMA rows. Treat those as integrity signals.
+                Ok(format!("{e}"))
+            }
+        }
+    }
+
     async fn shutdown(mut self, should_checkpoint: bool) -> anyhow::Result<()> {
         self.tasks.shutdown().await;
         if should_checkpoint {
