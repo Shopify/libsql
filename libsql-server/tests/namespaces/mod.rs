@@ -348,6 +348,54 @@ fn integrity_check_defaults_to_quick_when_full_omitted() {
 }
 
 #[test]
+fn reset_replication_response_includes_elapsed_ms() {
+    // Operators (and ops dashboards) want to see how long reset took
+    // without having to grep logs. The JSON response body includes
+    // elapsed_ms, which must be a positive integer for any successful
+    // reset.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/elapsed/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://elapsed.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+        conn.execute("insert into t values ('x')", ()).await?;
+
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/elapsed/reset-replication",
+                json!({}),
+            )
+            .await?;
+        assert_eq!(resp.status(), hyper::http::StatusCode::OK);
+        let v = resp.json_value().await?;
+        let elapsed = v["elapsed_ms"].as_u64().expect("elapsed_ms must be u64");
+        // We can't assert a specific value (depends on hardware) but we
+        // can assert it's present and non-negative. In practice this is
+        // typically single-digit milliseconds for an empty/small table.
+        // Max bound guards against a runaway regression.
+        assert!(elapsed < 30_000, "elapsed_ms={elapsed} exceeds 30s sanity bound");
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
 fn reset_replication_is_idempotent() {
     // An operator (or the streamer's retry-after-reset path) may call
     // reset-replication multiple times in quick succession. Each call

@@ -572,12 +572,18 @@ async fn handle_checkpoint<C>(
 /// - metastore config (jwt_key, block_writes, etc.) is preserved
 ///
 /// Other namespaces on this pod are completely unaffected.
+#[derive(serde::Serialize)]
+struct ResetReplicationResp {
+    /// Wall-clock duration of the reset, for operator-visible metrics.
+    elapsed_ms: u64,
+}
+
 async fn handle_reset_replication<C>(
     State(app_state): State<Arc<AppState<C>>>,
     Path(namespace): Path<NamespaceName>,
-) -> crate::Result<()> {
-    app_state.namespaces.reset_replication(namespace).await?;
-    Ok(())
+) -> crate::Result<axum::Json<ResetReplicationResp>> {
+    let elapsed_ms = app_state.namespaces.reset_replication(namespace).await?;
+    Ok(axum::Json(ResetReplicationResp { elapsed_ms }))
 }
 
 #[derive(serde::Deserialize, Default)]
