@@ -302,3 +302,76 @@ fn reset_replication_on_nonexistent_namespace_returns_404() {
 
     sim.run().unwrap();
 }
+
+#[test]
+fn reset_replication_is_idempotent() {
+    // An operator (or the streamer's retry-after-reset path) may call
+    // reset-replication multiple times in quick succession. Each call
+    // must succeed independently without corrupting the data file.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/idem/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://idem.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+        for i in 0..20 {
+            conn.execute(&format!("insert into t values ('row-{i}')"), ())
+                .await?;
+        }
+
+        // Call reset-replication three times in a row. Each must 200.
+        for attempt in 0..3 {
+            let resp = client
+                .post(
+                    "http://primary:9090/v1/namespaces/idem/reset-replication",
+                    json!({}),
+                )
+                .await?;
+            assert_eq!(
+                resp.status(),
+                hyper::http::StatusCode::OK,
+                "attempt {attempt} should return 200"
+            );
+        }
+
+        // After three resets, the 20 rows are still there.
+        let db2 = Database::open_remote_with_connector(
+            "http://idem.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn2 = db2.connect()?;
+        let mut rows = conn2.query("select count(*) from t", ()).await?;
+        assert!(matches!(
+            rows.next().await.unwrap().unwrap().get_value(0)?,
+            Value::Integer(20)
+        ));
+
+        // And integrity-check still passes.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/idem/integrity-check",
+                json!({}),
+            )
+            .await?;
+        let v = resp.json_value().await?;
+        assert_eq!(v["ok"], json!(true));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
