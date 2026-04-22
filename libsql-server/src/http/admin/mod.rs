@@ -162,6 +162,10 @@ where
             "/v1/namespaces/:namespace/reset-replication",
             post(handle_reset_replication),
         )
+        .route(
+            "/v1/namespaces/:namespace/integrity-check",
+            post(handle_integrity_check),
+        )
         .route("/v1/namespaces/:namespace", delete(handle_delete_namespace))
         .route("/v1/namespaces/:namespace/stats", get(stats::handle_stats))
         .route(
@@ -574,6 +578,53 @@ async fn handle_reset_replication<C>(
 ) -> crate::Result<()> {
     app_state.namespaces.reset_replication(namespace).await?;
     Ok(())
+}
+
+#[derive(serde::Deserialize, Default)]
+struct IntegrityCheckReq {
+    /// If true, run full `PRAGMA integrity_check` (O(DB size), thorough).
+    /// Default is `PRAGMA quick_check` which is fast and catches the
+    /// critical corruption classes.
+    #[serde(default)]
+    full: bool,
+}
+
+#[derive(serde::Serialize)]
+struct IntegrityCheckResp {
+    ok: bool,
+    /// Raw SQLite diagnostic text. `"ok"` on success, otherwise one or
+    /// more messages describing integrity issues.
+    message: String,
+    /// "quick" or "full", mirrors the `full` request field.
+    check: &'static str,
+}
+
+/// Run `PRAGMA quick_check` (default) or `PRAGMA integrity_check` on a
+/// namespace's live data file without touching other namespaces.
+///
+/// Use this to classify the failure mode before recovery:
+/// - `ok` → live DB is fine, any corruption is in wallog/snapshots (Mode A)
+/// → caller should use `POST /v1/namespaces/:ns/reset-replication`.
+/// - non-"ok" → live DB itself is corrupt (Mode B)
+/// → caller should restore from backup, not reset-replication.
+///
+/// Cheap: ~10ms for quick_check on small-to-medium namespaces.
+async fn handle_integrity_check<C>(
+    State(app_state): State<Arc<AppState<C>>>,
+    Path(namespace): Path<NamespaceName>,
+    payload: Option<Json<IntegrityCheckReq>>,
+) -> crate::Result<Json<IntegrityCheckResp>> {
+    let full = payload.map(|p| p.0.full).unwrap_or(false);
+    let message = app_state
+        .namespaces
+        .integrity_check(namespace, full)
+        .await?;
+    let ok = message.trim() == "ok";
+    Ok(Json(IntegrityCheckResp {
+        ok,
+        message,
+        check: if full { "full" } else { "quick" },
+    }))
 }
 
 #[derive(serde::Deserialize)]
