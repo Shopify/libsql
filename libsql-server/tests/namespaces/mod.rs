@@ -304,6 +304,37 @@ fn reset_replication_on_nonexistent_namespace_returns_404() {
 }
 
 #[test]
+fn integrity_check_on_nonexistent_namespace_returns_404() {
+    // Symmetric to reset_replication_on_nonexistent_namespace_returns_404.
+    // If someone regresses error handling (e.g., returning 500 on
+    // NamespaceDoesntExist), the streamer's classifier would treat that
+    // as a transient server error and retry, instead of falling through
+    // to the optimistic-reset path.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/missing/integrity-check",
+                json!({}),
+            )
+            .await;
+        match resp {
+            Ok(r) => assert_eq!(r.status(), hyper::http::StatusCode::NOT_FOUND),
+            Err(e) => panic!("expected 404 response, got error: {e}"),
+        }
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
 fn integrity_check_defaults_to_quick_when_full_omitted() {
     // Verifies backward compatibility: if the request body is {} (no
     // `full` field), the server defaults to quick_check. This preserves
