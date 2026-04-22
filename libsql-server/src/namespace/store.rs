@@ -191,6 +191,146 @@ impl NamespaceStore {
         Ok(())
     }
 
+    /// Rebuild the replication log for a namespace from its live DB file,
+    /// without wiping the DB or the metastore config.
+    ///
+    /// Use this when the replication artifacts (wallog, snapshots/,
+    /// to_compact/) are corrupt but the live `data` file (and metastore
+    /// config) are intact.
+    ///
+    /// Semantics:
+    /// 1. Acquire the single-namespace write lock (other namespaces on this
+    ///    pod are unaffected).
+    /// 2. Checkpoint the current WAL into `data` so nothing in-flight is
+    ///    lost.
+    /// 3. Destroy the in-memory namespace (closes connections, stops tasks).
+    ///    This does NOT touch any files on disk.
+    /// 4. Remove only `wallog`, `snapshots/`, `to_compact/`.
+    /// 5. Create `.sentinel`.
+    /// 6. Re-initialize the namespace via `make_namespace()`. The
+    ///    `PrimaryConfigurator` sees `.sentinel` → opens
+    ///    `ReplicationLogger` with `dirty=true` → `recover()` rebuilds the
+    ///    wallog page-by-page from the restored `data` file, mints a fresh
+    ///    `log_id`, and wipes `snapshots/` + `to_compact/`.
+    ///
+    /// Effects for clients:
+    /// - connected embedded replicas see `LogIncompatible` on next sync
+    ///   (new log_id) and self-reset (wipe local + re-bootstrap).
+    /// - fresh bootstrap succeeds against the rebuilt history.
+    /// - live DB data is fully preserved.
+    /// - metastore config (jwt_key, block_writes, bottomless_db_id, etc.)
+    ///   is fully preserved.
+    ///
+    /// Brief unavailability window: from the moment we take the write lock
+    /// until `make_namespace` returns. Other namespaces on the pod are
+    /// completely unaffected.
+    pub async fn reset_replication(&self, namespace: NamespaceName) -> crate::Result<()> {
+        if self.inner.has_shutdown.load(Ordering::Relaxed) {
+            return Err(Error::NamespaceStoreShutdown);
+        }
+
+        if !self.inner.metadata.exists(&namespace).await {
+            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+        }
+
+        // Load the namespace first so we can resolve its on-disk path
+        // cleanly. This is effectively a no-op if it's already hot.
+        let db_config = self.inner.metadata.handle(namespace.clone()).await;
+        let _ = self
+            .load_namespace(&namespace, db_config.clone(), RestoreOption::Latest)
+            .await?;
+
+        let entry = self
+            .inner
+            .store
+            .get_with(namespace.clone(), async { Default::default() })
+            .await;
+        let mut lock = entry.write().await;
+
+        let ns_path: Arc<std::path::Path> = match lock.as_ref() {
+            Some(ns) => ns.path().clone(),
+            None => {
+                return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+            }
+        };
+
+        // (1) Checkpoint before we tear down in-memory state so the data
+        //     file has everything the WAL was holding.
+        if let Some(ns) = lock.as_ref() {
+            if let Err(e) = ns.checkpoint().await {
+                tracing::warn!("reset_replication: checkpoint failed: {e}; proceeding anyway");
+            }
+        }
+
+        // (2) Tear down in-memory namespace. Does not touch files.
+        if let Some(ns) = lock.take() {
+            if let Err(e) = ns.destroy().await {
+                // Best-effort: if we can't destroy cleanly, the next
+                // make_namespace will fail too, so surface the error now.
+                return Err(Error::Internal(format!(
+                    "reset_replication: destroy failed: {e}"
+                )));
+            }
+        }
+
+        // (3) Remove only replication artifacts. Keep `data` and
+        //     `data-wal`/`data-shm` + config.
+        for artifact in ["wallog"] {
+            let p = ns_path.join(artifact);
+            if let Err(e) = tokio::fs::remove_file(&p).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "reset_replication: remove_file {} failed: {e}",
+                        p.display()
+                    );
+                }
+            }
+        }
+        for artifact in ["snapshots", "to_compact"] {
+            let p = ns_path.join(artifact);
+            if let Err(e) = tokio::fs::remove_dir_all(&p).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "reset_replication: remove_dir_all {} failed: {e}",
+                        p.display()
+                    );
+                }
+            }
+        }
+
+        // (4) Drop any stale .sentinel left by prior shutdown, then mint a
+        //     fresh one so ReplicationLogger::open takes the dirty-recovery
+        //     path on the next init.
+        let sentinel = ns_path.join(".sentinel");
+        let _ = tokio::fs::remove_file(&sentinel).await;
+        // Ensure parent dir exists (it should, because data still lives
+        // there, but be defensive).
+        if !ns_path.exists() {
+            tokio::fs::create_dir_all(&ns_path).await.map_err(|e| {
+                Error::Internal(format!(
+                    "reset_replication: create_dir_all {} failed: {e}",
+                    ns_path.display()
+                ))
+            })?;
+        }
+        tokio::fs::File::create(&sentinel).await.map_err(|e| {
+            Error::Internal(format!(
+                "reset_replication: create .sentinel failed: {e}"
+            ))
+        })?;
+
+        // (5) Re-initialize the namespace. setup() sees .sentinel → opens
+        //     ReplicationLogger with dirty=true → recover() rebuilds the
+        //     wallog page-by-page from the intact `data` file.
+        let ns = self
+            .make_namespace(&namespace, db_config, RestoreOption::Latest)
+            .await?;
+        lock.replace(ns);
+
+        tracing::info!("reset_replication: rebuilt replication log for namespace {namespace}");
+        Ok(())
+    }
+
     // This is only called on replica
     fn make_reset_cb(&self) -> ResetCb {
         let this = self.clone();

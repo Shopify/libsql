@@ -158,6 +158,10 @@ where
             "/v1/namespaces/:namespace/checkpoint",
             post(handle_checkpoint),
         )
+        .route(
+            "/v1/namespaces/:namespace/reset-replication",
+            post(handle_reset_replication),
+        )
         .route("/v1/namespaces/:namespace", delete(handle_delete_namespace))
         .route("/v1/namespaces/:namespace/stats", get(stats::handle_stats))
         .route(
@@ -547,6 +551,28 @@ async fn handle_checkpoint<C>(
     Path(namespace): Path<NamespaceName>,
 ) -> crate::Result<()> {
     app_state.namespaces.checkpoint(namespace).await?;
+    Ok(())
+}
+
+/// Rebuild the replication log for a namespace from its live DB file
+/// without touching other namespaces on this pod.
+///
+/// Use when the replication artifacts (wallog, snapshots/, to_compact/)
+/// are corrupt but the live `data` file is intact (verify first with
+/// `PRAGMA quick_check`).
+///
+/// Side effects:
+/// - new `log_id` is minted
+/// - connected replicas see `LogIncompatible` and must re-bootstrap
+/// - live DB data is preserved
+/// - metastore config (jwt_key, block_writes, etc.) is preserved
+///
+/// Other namespaces on this pod are completely unaffected.
+async fn handle_reset_replication<C>(
+    State(app_state): State<Arc<AppState<C>>>,
+    Path(namespace): Path<NamespaceName>,
+) -> crate::Result<()> {
+    app_state.namespaces.reset_replication(namespace).await?;
     Ok(())
 }
 
