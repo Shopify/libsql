@@ -158,6 +158,14 @@ where
             "/v1/namespaces/:namespace/checkpoint",
             post(handle_checkpoint),
         )
+        .route(
+            "/v1/namespaces/:namespace/reset-replication",
+            post(handle_reset_replication),
+        )
+        .route(
+            "/v1/namespaces/:namespace/integrity-check",
+            post(handle_integrity_check),
+        )
         .route("/v1/namespaces/:namespace", delete(handle_delete_namespace))
         .route("/v1/namespaces/:namespace/stats", get(stats::handle_stats))
         .route(
@@ -548,6 +556,81 @@ async fn handle_checkpoint<C>(
 ) -> crate::Result<()> {
     app_state.namespaces.checkpoint(namespace).await?;
     Ok(())
+}
+
+/// Rebuild the replication log for a namespace from its live DB file
+/// without touching other namespaces on this pod.
+///
+/// Use when the replication artifacts (wallog, snapshots/, to_compact/)
+/// are corrupt but the live `data` file is intact (verify first with
+/// `PRAGMA quick_check`).
+///
+/// Side effects:
+/// - new `log_id` is minted
+/// - connected replicas see `LogIncompatible` and must re-bootstrap
+/// - live DB data is preserved
+/// - metastore config (jwt_key, block_writes, etc.) is preserved
+///
+/// Other namespaces on this pod are completely unaffected.
+#[derive(serde::Serialize)]
+struct ResetReplicationResp {
+    /// Wall-clock duration of the reset, for operator-visible metrics.
+    elapsed_ms: u64,
+}
+
+async fn handle_reset_replication<C>(
+    State(app_state): State<Arc<AppState<C>>>,
+    Path(namespace): Path<NamespaceName>,
+) -> crate::Result<axum::Json<ResetReplicationResp>> {
+    let elapsed_ms = app_state.namespaces.reset_replication(namespace).await?;
+    Ok(axum::Json(ResetReplicationResp { elapsed_ms }))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct IntegrityCheckReq {
+    /// If true, run full `PRAGMA integrity_check` (O(DB size), thorough).
+    /// Default is `PRAGMA quick_check` which is fast and catches the
+    /// critical corruption classes.
+    #[serde(default)]
+    full: bool,
+}
+
+#[derive(serde::Serialize)]
+struct IntegrityCheckResp {
+    ok: bool,
+    /// Raw SQLite diagnostic text. `"ok"` on success, otherwise one or
+    /// more messages describing integrity issues.
+    message: String,
+    /// "quick" or "full", mirrors the `full` request field.
+    check: &'static str,
+}
+
+/// Run `PRAGMA quick_check` (default) or `PRAGMA integrity_check` on a
+/// namespace's live data file without touching other namespaces.
+///
+/// Use this to classify the failure mode before recovery:
+/// - `ok` → live DB is fine, any corruption is in wallog/snapshots (Mode A)
+/// → caller should use `POST /v1/namespaces/:ns/reset-replication`.
+/// - non-"ok" → live DB itself is corrupt (Mode B)
+/// → caller should restore from backup, not reset-replication.
+///
+/// Cheap: ~10ms for quick_check on small-to-medium namespaces.
+async fn handle_integrity_check<C>(
+    State(app_state): State<Arc<AppState<C>>>,
+    Path(namespace): Path<NamespaceName>,
+    payload: Option<Json<IntegrityCheckReq>>,
+) -> crate::Result<Json<IntegrityCheckResp>> {
+    let full = payload.map(|p| p.0.full).unwrap_or(false);
+    let message = app_state
+        .namespaces
+        .integrity_check(namespace, full)
+        .await?;
+    let ok = message.trim() == "ok";
+    Ok(Json(IntegrityCheckResp {
+        ok,
+        message,
+        check: if full { "full" } else { "quick" },
+    }))
 }
 
 #[derive(serde::Deserialize)]

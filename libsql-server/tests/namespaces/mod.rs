@@ -137,3 +137,364 @@ fn delete_namespace() {
 
     sim.run().unwrap();
 }
+
+#[test]
+fn integrity_check_on_healthy_namespace() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/chk/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://chk.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+        conn.execute("insert into t values ('alive')", ()).await?;
+
+        // quick_check should report ok on a healthy DB.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/chk/integrity-check",
+                json!({ "full": false }),
+            )
+            .await?;
+        assert_eq!(resp.status(), hyper::http::StatusCode::OK);
+        let v = resp.json_value().await?;
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["message"], json!("ok"));
+        assert_eq!(v["check"], json!("quick"));
+
+        // Full integrity_check should also succeed.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/chk/integrity-check",
+                json!({ "full": true }),
+            )
+            .await?;
+        let v = resp.json_value().await?;
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["check"], json!("full"));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn reset_replication_preserves_data_on_healthy_namespace() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/reset/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://reset.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+        for i in 0..100 {
+            conn.execute(
+                &format!("insert into t values ('row-{i}')"),
+                (),
+            )
+            .await?;
+        }
+
+        // Before reset: 100 rows.
+        let mut rows = conn.query("select count(*) from t", ()).await?;
+        assert!(matches!(
+            rows.next().await.unwrap().unwrap().get_value(0)?,
+            Value::Integer(100)
+        ));
+
+        // Reset the replication log on a healthy namespace.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/reset/reset-replication",
+                json!({}),
+            )
+            .await?;
+        assert_eq!(resp.status(), hyper::http::StatusCode::OK);
+
+        // After reset: still 100 rows (data preserved).
+        let db2 = Database::open_remote_with_connector(
+            "http://reset.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn2 = db2.connect()?;
+        let mut rows = conn2.query("select count(*) from t", ()).await?;
+        assert!(matches!(
+            rows.next().await.unwrap().unwrap().get_value(0)?,
+            Value::Integer(100)
+        ));
+
+        // And writes still work.
+        conn2
+            .execute("insert into t values ('post-reset')", ())
+            .await?;
+        let mut rows = conn2.query("select count(*) from t", ()).await?;
+        assert!(matches!(
+            rows.next().await.unwrap().unwrap().get_value(0)?,
+            Value::Integer(101)
+        ));
+
+        // Integrity check confirms the new DB is fine.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/reset/integrity-check",
+                json!({}),
+            )
+            .await?;
+        let v = resp.json_value().await?;
+        assert_eq!(v["ok"], json!(true));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn reset_replication_on_nonexistent_namespace_returns_404() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/missing/reset-replication",
+                json!({}),
+            )
+            .await;
+        // Server-error path: post_with_headers bails on 5xx, but 404
+        // should come through cleanly as an error response.
+        match resp {
+            Ok(r) => assert_eq!(r.status(), hyper::http::StatusCode::NOT_FOUND),
+            Err(e) => panic!("expected 404 response, got error: {e}"),
+        }
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn integrity_check_on_nonexistent_namespace_returns_404() {
+    // Symmetric to reset_replication_on_nonexistent_namespace_returns_404.
+    // If someone regresses error handling (e.g., returning 500 on
+    // NamespaceDoesntExist), the streamer's classifier would treat that
+    // as a transient server error and retry, instead of falling through
+    // to the optimistic-reset path.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/missing/integrity-check",
+                json!({}),
+            )
+            .await;
+        match resp {
+            Ok(r) => assert_eq!(r.status(), hyper::http::StatusCode::NOT_FOUND),
+            Err(e) => panic!("expected 404 response, got error: {e}"),
+        }
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn integrity_check_defaults_to_quick_when_full_omitted() {
+    // Verifies backward compatibility: if the request body is {} (no
+    // `full` field), the server defaults to quick_check. This preserves
+    // the contract for any older/simpler client that doesn't send the
+    // field, and is also the documented default in the admin API.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/defchk/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://defchk.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+
+        // Empty body: no `full` field at all.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/defchk/integrity-check",
+                json!({}),
+            )
+            .await?;
+        assert_eq!(resp.status(), hyper::http::StatusCode::OK);
+        let v = resp.json_value().await?;
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["check"], json!("quick"));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn reset_replication_response_includes_elapsed_ms() {
+    // Operators (and ops dashboards) want to see how long reset took
+    // without having to grep logs. The JSON response body includes
+    // elapsed_ms, which must be a positive integer for any successful
+    // reset.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/elapsed/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://elapsed.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+        conn.execute("insert into t values ('x')", ()).await?;
+
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/elapsed/reset-replication",
+                json!({}),
+            )
+            .await?;
+        assert_eq!(resp.status(), hyper::http::StatusCode::OK);
+        let v = resp.json_value().await?;
+        let elapsed = v["elapsed_ms"].as_u64().expect("elapsed_ms must be u64");
+        // We can't assert a specific value (depends on hardware) but we
+        // can assert it's present and non-negative. In practice this is
+        // typically single-digit milliseconds for an empty/small table.
+        // Max bound guards against a runaway regression.
+        assert!(elapsed < 30_000, "elapsed_ms={elapsed} exceeds 30s sanity bound");
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn reset_replication_is_idempotent() {
+    // An operator (or the streamer's retry-after-reset path) may call
+    // reset-replication multiple times in quick succession. Each call
+    // must succeed independently without corrupting the data file.
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async {
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/idem/create", json!({}))
+            .await?;
+
+        let db = Database::open_remote_with_connector(
+            "http://idem.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn = db.connect()?;
+        conn.execute("create table t(v text)", ()).await?;
+        for i in 0..20 {
+            conn.execute(&format!("insert into t values ('row-{i}')"), ())
+                .await?;
+        }
+
+        // Call reset-replication three times in a row. Each must 200.
+        for attempt in 0..3 {
+            let resp = client
+                .post(
+                    "http://primary:9090/v1/namespaces/idem/reset-replication",
+                    json!({}),
+                )
+                .await?;
+            assert_eq!(
+                resp.status(),
+                hyper::http::StatusCode::OK,
+                "attempt {attempt} should return 200"
+            );
+        }
+
+        // After three resets, the 20 rows are still there.
+        let db2 = Database::open_remote_with_connector(
+            "http://idem.primary:8080",
+            "",
+            TurmoilConnector,
+        )?;
+        let conn2 = db2.connect()?;
+        let mut rows = conn2.query("select count(*) from t", ()).await?;
+        assert!(matches!(
+            rows.next().await.unwrap().unwrap().get_value(0)?,
+            Value::Integer(20)
+        ));
+
+        // And integrity-check still passes.
+        let resp = client
+            .post(
+                "http://primary:9090/v1/namespaces/idem/integrity-check",
+                json!({}),
+            )
+            .await?;
+        let v = resp.json_value().await?;
+        assert_eq!(v["ok"], json!(true));
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}

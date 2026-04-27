@@ -72,6 +72,12 @@ impl Namespace {
         &self.name
     }
 
+    /// On-disk path of this namespace's files (data, wallog, snapshots/,
+    /// to_compact/, .sentinel).
+    pub(crate) fn path(&self) -> &Arc<Path> {
+        &self.path
+    }
+
     async fn destroy(mut self) -> anyhow::Result<()> {
         self.tasks.shutdown().await;
         self.db.destroy();
@@ -85,14 +91,90 @@ impl Namespace {
         Ok(())
     }
 
+    /// Run `PRAGMA quick_check` (or `integrity_check` if `full=true`) on
+    /// the namespace's live DB file and return the result string.
+    ///
+    /// For a healthy DB this returns `"ok"`. Anything else is an
+    /// integrity diagnostic message from SQLite.
+    ///
+    /// A catastrophically corrupt DB can fail before PRAGMA runs (e.g.
+    /// `malformed database schema` raised while the prepared statement
+    /// is parsing the schema). We normalize that into the same
+    /// `Ok(String)` return path so callers get a uniform classification
+    /// signal instead of a server error.
+    async fn integrity_check(&self, full: bool) -> anyhow::Result<String> {
+        // Even creating a connection can fail ("malformed database schema")
+        // when the DB is badly corrupt — that IS an integrity signal so we
+        // surface it as `Ok(String)` rather than an Err that becomes a 500.
+        let conn = match self.db.connection_maker().create().await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(format!("connection failed: {e}"));
+            }
+        };
+        let pragma = if full { "integrity_check" } else { "quick_check" };
+        // `with_raw` holds a parking_lot mutex and runs the closure on the
+        // current thread. `PRAGMA integrity_check` scans the full database
+        // and can take seconds on large DBs, which would stall a Tokio
+        // worker. Move the work to the blocking thread pool so Tokio's
+        // async workers keep making progress (consistent with the
+        // `checkpoint` / `vacuum_if_needed` paths on `LegacyConnection`).
+        let pragma_owned = pragma.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            conn.with_raw(move |raw| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = raw.prepare(&format!("PRAGMA {pragma_owned}"))?;
+                let mut rows = stmt.query([])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let s: String = row.get(0)?;
+                    out.push(s);
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("integrity_check join failure: {e}"))?;
+        match result {
+            Ok(rows) => Ok(rows.join("\n")),
+            Err(e) => {
+                // SQLite surfaces integrity failures as prepare/query errors
+                // rather than PRAGMA rows. Treat those as integrity signals.
+                Ok(format!("{e}"))
+            }
+        }
+    }
+
     async fn shutdown(mut self, should_checkpoint: bool) -> anyhow::Result<()> {
         self.tasks.shutdown().await;
         if should_checkpoint {
             self.checkpoint().await?;
         }
         self.db.shutdown().await?;
-        if let Err(e) = tokio::fs::remove_file(self.path.join(".sentinel")).await {
-            tracing::error!("unable to remove .sentinel file: {}", e);
+        // Historically `.sentinel` was removed unconditionally on graceful
+        // shutdown. This makes the documented `touch .sentinel + kubectl
+        // delete pod` operator recovery path silently ineffective, because
+        // kubectl sends SIGTERM first which invokes this graceful shutdown
+        // and removes the sentinel before the pod actually stops.
+        //
+        // Guard the removal behind `LIBSQL_PRESERVE_SENTINEL_ON_SHUTDOWN`.
+        // When set, the sentinel survives graceful shutdown, so the next
+        // namespace init will correctly trigger dirty-recovery from the
+        // live `data` file.
+        //
+        // Default remains: remove (preserves existing behavior for the
+        // 99% of deployments that don't need this recovery path, now that
+        // `POST /v1/namespaces/:ns/reset-replication` is the primary
+        // recovery primitive).
+        let preserve_sentinel =
+            std::env::var("LIBSQL_PRESERVE_SENTINEL_ON_SHUTDOWN").is_ok();
+        if !preserve_sentinel {
+            if let Err(e) = tokio::fs::remove_file(self.path.join(".sentinel")).await {
+                tracing::error!("unable to remove .sentinel file: {}", e);
+            }
+        } else {
+            tracing::info!(
+                "LIBSQL_PRESERVE_SENTINEL_ON_SHUTDOWN set; keeping .sentinel for recovery"
+            );
         }
         Ok(())
     }
