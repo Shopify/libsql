@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::io::SeekFrom;
 use std::mem::size_of;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use anyhow::{bail, Context};
@@ -26,9 +27,117 @@ use super::FrameNo;
 
 /// This is the ratio of the space required to store snapshot vs size of the actual database.
 /// When this ratio is exceeded, compaction is triggered.
+///
+/// Used only when `SQLD_MAX_SNAPSHOT_SIZE` is unset (legacy behavior).
 const SNAPHOT_SPACE_AMPLIFICATION_FACTOR: u64 = 2;
-/// The maximum amount of snapshot allowed before a compaction is required
+/// The default maximum number of snapshot files allowed before a compaction is required.
+/// Overridable via `SQLD_MAX_SNAPSHOT_COUNT`.
 const MAX_SNAPSHOT_NUMBER: usize = 32;
+
+/// Group an ordered list of accumulated snapshots into contiguous batches for merging,
+/// ensuring no batch's cumulative frame count exceeds `max_frames`.
+///
+/// Returns ranges into `snapshots`. With `max_frames = None`, returns a single range
+/// covering the whole input (legacy single-file merge). An input snapshot whose own
+/// frame count is already strictly larger than `max_frames` is placed in a singleton
+/// batch so the merger can leave it as-is rather than produce an even larger file.
+///
+/// Both bound checks use the same comparator (`>`) for symmetry: a snapshot whose count
+/// equals `max_frames` exactly is allowed to fill a batch by itself but is not flagged as
+/// oversized.
+fn group_snapshots_for_merge(
+    snapshots: &[(String, u64)],
+    max_frames: Option<u64>,
+) -> Vec<Range<usize>> {
+    if snapshots.is_empty() {
+        return Vec::new();
+    }
+    let Some(max) = max_frames else {
+        return vec![0..snapshots.len()];
+    };
+
+    let mut batches: Vec<Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut acc: u64 = 0;
+    for (i, (_, count)) in snapshots.iter().enumerate() {
+        // Pre-existing oversized file: flush any pending batch and emit this one as its
+        // own singleton so the merger leaves it untouched.
+        if *count > max {
+            if i > start {
+                batches.push(start..i);
+            }
+            batches.push(i..i + 1);
+            start = i + 1;
+            acc = 0;
+            continue;
+        }
+        if acc.saturating_add(*count) > max && i > start {
+            batches.push(start..i);
+            start = i;
+            acc = 0;
+        }
+        acc = acc.saturating_add(*count);
+    }
+    if start < snapshots.len() {
+        batches.push(start..snapshots.len());
+    }
+    batches
+}
+
+/// Returns true iff at least one batch in the proposed grouping would actually combine
+/// 2+ input files. When false, running the merger is a no-op (every batch is a
+/// passthrough singleton) and `should_compact` must return false to avoid spinning a hot
+/// merge loop on every snapshot registration.
+fn merge_makes_progress(batches: &[Range<usize>]) -> bool {
+    batches.iter().any(|b| b.end - b.start > 1)
+}
+
+/// Read `SQLD_MAX_SNAPSHOT_SIZE` (in MB) and convert to a frame count. Mirrors the unit
+/// convention in `replication/primary/logger.rs:max_log_frame_count` (decimal MB,
+/// `mb * 1_000_000 / FRAME_SIZE`). Returns `None` on unset, empty, unparseable,
+/// zero, or arithmetic overflow — in all those cases the merger falls back to legacy
+/// behavior rather than picking a pathologically small cap.
+///
+/// `OnceLock`-cached for the lifetime of the process: changing the env var after the
+/// first read has no effect (no SIGHUP-style reload).
+fn read_max_snapshot_frames_from_env() -> Option<u64> {
+    static CACHED: OnceLock<Option<u64>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_max_snapshot_frames(std::env::var("SQLD_MAX_SNAPSHOT_SIZE").ok().as_deref())
+    })
+}
+
+fn parse_max_snapshot_frames(raw: Option<&str>) -> Option<u64> {
+    let mb = raw?.parse::<u64>().ok()?;
+    if mb == 0 {
+        return None;
+    }
+    let bytes = mb.checked_mul(1_000_000)?;
+    Some(bytes / LogFile::FRAME_SIZE as u64)
+}
+
+/// Read `SQLD_MAX_SNAPSHOT_COUNT`; falls back to `MAX_SNAPSHOT_NUMBER` (32) when unset.
+///
+/// When pairing a low `SQLD_MAX_SNAPSHOT_SIZE` with a low `SQLD_MAX_LOG_SIZE` (so that
+/// each `.snap` file stays small on disk), this count needs to be raised in lockstep,
+/// otherwise the count-trigger fires and undoes the chunking by merging many small files
+/// into one large one. Lower bounds an operator should respect:
+///
+///   SQLD_MAX_SNAPSHOT_COUNT >= expected_total_snapshot_bytes / SQLD_MAX_LOG_SIZE
+///   SQLD_MAX_SNAPSHOT_COUNT >= expected_total_snapshot_bytes / SQLD_MAX_SNAPSHOT_SIZE
+///
+/// (the latter because the count is checked post-merge too: a successful chunked merge
+/// produces about `total / cap` files).
+fn read_max_snapshot_count_from_env() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("SQLD_MAX_SNAPSHOT_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MAX_SNAPSHOT_NUMBER)
+    })
+}
 
 /// returns (db_id, start_frame_no, end_frame_no) for the given snapshot name
 fn parse_snapshot_name(name: &str) -> Option<(Uuid, u64, u64)> {
@@ -242,6 +351,51 @@ impl LogCompactor {
     }
 }
 
+/// Snapshot policy: caps used by `should_compact` / `merge_snapshots`.
+///
+/// Carried as a struct so the merger does not depend on process-global state and so the
+/// pure decision functions can be unit-tested with arbitrary values. The single env-read
+/// happens in `SnapshotPolicy::from_env` at `SnapshotMerger::new` time.
+#[derive(Clone, Copy, Debug)]
+struct SnapshotPolicy {
+    /// `Some(max_frames)` enforces the user-configured cap; `None` selects the legacy
+    /// `SNAPHOT_SPACE_AMPLIFICATION_FACTOR * db_page_count` rule.
+    max_frames: Option<u64>,
+    /// File-count cap. Always >= 1.
+    max_count: usize,
+}
+
+impl SnapshotPolicy {
+    fn from_env() -> Self {
+        Self {
+            max_frames: read_max_snapshot_frames_from_env(),
+            max_count: read_max_snapshot_count_from_env(),
+        }
+    }
+
+    /// Decide whether to spawn a merge job for `snapshots`.
+    ///
+    /// Returns false when the merger has nothing actionable to do (every batch would be
+    /// a passthrough singleton). Without this guard the merger spins a hot loop
+    /// re-spawning no-op merge jobs on every snapshot registration once the working set
+    /// crosses the cap.
+    fn should_compact(&self, snapshots: &[(String, u64)], db_page_count: u32) -> bool {
+        let snapshots_size: u64 = snapshots.iter().map(|(_, s)| *s).sum();
+        let size_trigger = match self.max_frames {
+            Some(max) => snapshots_size >= max,
+            None => snapshots_size >= SNAPHOT_SPACE_AMPLIFICATION_FACTOR * db_page_count as u64,
+        };
+        let count_trigger = snapshots.len() > self.max_count;
+        if !(size_trigger || count_trigger) {
+            return false;
+        }
+        // No merge would actually combine anything (all singletons / oversized passthroughs).
+        // Triggering anyway costs a tokio::spawn + N file opens per registration forever.
+        let batches = group_snapshots_for_merge(snapshots, self.max_frames);
+        merge_makes_progress(&batches)
+    }
+}
+
 struct SnapshotMerger {
     /// Sending part of a channel of (snapshot_name, snapshot_frame_count, db_page_count) to the merger thread
     sender: mpsc::Sender<(String, u64, u32)>,
@@ -258,9 +412,17 @@ impl SnapshotMerger {
         let (sender, receiver) = mpsc::channel(1);
 
         let db_path = db_path.to_path_buf();
+        let policy = SnapshotPolicy::from_env();
         let handle = tokio::task::spawn(async move {
-            Self::run_snapshot_merger_loop(receiver, &db_path, log_id, scripted_backup, namespace)
-                .await
+            Self::run_snapshot_merger_loop(
+                receiver,
+                &db_path,
+                log_id,
+                scripted_backup,
+                namespace,
+                policy,
+            )
+            .await
         });
 
         Ok(Self {
@@ -269,18 +431,13 @@ impl SnapshotMerger {
         })
     }
 
-    fn should_compact(snapshots: &[(String, u64)], db_page_count: u32) -> bool {
-        let snapshots_size: u64 = snapshots.iter().map(|(_, s)| *s).sum();
-        snapshots_size >= SNAPHOT_SPACE_AMPLIFICATION_FACTOR * db_page_count as u64
-            || snapshots.len() > MAX_SNAPSHOT_NUMBER
-    }
-
     async fn run_snapshot_merger_loop(
         mut receiver: mpsc::Receiver<(String, u64, u32)>,
         db_path: &Path,
         log_id: Uuid,
         scripted_backup: Option<ScriptBackupManager>,
         namespace: NamespaceName,
+        policy: SnapshotPolicy,
     ) -> anyhow::Result<()> {
         let mut snapshots = Self::init_snapshot_info_list(db_path).await?;
         let mut working = false;
@@ -290,7 +447,7 @@ impl SnapshotMerger {
             tokio::select! {
                 Some((name, size, db_page_count)) = receiver.recv() => {
                     snapshots.push((name, size));
-                    if !working && Self::should_compact(&snapshots, db_page_count) {
+                    if !working && policy.should_compact(&snapshots, db_page_count) {
                         let snapshots = std::mem::take(&mut snapshots);
                         let db_path = db_path.clone();
                         let handle = tokio::spawn({
@@ -298,7 +455,7 @@ impl SnapshotMerger {
                             let namespace = namespace.clone();
                             async move {
                                 let compacted_snapshot_info =
-                                    Self::merge_snapshots(snapshots, db_path.as_ref(), log_id, scripted_backup, namespace).await?;
+                                    Self::merge_snapshots(snapshots, db_path.as_ref(), log_id, scripted_backup, namespace, policy.max_frames).await?;
                                 anyhow::Result::<_, anyhow::Error>::Ok(compacted_snapshot_info)
                             }
                         });
@@ -310,8 +467,21 @@ impl SnapshotMerger {
                     working = false;
                     job.set(std::future::pending());
                     let ret = ret??;
-                    // the new merged snapshot is prepended to the snapshot list
-                    snapshots.insert(0, ret);
+                    // The merged snapshot(s) cover the oldest frames. `merge_snapshots`
+                    // returns them in chronological (oldest-first) order, and at this
+                    // point any item still in `snapshots` arrived during the merge job
+                    // (post `mem::take`) and is therefore strictly newer than every
+                    // returned item. We prepend with `splice` (single shift, O(n)) instead
+                    // of repeated `insert(i, _)` (O(n·k)).
+                    debug_assert!(
+                        ret.windows(2).all(|w| {
+                            let a = parse_snapshot_name(&w[0].0).map(|(_, s, _)| s).unwrap_or(0);
+                            let b = parse_snapshot_name(&w[1].0).map(|(_, s, _)| s).unwrap_or(u64::MAX);
+                            a < b
+                        }),
+                        "merge_snapshots must return batches in ascending start_frame_no order"
+                    );
+                    snapshots.splice(0..0, ret);
                 }
                 else => return Ok(())
             }
@@ -353,47 +523,88 @@ impl SnapshotMerger {
             .collect())
     }
 
+    /// Merge accumulated snapshots according to the configured `max_frames` cap.
+    ///
+    /// **Returned ordering contract**: output is in chronological (oldest-first) order,
+    /// and the start_frame_no of each returned item is strictly less than the next.
+    /// `run_snapshot_merger_loop` relies on this to prepend the result with a single
+    /// `splice` while preserving the global frame-no ordering. Do not reorder.
+    ///
+    /// **Failure semantics**: on per-batch I/O error, batches `0..K` have already merged
+    /// successfully and their input files have been deleted from disk. The orphaned
+    /// merged outputs for `0..K` and the un-merged inputs for `K+1..N` will be discovered
+    /// and re-registered by `init_snapshot_info_list` on the next process restart. This
+    /// matches upstream's pre-existing failure mode (single-file scope), just with a
+    /// larger blast radius. Tracked separately; not addressed in this patch.
     async fn merge_snapshots(
         snapshots: Vec<(String, u64)>,
         db_path: &Path,
         log_id: Uuid,
         scripted_backup: Option<ScriptBackupManager>,
         namespace: NamespaceName,
-    ) -> anyhow::Result<(String, u64)> {
-        let mut builder = SnapshotBuilder::new(db_path, log_id, scripted_backup, namespace).await?;
-        let snapshot_dir_path = snapshot_dir_path(db_path);
-        let mut size_after = None;
-        tracing::debug!("merging {} snashots for {log_id}", snapshots.len());
-        for (name, _) in snapshots.iter().rev() {
-            // NOTICE: no encryptor passed in order to read frames as is, still encrypted
-            let snapshot = SnapshotFile::open(&snapshot_dir_path.join(name), None).await?;
-            // The size after the merged snapshot is the size after the first snapshot to be merged
-            if size_after.is_none() {
-                size_after.replace(snapshot.header().size_after);
-            }
-            builder
-                .append_frames(snapshot.into_stream_mut().map_err(|e| anyhow::anyhow!(e)))
-                .await?;
-        }
-
-        let (_, start_frame_no, _) = parse_snapshot_name(&snapshots[0].0).unwrap();
-        let (_, _, end_frame_no) = parse_snapshot_name(&snapshots.last().unwrap().0).unwrap();
-
+        max_frames: Option<u64>,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        // When `max_frames` is `Some`, group input snapshots greedily into batches whose
+        // summed frame count fits under the cap. Each batch becomes one output `.snap`
+        // file, ensuring no merger-produced file ever exceeds the cap. A batch of size 1
+        // is left as-is (skip the merge copy). When `None`, fall back to the legacy
+        // behavior: collapse everything into a single file.
+        let batches = group_snapshots_for_merge(&snapshots, max_frames);
         tracing::debug!(
-            "created merged snapshot for {log_id} from frame {start_frame_no} to {end_frame_no}"
+            "merging {} snapshots for {log_id} into {} batch(es) (max_frames={:?})",
+            snapshots.len(),
+            batches.len(),
+            max_frames,
         );
 
-        builder.header.start_frame_no = start_frame_no.into();
-        builder.header.end_frame_no = end_frame_no.into();
-        builder.header.size_after = size_after.unwrap();
+        let snapshot_dir_path = snapshot_dir_path(db_path);
+        let mut out: Vec<(String, u64)> = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let batch = &snapshots[batch];
+            if batch.len() == 1 {
+                // Single oversized or stand-alone snapshot — leave it in place untouched
+                // so that we never produce a merged file larger than the configured cap.
+                out.push(batch[0].clone());
+                continue;
+            }
 
-        let meta = builder.finish().await?;
+            let mut builder =
+                SnapshotBuilder::new(db_path, log_id, scripted_backup.clone(), namespace.clone())
+                    .await?;
+            let mut size_after = None;
+            for (name, _) in batch.iter().rev() {
+                // NOTICE: no encryptor passed in order to read frames as is, still encrypted
+                let snapshot = SnapshotFile::open(&snapshot_dir_path.join(name), None).await?;
+                // The size after the merged snapshot is the size after the first snapshot to be merged
+                if size_after.is_none() {
+                    size_after.replace(snapshot.header().size_after);
+                }
+                builder
+                    .append_frames(snapshot.into_stream_mut().map_err(|e| anyhow::anyhow!(e)))
+                    .await?;
+            }
 
-        for (name, _) in snapshots.iter() {
-            tokio::fs::remove_file(&snapshot_dir_path.join(name)).await?;
+            let (_, start_frame_no, _) = parse_snapshot_name(&batch[0].0).unwrap();
+            let (_, _, end_frame_no) = parse_snapshot_name(&batch.last().unwrap().0).unwrap();
+
+            tracing::debug!(
+                "created merged snapshot for {log_id} from frame {start_frame_no} to {end_frame_no}"
+            );
+
+            builder.header.start_frame_no = start_frame_no.into();
+            builder.header.end_frame_no = end_frame_no.into();
+            builder.header.size_after = size_after.unwrap();
+
+            let meta = builder.finish().await?;
+
+            for (name, _) in batch.iter() {
+                tokio::fs::remove_file(&snapshot_dir_path.join(name)).await?;
+            }
+
+            out.push((meta.0, meta.1));
         }
 
-        Ok((meta.0, meta.1))
+        Ok(out)
     }
 
     async fn register_snapshot(
@@ -578,11 +789,247 @@ mod test {
     use tempfile::tempdir;
     use zerocopy::FromBytes;
 
+    use super::*;
     use crate::replication::primary::logger::WalPage;
     use crate::replication::snapshot::SnapshotFile;
     use crate::LIBSQL_PAGE_SIZE;
 
-    use super::*;
+    fn entry(name: &str, count: u64) -> (String, u64) {
+        (name.to_string(), count)
+    }
+
+    // ---------- group_snapshots_for_merge ----------
+
+    #[test]
+    fn group_snapshots_legacy_no_max_returns_single_batch() {
+        let snaps = vec![entry("a", 10), entry("b", 20), entry("c", 5)];
+        assert_eq!(group_snapshots_for_merge(&snaps, None), vec![0..3]);
+    }
+
+    #[test]
+    fn group_snapshots_empty_input() {
+        assert!(group_snapshots_for_merge(&[], Some(100)).is_empty());
+        assert!(group_snapshots_for_merge(&[], None).is_empty());
+    }
+
+    #[test]
+    fn group_snapshots_packs_under_max() {
+        // max = 25, sequence 10,10,10,10 → (10+10) (10+10)
+        let snaps = vec![
+            entry("a", 10),
+            entry("b", 10),
+            entry("c", 10),
+            entry("d", 10),
+        ];
+        assert_eq!(
+            group_snapshots_for_merge(&snaps, Some(25)),
+            vec![0..2, 2..4]
+        );
+    }
+
+    #[test]
+    fn group_snapshots_acc_plus_count_equal_to_max_packs() {
+        // Boundary: acc(10)+count(10)=20 == max → must pack together (uses `>` not `>=`).
+        let snaps = vec![entry("a", 10), entry("b", 10), entry("c", 5)];
+        assert_eq!(
+            group_snapshots_for_merge(&snaps, Some(20)),
+            vec![0..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn group_snapshots_count_exactly_at_max_is_not_oversized() {
+        // Boundary: count == max must not be flagged as oversized singleton (uses `>`).
+        // The file fills its own batch but goes through the regular packing path: it
+        // arrives with acc=0, then `acc + count(=max) > max` is false, so it joins a
+        // batch alone; the next file would overflow and start a new batch.
+        let snaps = vec![entry("exact", 25), entry("after", 10)];
+        // Both items singleton-by-overflow; neither is the oversized passthrough kind.
+        assert_eq!(
+            group_snapshots_for_merge(&snaps, Some(25)),
+            vec![0..1, 1..2]
+        );
+    }
+
+    #[test]
+    fn group_snapshots_strictly_oversized_input_is_passthrough_singleton() {
+        // count > max: oversized passthrough, isolated as its own batch.
+        let snaps = vec![
+            entry("a", 10),
+            entry("big", 50),
+            entry("c", 10),
+            entry("d", 10),
+        ];
+        assert_eq!(
+            group_snapshots_for_merge(&snaps, Some(25)),
+            vec![0..1, 1..2, 2..4]
+        );
+    }
+
+    #[test]
+    fn group_snapshots_consecutive_oversized_inputs() {
+        // Run of oversized files at the start, middle, and end. Each must be its own
+        // singleton; the small files between must pack normally.
+        let snaps = vec![
+            entry("big1", 100),
+            entry("big2", 100),
+            entry("a", 5),
+            entry("b", 5),
+            entry("big3", 100),
+            entry("c", 5),
+        ];
+        assert_eq!(
+            group_snapshots_for_merge(&snaps, Some(20)),
+            vec![0..1, 1..2, 2..4, 4..5, 5..6]
+        );
+    }
+
+    #[test]
+    fn group_snapshots_each_under_cap_but_sum_over() {
+        // max=15, sequence 10,10,10 → each fits alone (10<15), pairs do not (20>15).
+        let snaps = vec![entry("a", 10), entry("b", 10), entry("c", 10)];
+        assert_eq!(
+            group_snapshots_for_merge(&snaps, Some(15)),
+            vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn group_snapshots_property_no_batch_exceeds_cap() {
+        // Property check: for any grouping, sum(counts in batch) <= max OR batch.len()==1.
+        let snaps = vec![
+            entry("a", 7),
+            entry("b", 12),
+            entry("c", 3),
+            entry("big", 99),
+            entry("d", 8),
+            entry("e", 8),
+            entry("f", 8),
+        ];
+        let max = 20u64;
+        let batches = group_snapshots_for_merge(&snaps, Some(max));
+        for b in &batches {
+            let sum: u64 = snaps[b.clone()].iter().map(|(_, c)| *c).sum();
+            assert!(
+                sum <= max || b.end - b.start == 1,
+                "batch {:?} sum={} exceeds cap={} and is not a passthrough singleton",
+                b,
+                sum,
+                max
+            );
+        }
+    }
+
+    // ---------- merge_makes_progress ----------
+
+    #[test]
+    fn merge_makes_progress_all_singletons_returns_false() {
+        // After grouping, every batch is len==1 → nothing to merge.
+        let batches = vec![0..1, 1..2, 2..3];
+        assert!(!merge_makes_progress(&batches));
+    }
+
+    #[test]
+    fn merge_makes_progress_any_multi_batch_returns_true() {
+        let batches = vec![0..1, 1..3, 3..4];
+        assert!(merge_makes_progress(&batches));
+    }
+
+    #[test]
+    fn merge_makes_progress_empty_returns_false() {
+        assert!(!merge_makes_progress(&[]));
+    }
+
+    // ---------- SnapshotPolicy::should_compact ----------
+
+    fn legacy_policy() -> SnapshotPolicy {
+        SnapshotPolicy { max_frames: None, max_count: MAX_SNAPSHOT_NUMBER }
+    }
+    fn cap_policy(max_frames: u64, max_count: usize) -> SnapshotPolicy {
+        SnapshotPolicy { max_frames: Some(max_frames), max_count }
+    }
+
+    #[test]
+    fn should_compact_legacy_amplification_trigger() {
+        // Legacy: total >= 2 * db_page_count fires.
+        let snaps = vec![entry("a", 100), entry("b", 100)]; // total 200
+        assert!(legacy_policy().should_compact(&snaps, 80));      // 200 >= 160
+        assert!(!legacy_policy().should_compact(&snaps, 200));    // 200 <  400
+    }
+
+    #[test]
+    fn should_compact_legacy_count_trigger() {
+        // Legacy: count > MAX_SNAPSHOT_NUMBER fires regardless of size.
+        let snaps: Vec<_> = (0..(MAX_SNAPSHOT_NUMBER + 1))
+            .map(|i| entry(&format!("s{i}"), 1))
+            .collect();
+        // With db_page_count enormous, size trigger does NOT fire — only count does.
+        // But group_snapshots_for_merge with max_frames=None returns one batch
+        // covering all, so merge_makes_progress is true (len > 1) → should_compact true.
+        assert!(legacy_policy().should_compact(&snaps, u32::MAX));
+    }
+
+    #[test]
+    fn should_compact_cap_size_trigger_with_progress() {
+        // Cap mode: total >= cap fires when batches actually combine something.
+        let snaps = vec![entry("a", 10), entry("b", 10), entry("c", 10)]; // total 30
+        let policy = cap_policy(25, 100);
+        // Total 30 >= cap 25 → size trigger fires. Grouping = [0..2, 2..3] → one
+        // multi-batch → progress → should_compact true.
+        assert!(policy.should_compact(&snaps, 0));
+    }
+
+    #[test]
+    fn should_compact_cap_below_threshold_returns_false() {
+        let snaps = vec![entry("a", 10), entry("b", 10)]; // total 20
+        let policy = cap_policy(25, 100);
+        // Below cap and well below count → false.
+        assert!(!policy.should_compact(&snaps, 0));
+    }
+
+    #[test]
+    fn should_compact_cap_no_progress_avoids_hot_loop() {
+        // Critical: every snapshot is at-or-above cap, so grouping yields all singletons.
+        // Even though `total >= cap` and `count > max_count`, should_compact must return
+        // false to avoid spawning useless merge jobs forever.
+        let snaps = vec![
+            entry("big1", 100),
+            entry("big2", 100),
+            entry("big3", 100),
+            entry("big4", 100),
+        ];
+        let policy = cap_policy(20, 2); // cap exceeded; count exceeded
+        assert!(!policy.should_compact(&snaps, 0));
+    }
+
+    #[test]
+    fn should_compact_cap_count_override() {
+        // SQLD_MAX_SNAPSHOT_COUNT raises the count trigger above the legacy 32.
+        let snaps: Vec<_> = (0..50).map(|i| entry(&format!("s{i}"), 1)).collect(); // total 50
+        // cap=10000 (size never trips), max_count=100 (count never trips), 50 small files.
+        let policy = cap_policy(10_000, 100);
+        assert!(!policy.should_compact(&snaps, 0));
+        // Now drop max_count below 50 → count trigger fires AND grouping packs them all
+        // into one big batch (50 files of size 1, sum=50 <= cap=10000) → progress.
+        let policy = cap_policy(10_000, 25);
+        assert!(policy.should_compact(&snaps, 0));
+    }
+
+    // ---------- parse_max_snapshot_frames ----------
+
+    #[test]
+    fn parse_max_snapshot_frames_handles_inputs() {
+        // unset / empty / non-numeric / zero → None (legacy fallback)
+        assert_eq!(parse_max_snapshot_frames(None), None);
+        assert_eq!(parse_max_snapshot_frames(Some("")), None);
+        assert_eq!(parse_max_snapshot_frames(Some("abc")), None);
+        assert_eq!(parse_max_snapshot_frames(Some("0")), None);
+        // Valid: 20 MB → frames = 20_000_000 / FRAME_SIZE.
+        let expected = 20u64 * 1_000_000 / LogFile::FRAME_SIZE as u64;
+        assert_eq!(parse_max_snapshot_frames(Some("20")), Some(expected));
+        // Overflow on mb * 1_000_000 → None (fail-safe to legacy).
+        assert_eq!(parse_max_snapshot_frames(Some("99999999999999999")), None);
+    }
 
     async fn dir_is_empty(p: &Path) -> bool {
         // there is nothing left in the to_compact directory
