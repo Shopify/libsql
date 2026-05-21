@@ -231,10 +231,24 @@ where
                 .to_string();
             let is_grpc = content_type.contains("grpc");
 
-            if status != http::StatusCode::OK || !is_grpc {
-                // Buffer the body to log it, then re-create the response
-                let (parts, body) = resp.into_parts();
-                let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+            // Diagnostic branch: buffer every response before tonic-web parses
+            // grpc-web frames, then re-create the body for normal consumption.
+            // This lets us catch malformed 200 OK grpc-looking responses whose
+            // first frame byte would otherwise only surface as "Invalid header bit".
+            let (parts, body) = resp.into_parts();
+            let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+            let first_body_byte = body_bytes.first().copied();
+            let first_body_byte_hex = first_body_byte.map(|byte| format!("0x{byte:02x}"));
+            let first_body_byte_ascii = first_body_byte.map(|byte| {
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    (byte as char).to_string()
+                } else {
+                    format!("\\x{byte:02x}")
+                }
+            });
+            let valid_grpc_web_first_byte = matches!(first_body_byte, None | Some(0 | 1 | 128));
+
+            if status != http::StatusCode::OK || !is_grpc || !valid_grpc_web_first_byte {
                 let preview_len = std::cmp::min(body_bytes.len(), 1024);
                 let body_preview = String::from_utf8_lossy(&body_bytes[..preview_len]);
                 tracing::warn!(
@@ -242,14 +256,24 @@ where
                     uri = %uri,
                     content_type = %content_type,
                     body_len = body_bytes.len(),
+                    first_body_byte = ?first_body_byte,
+                    first_body_byte_hex = ?first_body_byte_hex,
+                    first_body_byte_ascii = ?first_body_byte_ascii,
                     body_preview = %body_preview,
-                    "[libsql diagnostic] non-gRPC HTTP response — will cause 'Invalid header bit' error"
+                    "[libsql diagnostic] raw HTTP response may fail grpc-web framing"
                 );
-                Ok(http::Response::from_parts(parts, hyper::Body::from(body_bytes)))
             } else {
-                tracing::trace!(status = %status, uri = %uri, "[libsql diagnostic] gRPC response OK");
-                Ok(resp)
+                tracing::trace!(
+                    status = %status,
+                    uri = %uri,
+                    content_type = %content_type,
+                    body_len = body_bytes.len(),
+                    first_body_byte = ?first_body_byte,
+                    "[libsql diagnostic] raw HTTP response has valid grpc-web first byte"
+                );
             }
+
+            Ok(http::Response::from_parts(parts, hyper::Body::from(body_bytes)))
         })
     }
 }
