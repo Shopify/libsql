@@ -394,6 +394,19 @@ impl Database {
     }
 
     #[cfg(feature = "replication")]
+    /// Cancels the currently running v1 remote-replica sync, if any, for terminal shutdown/cleanup.
+    pub fn cancel_current_sync_for_shutdown(&self) -> Result<bool> {
+        if let Some(ctx) = &self.replication_ctx {
+            Ok(ctx.replicator.cancel_current_sync_for_shutdown())
+        } else {
+            Err(crate::errors::Error::Misuse(
+                "No replicator available. Use Database::with_replicator() to enable replication"
+                    .to_string(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "replication")]
     /// Return detailed logs about bytes synced with primary
     pub async fn get_sync_usage_stats(&self) -> Result<SyncUsageStats> {
         if let Some(ctx) = &self.replication_ctx {
