@@ -162,7 +162,8 @@ impl ConfigureNamespace for ReplicaConfigurator {
                         e @ (Error::Internal(_)
                             | Error::Client(_)
                             | Error::PrimaryHandshakeTimeout
-                            | Error::NeedSnapshot) => {
+                            | Error::NeedSnapshot
+                            | Error::SyncCancelledForShutdown) => {
                             tracing::warn!("non-fatal replication error, retrying from last commit index: {e}");
                         },
                         Error::NoHandshake => {
