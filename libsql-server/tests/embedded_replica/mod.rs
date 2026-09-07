@@ -1796,3 +1796,118 @@ fn remote_replica_namespace_header_support() {
 
     sim.run().unwrap();
 }
+
+#[test]
+fn replicate_cross_namespace_denied() {
+    init_tracing();
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+
+    let (encoding, decoding) = common::auth::key_pair();
+    sim.host("primary", {
+        let decoding = decoding.clone();
+        move || {
+            let decoding = decoding.clone();
+            async move {
+                let tmp = tempdir()?;
+                let jwt_keys =
+                    vec![jsonwebtoken::DecodingKey::from_ed_components(&decoding).unwrap()];
+                let auth = Auth::new(user_auth_strategies::Jwt::new(jwt_keys));
+                let server = TestServer {
+                    path: tmp.path().to_owned().into(),
+                    user_api_config: UserApiConfig {
+                        hrana_ws_acceptor: None,
+                        auth_strategy: auth,
+                        ..Default::default()
+                    },
+                    admin_api_config: Some(AdminApiConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
+                        connector: TurmoilConnector,
+                        disable_metrics: true,
+                        auth_key: None,
+                    }),
+                    rpc_server_config: Some(RpcServerConfig {
+                        acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
+                        tls_config: None,
+                    }),
+                    disable_namespaces: false,
+                    disable_default_namespace: true,
+                    ..Default::default()
+                };
+
+                server.start_sim(8080).await?;
+
+                Ok(())
+            }
+        }
+    });
+
+    sim.client("client", async move {
+        // Create two distinct namespaces.
+        let client = Client::new();
+        client
+            .post("http://primary:9090/v1/namespaces/ns1/create", json!({}))
+            .await?;
+        client
+            .post("http://primary:9090/v1/namespaces/ns2/create", json!({}))
+            .await?;
+
+        // Token scoped to ns1 only.
+        let ns1_token = encode(
+            &serde_json::json!({
+                "p": { "ro": { "ns": ["ns1"] } },
+            }),
+            &encoding,
+        );
+
+        // Sanity: ns1 token works against ns1.
+        let tmp = tempdir().unwrap();
+        let db = Database::open_with_remote_sync_connector(
+            tmp.path().join("embedded-ns1").to_str().unwrap(),
+            "http://ns1.primary:8080",
+            ns1_token.clone(),
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+        assert!(db.sync().await.is_ok());
+
+        // Negative: ns1 token must NOT replicate ns2.
+        let tmp = tempdir().unwrap();
+        let db = Database::open_with_remote_sync_connector(
+            tmp.path().join("embedded-ns2").to_str().unwrap(),
+            "http://ns2.primary:8080",
+            ns1_token.clone(),
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+        assert!(db.sync().await.is_err());
+
+        // Token scoped to both namespaces can replicate both (control).
+        let both_token = encode(
+            &serde_json::json!({
+                "p": { "ro": { "ns": ["ns1", "ns2"] } },
+            }),
+            &encoding,
+        );
+        let tmp = tempdir().unwrap();
+        let db = Database::open_with_remote_sync_connector(
+            tmp.path().join("embedded-ns2-both").to_str().unwrap(),
+            "http://ns2.primary:8080",
+            both_token.clone(),
+            TurmoilConnector,
+            false,
+            None,
+        )
+        .await?;
+        assert!(db.sync().await.is_ok());
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}

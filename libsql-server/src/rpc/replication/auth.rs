@@ -39,7 +39,12 @@ pub async fn authenticate<T>(
     if let Some(auth) = auth {
         let context = parse_grpc_auth_header(req.metadata(), &auth.user_strategy.required_fields())
             .map_err(|e| tonic::Status::internal(format!("Error parsing auth header: {}", e)))?;
-        auth.authenticate(context)?;
+        let authenticated = auth.authenticate(context)?;
+        if !authenticated.is_namespace_authorized(&namespace) {
+            return Err(tonic::Status::permission_denied(
+                "not authorized to replicate this namespace",
+            ));
+        }
     }
 
     Ok(())
