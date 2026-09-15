@@ -212,6 +212,10 @@ async fn auth_middleware<B>(
     next: Next<B>,
 ) -> Result<axum::response::Response, StatusCode> {
     if let Some(ref auth) = auth {
+        if request.method() == hyper::Method::GET && request.uri().path() == "/metrics" {
+            return Ok(next.run(request).await);
+        }
+
         let Some(auth_header) = request.headers().get("authorization") else {
             return Err(StatusCode::UNAUTHORIZED);
         };
