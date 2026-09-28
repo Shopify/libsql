@@ -217,7 +217,7 @@ static int vectorParseSqliteText(
       continue;
     }
     if( this != ',' && this != ']' ){
-      if( iBuf > MAX_FLOAT_CHAR_SZ ){
+      if( iBuf >= MAX_FLOAT_CHAR_SZ ){
         *pzErrMsg = sqlite3_mprintf("vector: float string length exceeded %d characters: '%s'", MAX_FLOAT_CHAR_SZ, valueBuf);
         goto error;
       }
