@@ -201,6 +201,56 @@ do_execsql_test vector-1-conversion-f8 {
   {[-20,-35.25,1.0625,1.63281,2.20313,2.76563,10.1875,99.5,104.5,110]} A0C10DC2883FD13F0D4031402341C742D142DC4206
 }
 
+foreach {name sql} {
+  vector {SELECT vector_extract(vector($input)) = vector_extract(vector('[1]'))}
+  vector32 {SELECT vector_extract(vector32($input)) = vector_extract(vector32('[1]'))}
+  vector64 {SELECT vector_extract(vector64($input)) = vector_extract(vector64('[1]'))}
+  vector8 {SELECT vector_extract(vector8($input)) = vector_extract(vector8('[1]'))}
+  vector16 {SELECT vector_extract(vector16($input)) = vector_extract(vector16('[1]'))}
+  vectorb16 {SELECT vector_extract(vectorb16($input)) = vector_extract(vectorb16('[1]'))}
+  vector1bit {SELECT vector_extract(vector1bit($input)) = vector_extract(vector1bit('[1]'))}
+  extract {SELECT vector_extract($input) = '[1]'}
+  cos-left {SELECT vector_distance_cos($input, '[1]') = 0}
+  cos-right {SELECT vector_distance_cos('[1]', $input) = 0}
+  l2-left {SELECT vector_distance_l2($input, '[1]') = 0}
+  l2-right {SELECT vector_distance_l2('[1]', $input) = 0}
+} {
+  foreach length {1023 1024} {
+    set element "[string repeat 0 [expr {$length - 1}]]1"
+    set input [format {[%s]} $element]
+    do_execsql_test vector-1-text-length-$name-$length $sql {1}
+  }
+
+  foreach length {1025 1026 5000} {
+    set input [format {[%s]} [string repeat 1 $length]]
+    do_catchsql_test vector-1-text-length-$name-$length $sql [list 1 \
+      "vector: float string length exceeded 1024 characters: '[string repeat 1 1024]'"
+    ]
+  }
+
+  set element "1[string repeat x 1023]"
+  set input [format {[%s]} $element]
+  do_catchsql_test vector-1-text-length-$name-invalid-1024 $sql [list 1 \
+    "vector: invalid float at position 0: '$element'"
+  ]
+
+  set input [format {[%sx]} $element]
+  do_catchsql_test vector-1-text-length-$name-invalid-1025 $sql [list 1 \
+    "vector: float string length exceeded 1024 characters: '$element'"
+  ]
+}
+
+set element "[string repeat 0 1023]1"
+set input [format {[%s,%s]} $element $element]
+do_execsql_test vector-1-text-length-multiple-elements {
+  SELECT vector_extract(vector($input));
+} {{[1,1]}}
+
+set input [format {[1,%sx]} $element]
+do_catchsql_test vector-1-text-length-invalid-second-element {
+  SELECT vector($input);
+} [list 1 "vector: float string length exceeded 1024 characters: '$element'"]
+
 proc error_messages {sql} {
   set ret ""
   set stmt [sqlite3_prepare db $sql -1 dummy]
@@ -239,3 +289,5 @@ do_test vector-1-func-errors {
   {vector_distance: vectors must have the same type: 1 != 2}
   {vector_distance: l2 distance is not supported for float1bit vectors}
 }]
+
+finish_test
