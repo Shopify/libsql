@@ -59,6 +59,9 @@ impl FenceController {
                 FenceCommand::SetSourceReadFence { .. } => {
                     super::read::set_source_read_fence(&mut transition, &meta, request, ctx).await
                 }
+                FenceCommand::SealTargetImport { .. } => {
+                    super::import::seal_target_import(&mut transition, &meta, request, ctx).await
+                }
                 _ => transition.apply(&meta, request, ctx).await,
             }
         })
@@ -234,7 +237,7 @@ async fn drain_writers(
 ///
 /// With write admission closed a manager that has been seen without a writer stays without one
 /// (only checkpoints can take the slot), so the managers are waited for one after the other.
-async fn wait_for_writers(sources: &[LiveWriteDrain], deadline: Instant) -> bool {
+pub(super) async fn wait_for_writers(sources: &[LiveWriteDrain], deadline: Instant) -> bool {
     for source in sources {
         loop {
             let released = source.manager.released().notified();

@@ -286,6 +286,11 @@ pub struct MakeThrottledConnection<F> {
 }
 
 impl<F> MakeThrottledConnection<F> {
+    /// The connection maker this one throttles.
+    pub(crate) fn inner(&self) -> &F {
+        &self.connection_maker
+    }
+
     fn new(
         semaphore: Arc<Semaphore>,
         connection_maker: F,

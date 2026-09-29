@@ -14,6 +14,7 @@ use tokio::time::Duration;
 use crate::error::Error;
 use crate::metrics::DESCRIBE_COUNT;
 use crate::namespace::broadcasters::BroadcasterHandle;
+use crate::namespace::fence::capability::MigrationCapability;
 use crate::namespace::fence::controller::{FenceConnState, FenceController};
 use crate::namespace::fence::state::OperationClass;
 use crate::namespace::meta_store::MetaStoreHandle;
@@ -143,6 +144,33 @@ where
 
     #[tracing::instrument(skip(self))]
     pub(super) async fn make_connection(&self) -> Result<LegacyConnection<W>> {
+        self.make_connection_with(FenceConnState::new(
+            self.fence.clone(),
+            OperationClass::NormalWrite,
+        ))
+        .await
+    }
+
+    /// Open a connection that works under `capability` (an import or validation session,
+    /// `docs/NAMESPACE_FENCE.md` section 11). It shares the maker's write slot, WAL and
+    /// replication log with every other connection, and is admitted as the capability's class
+    /// only while the capability is valid. It is not counted by the connection throttle: it is
+    /// operation-owned work, and the fence, not the throttle, bounds how much of it runs.
+    pub(crate) async fn make_capability_connection(
+        &self,
+        capability: MigrationCapability,
+    ) -> Result<LegacyConnection<W>> {
+        self.make_connection_with(FenceConnState::with_capability(
+            self.fence.clone(),
+            capability,
+        ))
+        .await
+    }
+
+    async fn make_connection_with(
+        &self,
+        fence: Arc<FenceConnState>,
+    ) -> Result<LegacyConnection<W>> {
         LegacyConnection::new(
             self.db_path.clone(),
             self.extensions.clone(),
@@ -161,7 +189,7 @@ where
             self.resolve_attach_path.clone(),
             self.connection_manager.clone(),
             self.make_wal_manager.clone(),
-            FenceConnState::new(self.fence.clone(), OperationClass::NormalWrite),
+            fence,
         )
         .await
     }
@@ -210,6 +238,13 @@ impl LegacyConnection<libsql_sys::wal::wrapper::PassthroughWalWrapper> {
         )
         .await
         .unwrap()
+    }
+}
+
+impl<T> LegacyConnection<T> {
+    /// The fence state shared by this connection's WAL wrapper and `CoreConnection`.
+    pub(crate) fn fence_state(&self) -> &Arc<FenceConnState> {
+        &self.fence
     }
 }
 
