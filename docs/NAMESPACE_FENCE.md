@@ -298,15 +298,17 @@ CREATE TABLE IF NOT EXISTS namespace_fence_receipts (
 For every mutating command, under the per-namespace transition lock:
 
 1. Authenticate (admin auth) and check the deployment flag.
-2. Compute the fingerprint: SHA-256 over the deterministic protobuf encoding of the command *including* namespace, `operation_id`, command kind and every argument, *excluding* `command_id`.
+2. Compute the fingerprint: SHA-256 over the deterministic protobuf encoding of the command *including* namespace, `operation_id`, command kind, `expected_state`, `expected_revision` and every argument, *excluding* `command_id`.
 3. Look up `(namespace, operation_id, command_id)`:
    - found, same fingerprint, final outcome: return the stored result with `"replayed": true`. This holds even though the revision has since advanced.
    - found, same fingerprint, in-progress (`DRAINING`, or an indeterminate commit being reconciled): resume that same command (section 8.4).
    - found, different fingerprint: `FENCE_COMMAND_CONFLICT`. Nothing changes.
-4. Only a non-replay proceeds: owner check (`FENCE_OWNED_BY_ANOTHER_OPERATION`), role and transition check (`INVALID_FENCE_TRANSITION`, with `detail: role_mismatch` where the role is wrong), `expected_state` and `expected_revision` (`FENCE_REVISION_MISMATCH`), then command-specific preconditions (`FENCE_PRECONDITION_FAILED`).
-5. A command from the owner that asks for the state the record is already in (for example `EnableTargetWrites` when already `TARGET_WRITABLE`) returns `ALREADY_APPLIED`, records a receipt so its own replay is stable, and does not change the revision.
+4. Only a non-replay proceeds. A namespace whose control state cannot be established refuses everything with `FENCE_STATE_UNAVAILABLE`, except the two commands that reconcile it: a replay of the `CreateTargetQuarantined` that left the marker (section 10.1), and `AdoptFence` after a metastore rollback (section 12).
+5. Owner check (`FENCE_OWNED_BY_ANOTHER_OPERATION`) against an unfinished record.
+6. A command from the owner that asks for the state the record is already in (for example `EnableTargetWrites` when already `TARGET_WRITABLE`) returns `ALREADY_APPLIED`, records a receipt so its own replay is stable, and does not change the revision. This is checked before the revision, because the caller's expectation is typically the state before a response it never received. Likewise, a new command from the owner that asks for the drain the record is already in (for example `AcquireSourceWriteFence` in `SOURCE_DRAINING`, after an adoption or a lost `command_id`) records a `DRAINING` receipt without changing the revision and joins that drain.
+7. Role and transition check (`INVALID_FENCE_TRANSITION`, with `detail: role_mismatch` where the role is wrong, or `operation_finished` when the owner has already finished with the namespace), `expected_state` and `expected_revision` (`FENCE_REVISION_MISMATCH`), then command-specific preconditions (`FENCE_PRECONDITION_FAILED`).
 
-The pure part of this — steps 3 to 5 as `apply(record, receipts, command) -> (next record, receipt, outcome)` — is a function with no I/O and is unit-tested exhaustively.
+The pure part of this — steps 3 to 7 as `apply(current, stored receipt, request, env) -> decision`, and the completion of a drain as `complete_drain(record, draining receipt, evidence) -> (next record, final receipt)` — is a function with no I/O (`namespace/fence/transition.rs`) and is unit-tested exhaustively over every state and command.
 
 ### 5.4 Transaction domain
 
@@ -330,7 +332,7 @@ Receipts of the operation that currently owns a record are never pruned. Receipt
 
 ### 5.6 On-disk marker
 
-Each fenced namespace directory holds a small file `dbs/<namespace>/.fence` containing `format_version`, `operation_id`, role, state and revision. It is written (and fsynced) **after** the metastore commit of each transition, and **before** the metastore transaction for `CreateTargetQuarantined` (section 10.1). It exists so that recovery paths that lose or roll back the metastore can tell a fenced namespace from a legacy one:
+Each fenced namespace directory holds a small file `dbs/<namespace>/.fence` containing `format_version` and a copy of the last committed record (so its `operation_id`, role, state, revision and the `command_id` that produced it). It is written (and fsynced) **after** the metastore commit of each transition, and **before** the metastore transaction for `CreateTargetQuarantined` (section 10.1). It exists so that recovery paths that lose or roll back the metastore can tell a fenced namespace from a legacy one:
 
 - metastore row present, marker absent or older: the metastore is authoritative; the marker is rewritten on load (a crash between commit and marker write);
 - marker present, metastore row absent or at a lower revision: the metastore was lost or rolled back; the namespace is `UNKNOWN_UNAVAILABLE`, with provenance `metastore_behind_marker`;
@@ -361,7 +363,7 @@ Notes:
 
 - `FENCE_COMMAND_CONFLICT`: a `command_id` reused with a different request fingerprint.
 - `FENCE_COMMIT_INDETERMINATE`: the server could not establish whether its own commit landed (for example an I/O error on `COMMIT`). Admission stays closed; only a replay of the same `command_id` reconciles it; every other command on the namespace receives this code until then.
-- `FENCE_PRECONDITION_FAILED` carries `detail`, one of: `admin_auth_required`, `fence_disabled`, `not_primary`, `shared_schema_unsupported`, `namespace_identity_mismatch`, `namespace_exists`, `validation_receipt_required`, `restore_not_allowed`, `adoption_not_authorised`.
+- `FENCE_PRECONDITION_FAILED` carries `detail`, one of: `admin_auth_required`, `fence_disabled`, `not_primary`, `shared_schema_unsupported`, `namespace_identity_mismatch`, `namespace_exists`, `validation_receipt_required`, `restore_not_allowed`, `adoption_not_authorised`, `invalid_argument`. `INVALID_FENCE_TRANSITION` may carry `role_mismatch` or `operation_finished`. `FENCE_STATE_UNAVAILABLE` carries the reason the state cannot be established: `corrupt_record`, `unsupported_format_version`, `incomplete_target_creation`, `metastore_behind_marker` or `indeterminate_commit`.
 - **Data-plane denials are never `500`, `503`, `429` or gRPC `UNAVAILABLE`.** `423 Locked` is chosen because common HTTP clients do not retry it. The JSON error body of the user HTTP API gains an additive `"code"` field (`{"error": "...", "code": "MIGRATION_WRITE_FENCED"}`); the existing `Blocked` error (from `block_reads`/`block_writes`) keeps its current mapping.
 - gRPC statuses carry the code in the `x-libsql-fence-code` metadata entry and as the message prefix `"<CODE>: "`.
 - Authentication (`401`), missing namespace (`404`), timeouts and transport errors are distinct from all of the above.
