@@ -128,6 +128,8 @@ pub enum Error {
     RuntimeTaskJoinError(#[from] tokio::task::JoinError),
     #[error("database is not a primary")]
     NotAPrimary,
+    #[error(transparent)]
+    NamespaceFence(#[from] crate::namespace::fence::outcome::FenceError),
 }
 
 impl AsRef<Self> for Error {
@@ -224,6 +226,7 @@ impl IntoResponse for &Error {
             AttachInMigration => self.format_err(StatusCode::BAD_REQUEST),
             RuntimeTaskJoinError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             NotAPrimary => self.format_err(StatusCode::BAD_REQUEST),
+            NamespaceFence(e) => self.format_err(e.outcome().admin_http_status()),
         }
     }
 }
