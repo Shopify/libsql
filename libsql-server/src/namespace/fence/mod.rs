@@ -10,8 +10,8 @@
 //! ([`store`], driven by `MetaStore::apply_fence_command`), and the in-memory authority built
 //! on them: the per-namespace [`controller`] with its gate and read leases, the positive write
 //! [`drain`], the source [`read`] fence and its
-//! [`stream`] leases for dump and replication, quarantined migration [`target`]s, the
-//! [`registry`] that holds the controllers outside the namespace cache, and the test [`hooks`]
+//! [`stream`] leases for dump and replication, quarantined migration [`target`]s with their
+//! [`capability`]-scoped [`import`] sessions and seal drain, the [`registry`] that holds the controllers outside the namespace cache, and the test [`hooks`]
 //! on their paths.
 
 // The persistence, controller and protocol layers that consume these types land in the
@@ -19,10 +19,12 @@
 // the crate. This attribute is removed once they are wired.
 #![allow(dead_code)]
 
+pub mod capability;
 pub mod command;
 pub mod controller;
 pub mod drain;
 pub mod hooks;
+pub mod import;
 pub mod outcome;
 pub mod read;
 pub mod record;

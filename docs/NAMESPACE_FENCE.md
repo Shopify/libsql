@@ -406,7 +406,7 @@ This is additive in proto3: older peers skip the unknown field; a newer replica 
 Per namespace:
 
 - `transition_lock`: a `tokio::sync::Mutex` serialising commands on this namespace. A command holds it from its first check to its response (`FenceController::begin_transition` returns a `Transition` that owns the guard).
-- `gate`: a `tokio::sync::watch` of `GateSnapshot { fence, write_generation, indeterminate, installing, closing_reads, creating_target }`, where `fence` is the durable fence as last published (a record, no record, or `UNKNOWN_UNAVAILABLE` with its detail) and `installing` is the in-memory `INSTALLING` gate of a closing command being persisted (section 8.3), which denies normal writes, vacuum, import writes and lifecycle work on top of `fence`. State, revision, owning operation and every admission (`permits(class)`, `write()`, `read()`) are derived from it through the permission matrix. The WAL wrapper, `CoreConnection`, dump, replication and lifecycle code read it without locks. Phase 5 adds the live capability set.
+- `gate`: a `tokio::sync::watch` of `GateSnapshot { fence, write_generation, indeterminate, installing, closing_reads, creating_target }`, where `fence` is the durable fence as last published (a record, no record, or `UNKNOWN_UNAVAILABLE` with its detail) and `installing` is the in-memory `INSTALLING` gate of a closing command being persisted (section 8.3), which denies normal writes, vacuum, import writes and lifecycle work on top of `fence`. State, revision, owning operation and every admission (`permits(class)`, `write()`, `read()`) are derived from it through the permission matrix. The WAL wrapper, `CoreConnection`, dump, replication and lifecycle code read it without locks. The live capability set is kept beside it (`capabilities`, below).
 - `write_generation: u64`, in the snapshot, **incremented on every publication that changes the fence state, the owning operation, or the indeterminate flag**. That covers every transition that closes or opens write admission (acquire, release, create, seal, publish, enable, abort, adopt), and is conservative for the others. A replay that publishes the same durable state does not move it.
 - `indeterminate: Option<(operation_id, command_id)>`: set when a command's `COMMIT` failed (or the task running it died) so that whether it applied is unknown. While set, every class except `Maintenance` and `Observability` is denied with `FENCE_STATE_UNAVAILABLE` / `indeterminate_commit`, and every other command is refused with `FENCE_COMMIT_INDETERMINATE`. A replay of the same command is answered by the metastore from the durable row (replayed if it had committed, applied if it had not) and clears it (section 8.4).
 - the write-drain sources of the namespace's primary connection makers (`register_write_drain`): each maker's connection manager, held weakly, and its replication log id and last-committed-frame reader, which the write drain waits on and reads the boundary from (section 8.3).
@@ -414,7 +414,7 @@ Per namespace:
 - `creating_target` (in the snapshot): the in-memory target-creation gate of a `CreateTargetQuarantined` being persisted (section 10.1), which denies every class except `Maintenance` and `Observability` with `MIGRATION_TARGET_QUARANTINED`, and makes `FenceRegistry::check_available` refuse the name, so nothing sets the namespace up, serves it or stores a config for it. Never persisted; it moves `write_generation`; the publication of the committed record replaces it, it is removed when the command is proven not to have committed, and it stays (with `indeterminate`) when the outcome is unknown.
 - `closing_reads` (in the snapshot): the in-memory read-closing gate of a `SetSourceReadFence` being persisted (section 9, step 2), which denies `NormalRead` and `Stream` with `MIGRATION_READ_FENCED` on top of `fence`. Never persisted; every publication clears it; it does not move `write_generation` (writes are already closed wherever a read fence can be set).
 - `read_leases`: the live read leases, each with its kind (`sql`, `dump`, `replication`), a cancel handle and a cancelled flag, and a `Notify` on every release. `FenceController::acquire_read_lease(class, kind, cancel)` checks the gate **under the lease lock** and registers the lease, so a lease is either refused by a read-closing gate published before it, or counted by a drain that closes admission after it; once admission is closed the set can only shrink. A `ReadLease` is released when dropped.
-- `capabilities`: the live `MigrationCapability` set and an import-writer counter.
+- `capabilities`: the live `MigrationCapability` set and an import-writer counter (the import calls running now, section 10.2), under a lock that may be taken before a gate borrow and never under one. `issue_capability` checks the gate under this lock and registers the capability; every publication of a transition drops the capabilities whose state, owner or revision no longer match; dropping a session revokes its capability. `begin_import_write` checks the capability against the gate and the live set under the same lock and counts the call, so a call is either refused by a seal that closed admission before it or counted by that seal.
 - in `cfg(test)` builds only, a `FenceTestHooks` (section 16).
 
 `FenceController::apply_command` runs the command on its own task: a caller that goes away after the commit (a lost response) does not prevent the publication. The metastore maps a failed `COMMIT` to `FENCE_COMMIT_INDETERMINATE`; any other error (a refusal by the transition function, a busy metastore, a failure before `COMMIT`) proves nothing was written and leaves the gate exactly as it was.
@@ -428,8 +428,8 @@ Every write-transaction request at the WAL, every read lease and every lifecycle
 | `NormalWrite` | SQL over HTTP, Hrana, RPC, proxy; admin shell; schema migration; dump load outside the capability | normal-write column allows |
 | `Maintenance` | `TRUNCATE` checkpoint, the manager's checkpoint slot, storage monitor | always |
 | `Vacuum` | `vacuum_if_needed`, `Namespace::checkpoint`, snapshot at shutdown | normal-write column allows; otherwise skipped with a debug log. `CoreConnection::vacuum_if_needed_above` checks the gate first and also reports a WAL refusal of the `VACUUM` itself (the fence closing between the check and the statement) as skipped, not failed |
-| `CapabilityImport` | import session writes | `TARGET_QUARANTINED`, matching `operation_id`, capability revision equal to the record's, capability not invalidated |
-| `CapabilityValidate` | validation reads (never writes) | `TARGET_VALIDATING`, `TARGET_WRITE_FENCED` |
+| `CapabilityImport` | import session writes | `TARGET_QUARANTINED`, matching `operation_id`, capability revision equal to the record's, capability live (issued by this server, not revoked, not invalidated by a transition); checked at the WAL in `admit_write` on every write transaction, and up front by every `ImportSession` call |
+| `CapabilityValidate` | validation reads (never writes: the WAL refuses every write transaction of a validation connection) | `TARGET_VALIDATING`, `TARGET_WRITE_FENCED` |
 | `NormalRead` | SQL programs, Hrana cursors, `/beta/listen`, ATTACH of this namespace | normal-read column allows |
 | `Stream` | `/dump`, `hello`, `log_entries`, `batch_log_entries`, `snapshot` | dump/replication column allows |
 | `Observability` | stats, `/v1/jobs`, metrics | always; never counted as a read lease |
@@ -439,6 +439,7 @@ Every write-transaction request at the WAL, every read lease and every lifecycle
 Every `LegacyConnection` receives a `FenceConnState` shared by its `ManagedConnectionWalWrapper` and its `CoreConnection`: the connection's class and capability (if any), `program_generation`, `txn_generation`, and a `denial` slot for the typed outcome of the last WAL refusal.
 
 - `begin_program()` records `program_generation` and clears the denial slot. It is called at the start of every `CoreConnection::run`, of every `with_raw` call (admin shell, schema migration, dump load, the configurators' own uses) and of `vacuum_if_needed`, so every way of running SQL on the connection is a program.
+- A capability connection (an import or validation session, section 11) is built with `FenceConnState::with_capability`: its class is the capability's, and `admit_write` additionally requires the capability to match the fence (state its purpose admits, owner, revision) and to be live.
 - `begin_read_txn()` records `txn_generation`. The WAL wrapper calls it from `begin_read_txn` **before** the snapshot is taken, so a transition racing with it leaves the transaction with the older generation, which can only refuse a later upgrade.
 - `admit_write()` is the check of section 8.1 (2). A refusal is stored in the denial slot and returned.
 
@@ -545,7 +546,14 @@ The target's replication `log_id` is not written back into the record: rewriting
 
 ### 10.2 SealTargetImport
 
-CAS `TARGET_IMPORT_DRAINING` (revision + 1, so every issued import capability is invalidated and no new one can be issued); wait for the import-writer count and the manager's `CapabilityImport` holder to reach zero (same mechanism as section 8.3, with the drain policy from the request); CAS `TARGET_VALIDATING`. A timeout leaves `TARGET_IMPORT_DRAINING` durable and closed; only a replay of the same command resumes it.
+`seal_target_import` (routed from `FenceController::execute`) runs under the transition lock:
+
+1. For a seal that can apply (the owner, at the current revision, of a `TARGET_QUARANTINED` target, with nothing indeterminate or installing), publish the in-memory `INSTALLING` gate: new import calls and import write transactions are refused, the write generation moves (so every transaction opened before it is stale) and queued import writers are woken and refused. A command that cannot apply does not touch the gate, so it cannot disturb a running import.
+2. CAS `TARGET_IMPORT_DRAINING` (revision + 1). Its publication replaces the `INSTALLING` gate and drops every issued import capability: none can be issued again for the target. A command proven not to have committed removes the `INSTALLING` gate.
+3. Wait, on release notifications and never on elapsed time, for the running import calls (the controller's import-writer counter) to end, then for every connection manager of the target to have no writer holding its write slot (an import transaction admitted before step 1, including one an idle session left open). With `on_deadline: force_rollback` the seal rolls back the transaction still holding the slot at the deadline (a running call ends its own; the rollback waits for the connection's lock) and waits again for the same deadline, at least 10 s. The request's drain policy applies; without one, `--namespace-fence-default-write-drain-ms`. A target without a loaded connection maker has no connection that could write.
+4. CAS `TARGET_VALIDATING` (`complete_drain`, `DrainCompletion::TargetImport`).
+
+A deadline reached before step 4 answers `DRAINING` and leaves `TARGET_IMPORT_DRAINING` durable and closed, also across a restart. Only the owning operation resumes it: a replay of the same command, or a new seal of the owner, which joins the drain (section 5.3); another operation is refused. Import never resumes.
 
 ### 10.3 Validation and publication
 
@@ -586,9 +594,11 @@ impl NamespaceStore {
         server: ServerIdentity) -> crate::Result<FenceCommit>;
 
     /// Issue an import capability and a capability-bearing connection. Valid only in
-    /// TARGET_QUARANTINED for the owning operation at `expected_revision`.
-    pub async fn open_import_session(&self, ns: NamespaceName, operation_id: Uuid,
-        expected_revision: u64) -> Result<ImportSession, FenceError>;
+    /// TARGET_QUARANTINED for the owning operation at `expected_revision`; loads the target.
+    /// Fence refusals are `Error::NamespaceFence(FenceError)`: OPERATION_CAPABILITY_REQUIRED in
+    /// any other state, FENCE_OWNED_BY_ANOTHER_OPERATION, FENCE_REVISION_MISMATCH.
+    pub async fn open_import_session(&self, namespace: NamespaceName, operation_id: Uuid,
+        expected_revision: u64) -> crate::Result<ImportSession>;
 
     /// Read-only validation connection (`query_only`), TARGET_VALIDATING or TARGET_WRITE_FENCED.
     pub async fn open_validation_session(&self, ns: NamespaceName, operation_id: Uuid,
@@ -600,17 +610,31 @@ impl NamespaceStore {
     pub async fn inspect_fence(&self, ns: NamespaceName) -> Result<FenceView, FenceError>;
 }
 
-pub struct ImportSession { /* capability, connection, import-writer guard */ }
+impl MigrationCapability {                // read-only accessors
+    pub fn id(&self) -> Uuid;
+    pub fn namespace(&self) -> &NamespaceName;
+    pub fn operation_id(&self) -> Uuid;
+    pub fn purpose(&self) -> CapabilityPurpose;
+    pub fn fence_revision(&self) -> u64;
+}
+
+pub struct ImportSession { /* capability, controller, capability connection */ }
 impl ImportSession {
     pub fn capability(&self) -> &MigrationCapability;
-    /// Run a closure with the raw connection inside the capability; writes are admitted by the
-    /// WAL only while the capability is valid.
+    /// Run a closure with the raw connection inside the capability. Refused up front once the
+    /// capability is no longer valid; counted as an import writer until the closure returns;
+    /// writes are admitted by the WAL only while the capability is valid, and a write the WAL
+    /// refused is returned as that FenceError.
     pub async fn with_raw<R: Send + 'static>(&mut self,
         f: impl FnOnce(&mut rusqlite::Connection) -> R + Send + 'static) -> Result<R, FenceError>;
+    /// The server's dump loader (`load_dump_sql`, the loader a namespace created from a dump
+    /// uses) run inside `with_raw`. Dump errors are `Error::LoadDumpError`.
+    pub async fn load_dump<S>(&mut self, dump: S) -> crate::Result<()>
+        where S: Stream<Item = std::io::Result<Bytes>> + Unpin;
 }
 ```
 
-`FenceError` carries a `FenceOutcome` (section 6) and converts into the server's `Error`, so a route built on top returns the same codes. Dropping an `ImportSession` decrements the import-writer count and wakes a waiting seal. The existing dump loader (`load_dump`) can run inside `ImportSession::with_raw`; this series includes a test that imports a small dump into a quarantined target that way. Streaming and memory bounds are not part of this series.
+`FenceError` carries a `FenceOutcome` (section 6) and converts into the server's `Error`, so a route built on top returns the same codes. The import-writer count is of running calls: a session that is not running a call cannot start a write once the seal has moved the revision, and a transaction it left open holds the write slot, which the seal waits for as well (section 10.2). Dropping an `ImportSession` revokes its capability and closes its connection, which rolls back a transaction it left open and so releases the slot. The capability connection shares the target's write slot, WAL and replication log, and is not counted by the connection throttle. The loader holds the connection for the whole dump and re-renders each statement it runs (as it does for a namespace created from a dump), so the stored SQL text of schema objects differs from the source's in case and spacing. Streaming and memory bounds are not part of this series.
 
 ## 12. Incident adoption (Contract)
 
@@ -685,7 +709,7 @@ How each path that can reach namespace data or lifecycle is covered. File refere
 | `rpc/replication/replication_log.rs` `hello`, `log_entries`, `batch_log_entries`, `snapshot` | Denied at request start (`FAILED_PRECONDITION` + `x-libsql-fence-code`, counted, rate-limited log); `FencedStream` replication leases for both streams and the batch; typed terminal status when the gate closes or at the deadline, lease released without the peer; `ReplicatedFence` in `hello`'s config (planned, section 6.2). |
 | `admin_shell.rs` | Writes denied at the WAL (no capability); reads checked against the gate, and a read lease held, per query (cancelled through the connection's interrupt handle). |
 | `schema/scheduler.rs`, `database/schema.rs` | Shared schema excluded from fencing; migration writes are WAL-gated; the scheduler's `block_writes` flag is not treated as drain evidence. |
-| `namespace/configurator/helpers.rs` `load_dump`, `http/admin/mod.rs` `dump_stream_from_url` | Restore options and dump URLs are refused for fenced namespaces; import goes through `ImportSession`. |
+| `namespace/configurator/helpers.rs` `load_dump`, `http/admin/mod.rs` `dump_stream_from_url` | Restore options and dump URLs are refused for fenced namespaces (planned, section 13.4 lifecycle work); outside a capability the loader's writes are refused at the WAL. Import goes through `ImportSession::load_dump`, which runs the same loader (`load_dump_sql`) on the capability connection. |
 | `connection/program.rs` ATTACH resolution | `check_program_auth` uses a non-creating lookup; the resolver returns the attached namespace's controller, the attachment is admitted as `NormalRead` of it with a read lease, and the connection keeps a lease on it for every later program until it is detached. |
 | `http/user/listen.rs` `/beta/listen` | `NormalRead`, read from the registry without loading the namespace; denied where reads are denied; the stream ends with an error event when reads are fenced. |
 | Raw internal connections (storage monitor, periodic checkpoint, shutdown checkpoint, replication logger, `checkpoint_db`, bottomless) | `Maintenance` / `Observability`; not leases; never blocked. |
@@ -734,8 +758,8 @@ Planned test names; the table is updated as tests land.
 | 9 | Filesystem recovery, `destroy_on_error`, undecodable records, missing target quarantine, metastore backup rollback fail closed with provenance | `meta_store::fence_tests::recovery::{fs_recovery_with_marker_unavailable, destroy_on_error_keeps_fenced_unavailable, undecodable_row_unavailable, incomplete_target_unavailable, metastore_rollback_detected_by_marker, lookup_never_creates, undecodable_name_with_fence_fails_startup, marker_in_invalid_directory_fails_startup}`; legacy behaviour kept: `destroy_on_error_without_fences_is_unchanged`, `undecodable_row_without_fences_is_skipped_as_before`; `meta_store::fence_tests::corrupt_fence_row_fails_closed` |
 | 10 | Wrong owner, stale revision, invalid role/state, replay, command-id reuse; replay before revision check | `fence::transition::tests::*` (exhaustive over states × commands) |
 | 11 | Target creation raced with SQL, dump, replication, lifecycle never observable as writable or readable | landed: `namespace::fence::target::tests::create_race_never_observable` (parked after the rows commit and before the config is published and the namespace loaded: SQL connections, stats, replication `hello` (never `UNAVAILABLE`), create, delete and fork of the name are denied or find nothing; afterwards the target is loaded behind the quarantine gate, SQL reads and WAL writes are refused, and lifecycle and replication are refused with `MIGRATION_TARGET_QUARANTINED`), `creating_gate_refuses_before_commit` (parked before the metastore transaction: the same attempts are refused and no database file is created), `create_replay_completes_interrupted_creation` (marker only, after a restart), `create_completes_when_the_caller_goes_away`, `indeterminate_create_is_completed_by_replay`, `create_rejects_existing_name` (a loaded or cold existing name, whose gate never moves, and another operation's target), `abort_keeps_traffic_denied` (also across a restart) |
-| 12 | Only the matching import capability writes a quarantined target; admin credentials and admin shell cannot | `fence::target::tests::import_requires_matching_capability`; `tests::fence::admin::admin_shell_cannot_write_quarantined` |
-| 13 | Seal enters `TARGET_IMPORT_DRAINING`, waits, reaches `TARGET_VALIDATING`, cannot resume import; only a durable validation receipt permits idempotent publication | `fence::target::tests::seal_waits_for_import_writers`, `sealed_target_rejects_import`, `publish_requires_validation_receipt`, `publish_is_idempotent` |
+| 12 | Only the matching import capability writes a quarantined target; admin credentials and admin shell cannot | landed: `namespace::fence::import::tests::import_requires_matching_capability` (plain connections with and without raw access, as the admin shell uses; issuing to another operation or at another revision; at the WAL, capabilities the server never issued, of another operation, at another revision, for validation, and revoked); `namespace::fence::target::tests::{create_race_never_observable, abort_keeps_traffic_denied}` (raw DDL refused); planned: `tests::fence::admin::admin_shell_cannot_write_quarantined` |
+| 13 | Seal enters `TARGET_IMPORT_DRAINING`, waits, reaches `TARGET_VALIDATING`, cannot resume import; only a durable validation receipt permits idempotent publication | seal landed: `namespace::fence::import::tests::{seal_waits_for_import_writers (an import call parked inside its write transaction: import is closed at once, the transaction commits, and the seal reaches its completion commit only afterwards), seal_deadline_leaves_import_draining_until_replayed (an idle session's open transaction; `DRAINING`, also across a restart; another operation refused, the owner's new seal joins; the replay completes), seal_force_rollback_ends_open_import_transaction, sealed_target_rejects_import}`; planned: `fence::target::tests::{publish_requires_validation_receipt, publish_is_idempotent}` |
 | 14 | Enable writes idempotent, survives restart and response loss, irreversible | `fence::target::tests::enable_writes_idempotent_and_irreversible`, `enable_writes_survives_restart` |
 | 15 | Lost `EnableTargetWrites` response resolved from receipt/state | `fence::target::tests::enable_writes_response_loss_resolved` |
 | 16 | Read fence drains SQL, dump, `log_entries`, `snapshot`, including dead peers and forced termination | SQL landed: `namespace::fence::read::tests::{read_fence_waits_for_running_program, program_after_closing_gate_is_refused (parked after the read-closing gate, before the CAS), read_fence_cancels_at_deadline, unreleased_lease_answers_draining_and_replay_completes, idle_txn_fails_on_next_program, clear_read_fence_reopens_reads_not_writes, refused_read_fence_reopens_reads, attach_of_read_fenced_namespace_denied}`, `admin_shell::fence_tests::admin_shell_read_denied`; dump and replication landed: `namespace::fence::stream::tests::{dump_lease_released_on_cancel (a dump blocked mid-row on a peer that stopped reading is cancelled at the deadline, its lease released without the peer, the fence acknowledged, and the body ends with the fence error and no `COMMIT;`), read_fence_waits_for_dump, dump_refused_while_read_fenced, log_entries_stream_ends_typed, stream_lease_released_without_peer_read (a dead peer), snapshot_stream_ends_typed, replication_calls_denied_while_read_fenced, read_fence_forced_termination}`; planned: the HTTP-level check that an interrupted `/dump` response is aborted rather than completed, with `tests::fence::protocol::dump_codes` |
@@ -745,7 +769,7 @@ Planned test names; the table is updated as tests land.
 | 20 | Metrics and audit logs | `tests::fence::observability::metrics_and_labels`; `fence::audit::tests::audit_event_fields` |
 | 21 | Capability discovery and mixed-version protection | `tests::fence::admin::capabilities`; `fence::store::tests::legacy_mirror_and_fk_guard` (bounded, see section 18) |
 | 22 | Adoption is two-person/audited, keeps admission closed, cannot reverse publication | `fence::tests::adopt_requires_key_and_two_approvers`, `adopt_keeps_gates_closed`, `adopt_cannot_touch_writable` |
-| — | Import API usable by bulk import | `fence::target::tests::import_session_loads_dump_into_quarantined_target` |
+| — | Import API usable by bulk import | landed: `namespace::fence::import::tests::import_session_loads_dump_into_quarantined_target` (a dump exported by the server from a source with tables, keys, a foreign key, an index, an autoincrement table, a trigger, a view and an FTS5 table loads through `ImportSession::load_dump`; after the seal the target's schema, rows, view and full-text results equal the source's) |
 
 ## 18. Limits
 
@@ -775,10 +799,12 @@ libsql-server/src/namespace/fence/
     store.rs        metastore tables, fence CAS, marker file
     registry.rs     FenceRegistry
     controller.rs   FenceController, GateSnapshot, generations, leases
-    drain.rs        write and import drains
+    drain.rs        FenceController::execute, source write drain
     read.rs         source read fence and its drain
     stream.rs       stream leases: FencedStream for replication, dump cancel
-    target.rs       target lifecycle, MigrationCapability, ImportSession, ValidationSession
+    target.rs       quarantined target creation, ValidationSession (planned)
+    capability.rs   MigrationCapability, CapabilityPurpose, ImportWriter
+    import.rs       ImportSession, SealTargetImport drain
     audit.rs        audit events and metrics
     hooks.rs        cfg(test) FenceTestHooks
 libsql-server/src/http/admin/fence.rs

@@ -304,19 +304,52 @@ async fn load_dump<S>(dump: S, conn: PrimaryConnection) -> crate::Result<(), Loa
 where
     S: Stream<Item = std::io::Result<Bytes>> + Unpin,
 {
+    let dump_content = read_dump(dump).await?;
+    tokio::task::spawn_blocking(move || conn.with_raw(|conn| load_dump_sql(&dump_content, conn)))
+        .await?
+}
+
+/// Read a whole dump into memory.
+pub(crate) async fn read_dump<S>(dump: S) -> crate::Result<String, LoadDumpError>
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Unpin,
+{
     let mut reader = tokio::io::BufReader::new(StreamReader::new(dump));
     let mut dump_content = String::new();
     reader
         .read_to_string(&mut dump_content)
         .await
         .map_err(|e| LoadDumpError::Internal(format!("Failed to read dump content: {}", e)))?;
+    Ok(dump_content)
+}
 
+/// Parse `dump_content` and run its statements, one at a time, on `conn`. The dump must run
+/// inside one transaction that it commits itself; `ATTACH` is refused. This is the loader both
+/// for a namespace created from a dump and for an import session into a quarantined migration
+/// target, which runs it under its capability (`docs/NAMESPACE_FENCE.md` section 11).
+pub(crate) fn load_dump_sql(
+    dump_content: &str,
+    conn: &mut rusqlite::Connection,
+) -> crate::Result<(), LoadDumpError> {
     if dump_content.to_lowercase().contains("attach") {
         return Err(LoadDumpError::InvalidSqlInput(
             "attach statements are not allowed in dumps".to_string(),
         ));
     }
 
+    conn.authorizer(Some(|auth: AuthContext<'_>| match auth.action {
+        AuthAction::Attach { filename: _ } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }));
+    let result = run_dump_statements(dump_content, conn);
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    result
+}
+
+fn run_dump_statements(
+    dump_content: &str,
+    conn: &mut rusqlite::Connection,
+) -> crate::Result<(), LoadDumpError> {
     let mut parser = Box::new(Parser::new(dump_content.as_bytes()));
     let mut skipped_wasm_table = false;
     let mut n_stmt = 0;
@@ -336,37 +369,20 @@ where
                     }
                 }
 
-                if n_stmt > 2 && conn.is_autocommit().await.unwrap() {
+                if n_stmt > 2 && conn.is_autocommit() {
                     return Err(LoadDumpError::NoTxn);
                 }
 
                 let stmt_sql = cmd.to_string();
-                tokio::task::spawn_blocking({
-                    let conn = conn.clone();
-                    move || -> crate::Result<(), LoadDumpError> {
-                        conn.with_raw(|conn| {
-                            conn.authorizer(Some(|auth: AuthContext<'_>| match auth.action {
-                                AuthAction::Attach { filename: _ } => Authorization::Deny,
-                                _ => Authorization::Allow,
-                            }));
-                            conn.execute(&stmt_sql, ())
-                        })
-                        .map_err(|e| match e {
-                            rusqlite::Error::SqlInputError {
-                                msg, sql, offset, ..
-                            } => LoadDumpError::InvalidSqlInput(format!(
-                                "msg: {}, sql: {}, offset: {}",
-                                msg, sql, offset
-                            )),
-                            e => LoadDumpError::Internal(format!(
-                                "statement: {}, error: {}",
-                                n_stmt, e
-                            )),
-                        })?;
-                        Ok(())
-                    }
-                })
-                .await??;
+                conn.execute(&stmt_sql, ()).map_err(|e| match e {
+                    rusqlite::Error::SqlInputError {
+                        msg, sql, offset, ..
+                    } => LoadDumpError::InvalidSqlInput(format!(
+                        "msg: {}, sql: {}, offset: {}",
+                        msg, sql, offset
+                    )),
+                    e => LoadDumpError::Internal(format!("statement: {}, error: {}", n_stmt, e)),
+                })?;
             }
             Ok(None) => break,
             Err(e) => {
@@ -389,15 +405,8 @@ where
         }
     }
 
-    if !conn.is_autocommit().await.unwrap() {
-        tokio::task::spawn_blocking({
-            let conn = conn.clone();
-            move || -> crate::Result<(), LoadDumpError> {
-                conn.with_raw(|conn| conn.execute("rollback", ()))?;
-                Ok(())
-            }
-        })
-        .await??;
+    if !conn.is_autocommit() {
+        conn.execute("rollback", ())?;
         return Err(LoadDumpError::NoCommit);
     }
 

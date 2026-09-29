@@ -26,6 +26,7 @@ mod primary;
 mod replica;
 mod schema;
 
+pub(crate) use helpers::{load_dump_sql, read_dump};
 pub use primary::PrimaryConfigurator;
 pub use replica::ReplicaConfigurator;
 pub use schema::SchemaConfigurator;
