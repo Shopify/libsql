@@ -58,6 +58,11 @@ pub struct GateSnapshot {
     /// allows. Never persisted, and cleared by every publication of a commit. It does not move
     /// the write generation: write admission is already closed wherever a read fence can be set.
     pub closing_reads: Option<CommandKey>,
+    /// The in-memory gate of a `CreateTargetQuarantined` that is being persisted (section
+    /// 10.1): the name is becoming a quarantined target, so everything but maintenance and
+    /// observability is refused with `MIGRATION_TARGET_QUARANTINED`, and the namespace is not
+    /// set up. Never persisted; replaced by the record the command's commit publishes.
+    pub creating_target: Option<CommandKey>,
 }
 
 impl GateSnapshot {
@@ -68,6 +73,7 @@ impl GateSnapshot {
             indeterminate: None,
             installing: None,
             closing_reads: None,
+            creating_target: None,
         }
     }
 
@@ -102,6 +108,20 @@ impl GateSnapshot {
                     ),
                 )
                 .with_detail(FenceDetail::IndeterminateCommit));
+            }
+        }
+        if let Some((operation_id, command_id)) = self.creating_target {
+            if !matches!(
+                class,
+                OperationClass::Maintenance | OperationClass::Observability
+            ) {
+                return Err(FenceError::new(
+                    FenceOutcome::MigrationTargetQuarantined,
+                    format!(
+                        "{class:?} is not permitted: fence command {command_id} of operation \
+                         {operation_id} is creating this namespace as a migration target"
+                    ),
+                ));
             }
         }
         self.fence.permits(class)?;
@@ -139,6 +159,11 @@ impl GateSnapshot {
     /// Whether a closing transition is being installed.
     pub fn is_installing(&self) -> bool {
         self.installing.is_some()
+    }
+
+    /// Whether the namespace is being created as a quarantined target.
+    pub fn is_creating_target(&self) -> bool {
+        self.creating_target.is_some()
     }
 
     /// Normal write admission.
@@ -507,14 +532,31 @@ impl FenceController {
     }
 
     /// Publish a new gate. `fence: None` keeps the published fence. The write generation moves
-    /// whenever the state, the owning operation, the indeterminate flag or the installing gate
-    /// changes. Every publication removes the read-closing gate: the commit that follows it
-    /// either persists the read fence or proves that nothing changed.
+    /// whenever the state, the owning operation, the indeterminate flag, the installing gate or
+    /// the target-creation gate changes. Every publication removes the read-closing gate: the
+    /// commit that follows it either persists the read fence or proves that nothing changed.
+    /// A publication with a fence also removes the target-creation gate, which the committed
+    /// record replaces; one without keeps it.
     fn publish(
         &self,
         fence: Option<StoredFence>,
         indeterminate: Option<CommandKey>,
         installing: Option<CommandKey>,
+    ) {
+        let creating_target = if fence.is_some() {
+            None
+        } else {
+            self.gate.borrow().creating_target
+        };
+        self.publish_gate(fence, indeterminate, installing, creating_target);
+    }
+
+    fn publish_gate(
+        &self,
+        fence: Option<StoredFence>,
+        indeterminate: Option<CommandKey>,
+        installing: Option<CommandKey>,
+        creating_target: Option<CommandKey>,
     ) {
         let mut generation_changed = false;
         self.gate.send_modify(|gate| {
@@ -523,10 +565,12 @@ impl FenceController {
                 || fence.record().map(|r| r.operation_id)
                     != gate.fence.record().map(|r| r.operation_id)
                 || indeterminate != gate.indeterminate
-                || installing != gate.installing;
+                || installing != gate.installing
+                || creating_target != gate.creating_target;
             gate.fence = fence;
             gate.indeterminate = indeterminate;
             gate.installing = installing;
+            gate.creating_target = creating_target;
             gate.closing_reads = None;
             if changed {
                 gate.write_generation += 1;
@@ -542,6 +586,7 @@ impl FenceController {
                 write_generation = gate.write_generation,
                 indeterminate = gate.indeterminate.is_some(),
                 installing = gate.installing.is_some(),
+                creating_target = gate.creating_target.is_some(),
                 "published namespace fence gate"
             );
         }
@@ -583,6 +628,33 @@ impl Transition {
         };
         if installing.is_some() {
             self.controller.publish(None, indeterminate, None);
+        }
+    }
+
+    /// Publish the in-memory target-creation gate for `CreateTargetQuarantined` `key` (section
+    /// 10.1): until the command's commit publishes the quarantined record, every class but
+    /// maintenance and observability is refused and the namespace is not set up. It is removed
+    /// with [`remove_creating_target`](Self::remove_creating_target) when the command is proven
+    /// not to have committed, and kept (with the indeterminate flag) when its outcome is
+    /// unknown.
+    pub fn install_creating_target(&mut self, key: CommandKey) {
+        let (indeterminate, installing) = {
+            let gate = self.controller.gate.borrow();
+            (gate.indeterminate, gate.installing)
+        };
+        self.controller
+            .publish_gate(None, indeterminate, installing, Some(key));
+    }
+
+    /// Remove the target-creation gate of a command that was proven not to have committed.
+    pub fn remove_creating_target(&mut self) {
+        let (indeterminate, installing, creating) = {
+            let gate = self.controller.gate.borrow();
+            (gate.indeterminate, gate.installing, gate.creating_target)
+        };
+        if creating.is_some() {
+            self.controller
+                .publish_gate(None, indeterminate, installing, None);
         }
     }
 

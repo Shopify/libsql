@@ -36,7 +36,7 @@ use super::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
 use super::fence::record::{
     CommandReceipt, NamespaceFenceRecord, ServerIdentity, ValidationSnapshot,
 };
-use super::fence::state::OperationClass;
+use super::fence::state::{OperationClass, Role};
 use super::fence::store::{
     self as fence_store, FenceStoreError, MarkerStatus, StoredFence, StoredReceipt,
 };
@@ -1374,6 +1374,56 @@ impl MetaStore {
                 completion,
                 &ctx,
             )
+        })
+        .await?
+        .map_err(fence_store_error)
+    }
+
+    /// Make a migration target that the metastore holds visible in the in-memory config map,
+    /// which is what makes `exists()` and `lookup()` find it (section 10.1, step 5). The config
+    /// published is the stored row with the record's own `block_*` values in place of the
+    /// legacy mirror, as `restore_fences` does at startup. The caller has already installed
+    /// the target's gate. Returns whether the map changed; `false` also when the namespace is
+    /// not a target with a stored config.
+    pub async fn publish_target_config(&self, namespace: NamespaceName) -> Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || -> std::result::Result<bool, FenceStoreError> {
+            // The connection lock first, as everywhere else that takes both.
+            let mut conn = inner.conn.blocking_lock();
+            let tx = conn.transaction()?;
+            let (stored, _) = fence_store::read_fence(&tx, &inner.dbs_path, &namespace)?;
+            let record = match stored {
+                StoredFence::Record(r) if r.role == Role::Target => r,
+                _ => return Ok(false),
+            };
+            let Some(row) = fence_store::read_config_row(&tx, &namespace)? else {
+                return Ok(false);
+            };
+            drop(tx);
+            let config = Arc::new(fence_store::with_legacy_blocks(&row, &record.legacy_blocks));
+            let mut configs = inner.configs.blocking_lock();
+            match configs.get_mut(&namespace) {
+                Some(sender)
+                    if metadata::DatabaseConfig::from(&*sender.borrow().config)
+                        == metadata::DatabaseConfig::from(&*config) =>
+                {
+                    Ok(false)
+                }
+                // An entry that was put in the map by a create or fork of the same name that
+                // the fence then refused: the durable config replaces it.
+                Some(sender) => {
+                    sender.send_modify(|c| {
+                        c.version = c.version.wrapping_add(1);
+                        c.config = config;
+                    });
+                    Ok(true)
+                }
+                None => {
+                    let (tx, _) = watch::channel(InnerConfig { version: 0, config });
+                    configs.insert(namespace, tx);
+                    Ok(true)
+                }
+            }
         })
         .await?
         .map_err(fence_store_error)

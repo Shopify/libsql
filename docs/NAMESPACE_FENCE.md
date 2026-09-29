@@ -406,11 +406,12 @@ This is additive in proto3: older peers skip the unknown field; a newer replica 
 Per namespace:
 
 - `transition_lock`: a `tokio::sync::Mutex` serialising commands on this namespace. A command holds it from its first check to its response (`FenceController::begin_transition` returns a `Transition` that owns the guard).
-- `gate`: a `tokio::sync::watch` of `GateSnapshot { fence, write_generation, indeterminate, installing, closing_reads }`, where `fence` is the durable fence as last published (a record, no record, or `UNKNOWN_UNAVAILABLE` with its detail) and `installing` is the in-memory `INSTALLING` gate of a closing command being persisted (section 8.3), which denies normal writes, vacuum, import writes and lifecycle work on top of `fence`. State, revision, owning operation and every admission (`permits(class)`, `write()`, `read()`) are derived from it through the permission matrix. The WAL wrapper, `CoreConnection`, dump, replication and lifecycle code read it without locks. Phase 5 adds the live capability set.
+- `gate`: a `tokio::sync::watch` of `GateSnapshot { fence, write_generation, indeterminate, installing, closing_reads, creating_target }`, where `fence` is the durable fence as last published (a record, no record, or `UNKNOWN_UNAVAILABLE` with its detail) and `installing` is the in-memory `INSTALLING` gate of a closing command being persisted (section 8.3), which denies normal writes, vacuum, import writes and lifecycle work on top of `fence`. State, revision, owning operation and every admission (`permits(class)`, `write()`, `read()`) are derived from it through the permission matrix. The WAL wrapper, `CoreConnection`, dump, replication and lifecycle code read it without locks. Phase 5 adds the live capability set.
 - `write_generation: u64`, in the snapshot, **incremented on every publication that changes the fence state, the owning operation, or the indeterminate flag**. That covers every transition that closes or opens write admission (acquire, release, create, seal, publish, enable, abort, adopt), and is conservative for the others. A replay that publishes the same durable state does not move it.
 - `indeterminate: Option<(operation_id, command_id)>`: set when a command's `COMMIT` failed (or the task running it died) so that whether it applied is unknown. While set, every class except `Maintenance` and `Observability` is denied with `FENCE_STATE_UNAVAILABLE` / `indeterminate_commit`, and every other command is refused with `FENCE_COMMIT_INDETERMINATE`. A replay of the same command is answered by the metastore from the durable row (replayed if it had committed, applied if it had not) and clears it (section 8.4).
 - the write-drain sources of the namespace's primary connection makers (`register_write_drain`): each maker's connection manager, held weakly, and its replication log id and last-committed-frame reader, which the write drain waits on and reads the boundary from (section 8.3).
 - the write queues of the namespace's connection managers: each `MakeLegacyConnection` registers a waker (`register_write_queue`) that the controller calls after every publication that moves `write_generation`, after the new gate is visible. A waker holds its manager weakly and is dropped once the manager is gone (for example after eviction). Writer tracking itself is the connection manager's (section 8.2).
+- `creating_target` (in the snapshot): the in-memory target-creation gate of a `CreateTargetQuarantined` being persisted (section 10.1), which denies every class except `Maintenance` and `Observability` with `MIGRATION_TARGET_QUARANTINED`, and makes `FenceRegistry::check_available` refuse the name, so nothing sets the namespace up, serves it or stores a config for it. Never persisted; it moves `write_generation`; the publication of the committed record replaces it, it is removed when the command is proven not to have committed, and it stays (with `indeterminate`) when the outcome is unknown.
 - `closing_reads` (in the snapshot): the in-memory read-closing gate of a `SetSourceReadFence` being persisted (section 9, step 2), which denies `NormalRead` and `Stream` with `MIGRATION_READ_FENCED` on top of `fence`. Never persisted; every publication clears it; it does not move `write_generation` (writes are already closed wherever a read fence can be set).
 - `read_leases`: the live read leases, each with its kind (`sql`, `dump`, `replication`), a cancel handle and a cancelled flag, and a `Notify` on every release. `FenceController::acquire_read_lease(class, kind, cancel)` checks the gate **under the lease lock** and registers the lease, so a lease is either refused by a read-closing gate published before it, or counted by a drain that closes admission after it; once admission is closed the set can only shrink. A `ReadLease` is released when dropped.
 - `capabilities`: the live `MigrationCapability` set and an import-writer counter.
@@ -530,14 +531,17 @@ This fence stops future service from the source. It cannot recall bytes a peer h
 
 ### 10.1 CreateTargetQuarantined
 
-1. Checks (section 5.3). The name must have no config row, no fence row and no marker (`FENCE_PRECONDITION_FAILED`, `namespace_exists`).
-2. Create `dbs/<namespace>/` and write the marker (`TARGET_QUARANTINED`, revision 1).
-3. One metastore transaction: insert the config row (with the legacy mirror `block_reads = block_writes = true`), the fence row (`TARGET_QUARANTINED`, revision 1, new `target_incarnation_id`) and the receipt.
-4. Install the controller in the registry with the quarantine gate.
-5. Only now insert the config into the metastore's in-memory map (which is what makes `exists()` true) and call `load_namespace`. The first connection maker is created with the quarantine gate already in place.
-6. Record the new `log_id` in the record (same revision, informational) and respond `APPLIED`.
+`NamespaceStore::create_target_quarantined(CreateTargetRequest, ServerIdentity)` (the admin route calls the same code through `execute_fence_command`) runs on its own task under the namespace's transition lock:
 
-A crash after step 2 leaves a marker with no rows: `UNKNOWN_UNAVAILABLE` until the same command is replayed, which completes it. A crash after step 3 recovers `TARGET_QUARANTINED` from the metastore.
+1. Checks. A name without fence state that the server already knows — its config is in the in-memory map, or the namespace cache holds it (loaded, or a fork in flight) — is refused with `FENCE_PRECONDITION_FAILED`, `namespace_exists`, without touching its gate. Otherwise the controller (get-or-create in the registry) publishes the in-memory **target-creation gate** (section 7.2): from here on every class but maintenance and observability is refused and `check_available` refuses the name, so `with()`, `make_namespace`, `create` and the fork destination refuse it before storing or setting anything up. The in-use check is repeated with the gate in place, which closes the race with a create or fork that had not stored anything yet. The metastore then checks section 5.3 and requires no config row, no fence row and no marker (`namespace_exists`). A name that already has fence state (a replay, a creation interrupted after its marker, a refusal) keeps the gate its state implies and goes straight to the metastore.
+2. Inside the metastore transaction, create `dbs/<namespace>/` and write the marker (`TARGET_QUARANTINED`, revision 1).
+3. In the same transaction: insert the config row (with the legacy mirror `block_reads = block_writes = true`), the fence row (`TARGET_QUARANTINED`, revision 1, new `target_incarnation_id`) and the receipt; commit.
+4. The controller publishes the committed record, whose quarantine gate replaces the creation gate (commit → publish, as for every command). A command proven not to have committed removes the creation gate; one whose commit is unknown keeps it with the indeterminate flag.
+5. Only now `MetaStore::publish_target_config` puts the config into the in-memory map (which is what makes `exists()` and `lookup()` find it): the stored row with the record's own `block_*` values in place of the legacy mirror, replacing any entry a refused create or fork of the same name had left there. An empty namespace-cache entry left by a refused fork is dropped, and the namespace is loaded; its first connection maker is created with the quarantine gate already in place, in a directory that until then held only the marker. The response is `APPLIED`.
+
+A replay of the same command returns the stored receipt and repeats step 5, which completes a creation whose commit was not acknowledged. A crash after step 2 leaves a marker with no rows: `UNKNOWN_UNAVAILABLE` (`incomplete_target_creation`) until the same command is replayed, which completes it with the incarnation id the marker announced. A crash after step 3 recovers `TARGET_QUARANTINED` from the metastore, and startup publishes its config.
+
+The target's replication `log_id` is not written back into the record: rewriting a record at the same revision would make a marker written before the rewrite look like `metastore_behind_marker` after a crash between the two. The log id is the namespace's own and is read live where it is needed (a later `AcquireSourceWriteFence` on the published target checks the caller's `expected_log_id` against it).
 
 ### 10.2 SealTargetImport
 
@@ -559,6 +563,14 @@ The bulk import work consumes this internal Rust API, which does not depend on a
 // namespace::fence
 pub enum TargetState { Quarantined, ImportDraining, Validating, WriteFenced, Writable, Aborted }
 
+/// CreateTargetQuarantined; the expectation is always ABSENT at revision 0.
+pub struct CreateTargetRequest {
+    pub namespace: NamespaceName,
+    pub operation_id: Uuid,
+    pub command_id: Uuid,             // idempotency key: a replay returns the stored result
+    pub config: TargetConfig,
+}
+
 pub struct MigrationCapability {      // server-created, not constructible outside the module
     id: Uuid,
     namespace: NamespaceName,
@@ -568,9 +580,10 @@ pub struct MigrationCapability {      // server-created, not constructible outsi
 }
 
 impl NamespaceStore {
-    /// CreateTargetQuarantined, atomic with namespace creation.
-    pub async fn create_target_quarantined(&self, req: CreateTargetRequest)
-        -> Result<FenceResponse, FenceError>;
+    /// CreateTargetQuarantined, atomic with namespace creation (section 10.1). Fence refusals
+    /// are `Error::NamespaceFence(FenceError)` with their stable outcome code.
+    pub async fn create_target_quarantined(&self, req: CreateTargetRequest,
+        server: ServerIdentity) -> crate::Result<FenceCommit>;
 
     /// Issue an import capability and a capability-bearing connection. Valid only in
     /// TARGET_QUARANTINED for the owning operation at `expected_revision`.
@@ -720,7 +733,7 @@ Planned test names; the table is updated as tests land.
 | 8 | Evict and lazily reload a fenced namespace; identical admission | `tests::fence::lifecycle::evicted_namespace_reloads_same_gate`; landed at unit level: `namespace::store::fence_tests::evicted_namespace_reloads_with_the_same_controller`, `fence::registry::tests::seeded_from_load_fences_including_recovered_names` |
 | 9 | Filesystem recovery, `destroy_on_error`, undecodable records, missing target quarantine, metastore backup rollback fail closed with provenance | `meta_store::fence_tests::recovery::{fs_recovery_with_marker_unavailable, destroy_on_error_keeps_fenced_unavailable, undecodable_row_unavailable, incomplete_target_unavailable, metastore_rollback_detected_by_marker, lookup_never_creates, undecodable_name_with_fence_fails_startup, marker_in_invalid_directory_fails_startup}`; legacy behaviour kept: `destroy_on_error_without_fences_is_unchanged`, `undecodable_row_without_fences_is_skipped_as_before`; `meta_store::fence_tests::corrupt_fence_row_fails_closed` |
 | 10 | Wrong owner, stale revision, invalid role/state, replay, command-id reuse; replay before revision check | `fence::transition::tests::*` (exhaustive over states × commands) |
-| 11 | Target creation raced with SQL, dump, replication, lifecycle never observable as writable or readable | `fence::target::tests::create_race_never_observable` |
+| 11 | Target creation raced with SQL, dump, replication, lifecycle never observable as writable or readable | landed: `namespace::fence::target::tests::create_race_never_observable` (parked after the rows commit and before the config is published and the namespace loaded: SQL connections, stats, replication `hello` (never `UNAVAILABLE`), create, delete and fork of the name are denied or find nothing; afterwards the target is loaded behind the quarantine gate, SQL reads and WAL writes are refused, and lifecycle and replication are refused with `MIGRATION_TARGET_QUARANTINED`), `creating_gate_refuses_before_commit` (parked before the metastore transaction: the same attempts are refused and no database file is created), `create_replay_completes_interrupted_creation` (marker only, after a restart), `create_completes_when_the_caller_goes_away`, `indeterminate_create_is_completed_by_replay`, `create_rejects_existing_name` (a loaded or cold existing name, whose gate never moves, and another operation's target), `abort_keeps_traffic_denied` (also across a restart) |
 | 12 | Only the matching import capability writes a quarantined target; admin credentials and admin shell cannot | `fence::target::tests::import_requires_matching_capability`; `tests::fence::admin::admin_shell_cannot_write_quarantined` |
 | 13 | Seal enters `TARGET_IMPORT_DRAINING`, waits, reaches `TARGET_VALIDATING`, cannot resume import; only a durable validation receipt permits idempotent publication | `fence::target::tests::seal_waits_for_import_writers`, `sealed_target_rejects_import`, `publish_requires_validation_receipt`, `publish_is_idempotent` |
 | 14 | Enable writes idempotent, survives restart and response loss, irreversible | `fence::target::tests::enable_writes_idempotent_and_irreversible`, `enable_writes_survives_restart` |
