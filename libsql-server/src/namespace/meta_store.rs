@@ -112,6 +112,7 @@ struct FenceSettings {
     receipt_retention: Duration,
     /// The write drain deadline of an `AcquireSourceWriteFence` that names no drain policy.
     default_write_drain: Duration,
+    default_read_drain: Duration,
 }
 
 fn setup_connection(conn: &rusqlite::Connection) -> Result<()> {
@@ -240,6 +241,9 @@ impl MetaStoreInner {
             default_write_drain: config
                 .namespace_fence_default_write_drain
                 .unwrap_or(crate::namespace::fence::drain::DEFAULT_WRITE_DRAIN),
+            default_read_drain: config
+                .namespace_fence_default_read_drain
+                .unwrap_or(crate::namespace::fence::read::DEFAULT_READ_DRAIN),
         };
 
         let mut this = MetaStoreInner {
@@ -1310,6 +1314,17 @@ impl MetaStore {
     pub fn fence_default_write_drain(&self) -> DrainPolicy {
         DrainPolicy {
             deadline_ms: u64::try_from(self.inner.fence.default_write_drain.as_millis())
+                .unwrap_or(u64::MAX),
+            on_deadline: OnDeadline::Fail,
+        }
+    }
+
+    /// The drain policy of a `SetSourceReadFence` that names none: the configured deadline,
+    /// after which running reads are cancelled and streams terminated (`on_deadline` does not
+    /// apply to reads).
+    pub fn fence_default_read_drain(&self) -> DrainPolicy {
+        DrainPolicy {
+            deadline_ms: u64::try_from(self.inner.fence.default_read_drain.as_millis())
                 .unwrap_or(u64::MAX),
             on_deadline: OnDeadline::Fail,
         }

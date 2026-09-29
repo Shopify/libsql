@@ -205,10 +205,15 @@ where
         let attached = attached.strip_prefix('"').unwrap_or(attached);
         let attached = attached.strip_suffix('"').unwrap_or(attached);
         let attached = NamespaceName::from_string(attached.into())?;
-        let path = (self.resolve_attach_path)(&attached)?;
+        let target = (self.resolve_attach_path)(&attached)?;
+        // Attaching a namespace reads it: the attachment is admitted by that namespace's fence,
+        // and the connection holds a read lease on it while its programs run (section 9).
+        if let Some(fence) = &self.fence {
+            fence.attach(attached_alias.trim_matches('"'), target.fence)?;
+        }
         let query = format!(
             "ATTACH DATABASE 'file:{}?mode=ro' AS \"{attached_alias}\"",
-            path.join("data").display()
+            target.path.join("data").display()
         );
         tracing::trace!("ATTACH rewritten to: {query}");
         Ok(query)
