@@ -142,7 +142,7 @@ async fn wait_for_read_leases(controller: &FenceController, deadline: Instant) -
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -165,13 +165,13 @@ mod tests {
 
     const OTHER_OP: Uuid = Uuid::from_u128(0xb);
     /// A deadline that has already passed: the drain cancels at once.
-    const NOW: DrainPolicy = DrainPolicy {
+    pub(crate) const NOW: DrainPolicy = DrainPolicy {
         deadline_ms: 0,
         on_deadline: OnDeadline::Fail,
     };
 
     /// A write-fenced source.
-    async fn fenced_source() -> Source {
+    pub(crate) async fn fenced_source() -> Source {
         let s = Source::new().await;
         raw(&s.conn().await, "insert into t values (1), (2)")
             .await
@@ -193,7 +193,7 @@ mod tests {
         }
     }
 
-    fn read_fence(s: &Source, command_id: u128, policy: DrainPolicy) -> FenceRequest {
+    pub(crate) fn read_fence(s: &Source, command_id: u128, policy: DrainPolicy) -> FenceRequest {
         request(
             s,
             OP,

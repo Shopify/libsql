@@ -151,6 +151,10 @@ pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpCo
     pub force_load_wals: bool,
     pub sync_conccurency: usize,
     pub set_log_level: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static>>,
+    /// HTTP/2 keepalive interval of the RPC server and the user-port gRPC services, set when
+    /// namespace fences are enabled so that the streams of dead peers are detected
+    /// (`docs/NAMESPACE_FENCE.md` section 9). `None` keeps hyper's default (no keepalive).
+    pub http2_keepalive_interval: Option<Duration>,
 }
 
 impl<C, A, D> Default for Server<C, A, D> {
@@ -180,6 +184,7 @@ impl<C, A, D> Default for Server<C, A, D> {
             force_load_wals: false,
             sync_conccurency: 8,
             set_log_level: None,
+            http2_keepalive_interval: None,
         }
     }
 }
@@ -196,6 +201,7 @@ struct Services<A, P, S, C> {
     db_config: DbConfig,
     user_auth_strategy: Auth,
     pub set_log_level: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static>>,
+    http2_keepalive_interval: Option<Duration>,
 }
 
 struct TaskManager {
@@ -290,6 +296,7 @@ where
             enable_console: self.user_api_config.enable_http_console,
             self_url: self.user_api_config.self_url,
             primary_url: self.user_api_config.primary_url,
+            http2_keepalive_interval: self.http2_keepalive_interval,
         };
 
         let user_http_service = user_http.configure(task_manager);
@@ -529,6 +536,7 @@ where
             db_config: self.db_config,
             user_auth_strategy,
             set_log_level: self.set_log_level.take(),
+            http2_keepalive_interval: self.http2_keepalive_interval,
         }
     }
 
@@ -677,6 +685,7 @@ where
                 config.tls_config,
                 idle_shutdown_kicker.clone(),
                 replication_service, // internal replicaton service
+                self.http2_keepalive_interval,
             ));
         }
 

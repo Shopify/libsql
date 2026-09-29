@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -22,6 +23,10 @@ use uuid::Uuid;
 
 use crate::auth::Auth;
 use crate::connection::config::DatabaseConfig;
+use crate::namespace::fence::controller::{FenceController, LeaseKind};
+use crate::namespace::fence::outcome::FenceError;
+use crate::namespace::fence::state::OperationClass;
+use crate::namespace::fence::stream::{fence_status, FencedStream};
 use crate::namespace::{NamespaceName, NamespaceStore};
 use crate::replication::primary::frame_stream::FrameStream;
 use crate::replication::{LogReadError, ReplicationLogger};
@@ -44,9 +49,15 @@ pub struct ReplicationLogService {
     //deprecated:
     generation_id: Uuid,
     replicas_with_hello: RwLock<HashSet<(SocketAddr, NamespaceName)>>,
+    /// When a fence denial of a replication call was last logged, per namespace.
+    fence_denials_logged: parking_lot::Mutex<HashMap<NamespaceName, Instant>>,
 }
 
 pub const MAX_FRAMES_PER_BATCH: usize = 1024;
+
+/// Replication calls denied by a namespace fence are logged at most this often per namespace
+/// (they are all counted): replicas that do not understand the typed code reconnect in a loop.
+const FENCE_DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 impl ReplicationLogService {
     pub fn new(
@@ -68,7 +79,60 @@ impl ReplicationLogService {
             generation_id: Uuid::new_v4(),
             replicas_with_hello: Default::default(),
             service_internal,
+            fence_denials_logged: Default::default(),
         }
+    }
+
+    /// The status of a replication call (or stream) that the namespace fence refuses. Counted
+    /// every time, and logged at most once per namespace per [`FENCE_DENIAL_LOG_INTERVAL`].
+    fn fence_denied(&self, namespace: &NamespaceName, call: &str, error: FenceError) -> Status {
+        metrics::increment_counter!(
+            "libsql_server_fence_denials_total",
+            "code" => error.outcome().as_str(),
+            "surface" => "replication",
+        );
+        let now = Instant::now();
+        let log = {
+            let mut logged = self.fence_denials_logged.lock();
+            match logged.get(namespace) {
+                Some(at) if now.duration_since(*at) < FENCE_DENIAL_LOG_INTERVAL => false,
+                _ => {
+                    logged.insert(namespace.clone(), now);
+                    true
+                }
+            }
+        };
+        if log {
+            tracing::warn!(
+                namespace = %namespace,
+                internal = self.service_internal,
+                "replication {call} refused by the namespace fence: {error} \
+                 (further refusals for this namespace are not logged for a minute)"
+            );
+        }
+        fence_status(error)
+    }
+
+    /// Admit `stream`, a replication stream on `namespace`, under the namespace's fence
+    /// (`docs/NAMESPACE_FENCE.md` section 9): it holds a replication read lease and ends with a
+    /// typed `FAILED_PRECONDITION` when the gate stops admitting streams.
+    fn fenced_stream<S>(
+        &self,
+        namespace: &NamespaceName,
+        call: &str,
+        fence: &Arc<FenceController>,
+        stream: S,
+    ) -> Result<FencedStream<S, fn(FenceError) -> Status>, Status>
+    where
+        S: futures::Stream<Item = Result<Frame, Status>> + Unpin + Send + 'static,
+    {
+        FencedStream::new(
+            fence,
+            LeaseKind::Replication,
+            stream,
+            fence_status as fn(FenceError) -> Status,
+        )
+        .map_err(|e| self.fence_denied(namespace, call, e))
     }
 
     async fn authenticate<T>(
@@ -124,9 +188,12 @@ impl ReplicationLogService {
         Ok(())
     }
 
+    /// The namespace's replication log and what goes with it, for a replication `call`. Refused
+    /// with the typed fence status when the namespace's fence does not admit streams.
     async fn logger_from_namespace<T>(
         &self,
         namespace: NamespaceName,
+        call: &str,
         req: &tonic::Request<T>,
         verify_session: bool,
     ) -> Result<
@@ -136,12 +203,13 @@ impl ReplicationLogService {
             usize,
             Arc<Stats>,
             impl Future<Output = ()>,
+            Arc<FenceController>,
         ),
         Status,
     > {
-        let (logger, config, version, stats, config_changed) = self
+        let (logger, config, version, stats, config_changed, fence) = self
             .namespaces
-            .with(namespace, |ns| -> Result<_, Status> {
+            .with(namespace.clone(), |ns| -> Result<_, Status> {
                 let logger = ns
                     .db
                     .logger()
@@ -150,23 +218,30 @@ impl ReplicationLogService {
                 let config = ns.config();
                 let version = ns.config_version();
                 let stats = ns.stats();
+                let fence = ns.fence().clone();
 
-                Ok((logger, config, version, stats, config_changed))
+                Ok((logger, config, version, stats, config_changed, fence))
             })
             .await
-            .map_err(|e| {
-                if let crate::error::Error::NamespaceDoesntExist(_) = e.as_ref() {
+            .map_err(|e| match e.as_ref() {
+                crate::error::Error::NamespaceDoesntExist(_) => {
                     Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
-                } else {
-                    Status::internal(e.to_string())
                 }
+                crate::error::Error::NamespaceFence(f) => {
+                    self.fence_denied(&namespace, call, f.clone())
+                }
+                _ => Status::internal(e.to_string()),
             })??;
+
+        fence
+            .permits(OperationClass::Stream)
+            .map_err(|e| self.fence_denied(&namespace, call, e))?;
 
         if verify_session {
             self.verify_session_token(req, version)?;
         }
 
-        Ok((logger, config, version, stats, config_changed))
+        Ok((logger, config, version, stats, config_changed, fence))
     }
 
     fn encode_session_token(&self, version: usize) -> Uuid {
@@ -254,8 +329,9 @@ impl ReplicationLog for ReplicationLogService {
 
         self.authenticate(&req, namespace.clone()).await?;
 
-        let (logger, _, _, stats, config_changed) =
-            self.logger_from_namespace(namespace, &req, true).await?;
+        let (logger, _, _, stats, config_changed, fence) = self
+            .logger_from_namespace(namespace.clone(), "log_entries", &req, true)
+            .await?;
 
         let stats = if self.collect_stats {
             Some(stats)
@@ -288,6 +364,8 @@ impl ReplicationLog for ReplicationLogService {
             }
         };
 
+        let stream = self.fenced_stream(&namespace, "log_entries", &fence, Box::pin(stream))?;
+
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 
@@ -301,7 +379,9 @@ impl ReplicationLog for ReplicationLogService {
         let namespace = super::super::extract_namespace(self.disable_namespaces, &req)?;
         self.authenticate(&req, namespace.clone()).await?;
 
-        let (logger, _, _, stats, _) = self.logger_from_namespace(namespace, &req, true).await?;
+        let (logger, _, _, stats, _, fence) = self
+            .logger_from_namespace(namespace.clone(), "batch_log_entries", &req, true)
+            .await?;
 
         let stats = if self.collect_stats {
             Some(stats)
@@ -322,9 +402,12 @@ impl ReplicationLog for ReplicationLogService {
             .map_err(|e| Status::internal(e.to_string()))?,
             self.idle_shutdown_layer.clone(),
         )
-        .map(map_frame_stream_output)
-        .collect::<Result<Vec<_>, _>>()
-        .await?;
+        .map(map_frame_stream_output);
+        // The batch is read under a replication read lease, so a read drain waits for it.
+        let frames = self
+            .fenced_stream(&namespace, "batch_log_entries", &fence, frames)?
+            .collect::<Result<Vec<_>, _>>()
+            .await?;
 
         Ok(tonic::Response::new(Frames { frames }))
     }
@@ -348,8 +431,9 @@ impl ReplicationLog for ReplicationLogService {
                 guard.insert((replica_addr, namespace.clone()));
             }
         }
-        let (logger, config, version, _, _) =
-            self.logger_from_namespace(namespace, &req, false).await?;
+        let (logger, config, version, _, _, _) = self
+            .logger_from_namespace(namespace, "hello", &req, false)
+            .await?;
 
         // If we are a shared schema and serving externally (aka to embedded replica's) then
         // return an error.
@@ -383,7 +467,9 @@ impl ReplicationLog for ReplicationLogService {
         let namespace = super::super::extract_namespace(self.disable_namespaces, &req)?;
         self.authenticate(&req, namespace.clone()).await?;
 
-        let (logger, _, _, stats, _) = self.logger_from_namespace(namespace, &req, true).await?;
+        let (logger, _, _, stats, _, fence) = self
+            .logger_from_namespace(namespace.clone(), "snapshot", &req, true)
+            .await?;
 
         let stats = if self.collect_stats {
             Some(stats)
@@ -395,9 +481,17 @@ impl ReplicationLog for ReplicationLogService {
 
         let offset = req.next_offset;
         match logger.get_snapshot_file(offset).await {
-            Ok(Some(snapshot)) => Ok(tonic::Response::new(Box::pin(
-                snapshot_stream::make_snapshot_stream(snapshot, offset, stats),
-            ))),
+            Ok(Some(snapshot)) => {
+                let stream = self.fenced_stream(
+                    &namespace,
+                    "snapshot",
+                    &fence,
+                    Box::pin(snapshot_stream::make_snapshot_stream(
+                        snapshot, offset, stats,
+                    )),
+                )?;
+                Ok(tonic::Response::new(Box::pin(stream)))
+            }
             Ok(None) => Err(Status::new(tonic::Code::Unavailable, "snapshot not found")),
             Err(e) => Err(Status::new(tonic::Code::Internal, e.to_string())),
         }

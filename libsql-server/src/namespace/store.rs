@@ -632,6 +632,13 @@ pub(crate) mod fence_tests {
     const OP: Uuid = Uuid::from_u128(0xa);
 
     pub(crate) async fn open_store(dir: &Path) -> NamespaceStore {
+        open_store_with_max_log_size(dir, 1_000_000_000).await
+    }
+
+    pub(crate) async fn open_store_with_max_log_size(
+        dir: &Path,
+        max_log_size: u64,
+    ) -> NamespaceStore {
         let (maker, manager) = metastore_connection_maker(None, dir).await.unwrap();
         let meta = MetaStore::new(
             MetaStoreConfig {
@@ -660,7 +667,7 @@ pub(crate) mod fence_tests {
                 disable_intelligent_throttling: false,
             },
             PrimaryConfig {
-                max_log_size: 1_000_000_000,
+                max_log_size,
                 max_log_duration: None,
                 bottomless_replication: None,
                 scripted_backup: None,

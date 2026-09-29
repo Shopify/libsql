@@ -280,6 +280,13 @@ struct Cli {
     #[clap(long, env = "SQLD_NAMESPACE_FENCE_DEFAULT_READ_DRAIN_MS")]
     namespace_fence_default_read_drain_ms: Option<u64>,
 
+    /// HTTP/2 keepalive interval, in seconds, of the RPC server and the user-port gRPC
+    /// services when namespace fences are enabled, so that replication streams of dead peers
+    /// are detected (a ping unanswered for 20 seconds closes the connection). Defaults to 30
+    /// seconds; ignored unless `--enable-namespace-fence` is set.
+    #[clap(long, env = "SQLD_NAMESPACE_FENCE_KEEPALIVE_INTERVAL_S")]
+    namespace_fence_keepalive_interval_s: Option<u64>,
+
     /// Shutdown timeout duration in seconds, defaults to 30 seconds.
     #[clap(long, env = "SQLD_SHUTDOWN_TIMEOUT")]
     shutdown_timeout: Option<u64>,
@@ -756,6 +763,9 @@ async fn build_server(
         force_load_wals: config.force_load_wals,
         sync_conccurency: config.sync_conccurency,
         set_log_level: Some(Box::new(set_log_level)),
+        http2_keepalive_interval: config.enable_namespace_fence.then(|| {
+            Duration::from_secs(config.namespace_fence_keepalive_interval_s.unwrap_or(30))
+        }),
     })
 }
 

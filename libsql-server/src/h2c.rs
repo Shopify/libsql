@@ -40,6 +40,7 @@
 
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::time::Duration;
 
 use axum::{body::BoxBody, http::HeaderValue};
 use bytes::Bytes;
@@ -56,6 +57,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, Clone)]
 pub struct H2cMaker<S, B> {
     s: S,
+    http2_keepalive_interval: Option<Duration>,
     _pd: PhantomData<fn(B)>,
 }
 
@@ -63,8 +65,31 @@ impl<S, B> H2cMaker<S, B> {
     pub fn new(s: S) -> Self {
         Self {
             s,
+            http2_keepalive_interval: None,
             _pd: PhantomData,
         }
+    }
+
+    /// Send HTTP/2 keepalive pings on upgraded `h2c` connections at this interval.
+    pub fn with_http2_keepalive(mut self, interval: Option<Duration>) -> Self {
+        self.http2_keepalive_interval = interval;
+        self
+    }
+}
+
+/// How long a keepalive ping may go unanswered before the connection is closed.
+pub const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Configure HTTP/2 keepalive on a server builder; `None` leaves it unchanged.
+pub fn with_http2_keepalive<I, E>(
+    builder: hyper::server::Builder<I, E>,
+    interval: Option<Duration>,
+) -> hyper::server::Builder<I, E> {
+    match interval {
+        Some(interval) => builder
+            .http2_keep_alive_interval(interval)
+            .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT),
+        None => builder,
     }
 }
 
@@ -95,10 +120,12 @@ where
     fn call(&mut self, conn: &C) -> Self::Future {
         let connect_info = conn.connect_info();
         let s = self.s.clone();
+        let http2_keepalive_interval = self.http2_keepalive_interval;
         Box::pin(async move {
             Ok(H2c {
                 s,
                 connect_info,
+                http2_keepalive_interval,
                 _pd: PhantomData,
             })
         })
@@ -112,6 +139,7 @@ where
 pub struct H2c<S, B> {
     s: S,
     connect_info: TcpConnectInfo,
+    http2_keepalive_interval: Option<Duration>,
     _pd: PhantomData<fn(B)>,
 }
 
@@ -139,6 +167,7 @@ where
     fn call(&mut self, mut req: hyper::Request<Body>) -> Self::Future {
         let mut svc = self.s.clone();
         let connect_info = self.connect_info.clone();
+        let http2_keepalive_interval = self.http2_keepalive_interval;
 
         Box::pin(async move {
             req.extensions_mut().insert(connect_info.clone());
@@ -169,8 +198,13 @@ where
 
                 tracing::debug!("Successfully upgraded the connection, speaking h2 now");
 
-                if let Err(e) = hyper::server::conn::Http::new()
-                    .http2_only(true)
+                let mut http = hyper::server::conn::Http::new();
+                http.http2_only(true);
+                if let Some(interval) = http2_keepalive_interval {
+                    http.http2_keep_alive_interval(interval)
+                        .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT);
+                }
+                if let Err(e) = http
                     .serve_connection(
                         upgraded_io,
                         tower::service_fn(move |mut r: hyper::Request<hyper::Body>| {
