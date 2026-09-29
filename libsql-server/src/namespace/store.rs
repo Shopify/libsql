@@ -13,7 +13,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::auth::Authenticated;
 use crate::broadcaster::BroadcastMsg;
 use crate::connection::config::DatabaseConfig;
-use crate::database::DatabaseKind;
+use crate::database::{Database, DatabaseKind, PrimaryConnectionMaker};
 use crate::error::Error;
 use crate::metrics::NAMESPACE_LOAD_LATENCY;
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
@@ -21,9 +21,11 @@ use crate::stats::Stats;
 
 use super::broadcasters::{BroadcasterHandle, BroadcasterRegistry};
 use super::configurator::{DynConfigurator, NamespaceConfigurators};
+use super::fence::capability::CapabilityPurpose;
 use super::fence::command::{FenceCommand, FenceRequest};
 use super::fence::controller::{FenceController, Transition};
 use super::fence::hooks::HookPoint;
+use super::fence::import::{self, ImportSession};
 use super::fence::outcome::FenceOutcome;
 use super::fence::record::ServerIdentity;
 use super::fence::registry::FenceRegistry;
@@ -692,6 +694,71 @@ impl NamespaceStore {
             );
         }
         Ok(commit)
+    }
+
+    /// Issue an import capability to `operation_id` and open a connection that works under it
+    /// (`docs/NAMESPACE_FENCE.md` section 11): the only way to write into a quarantined target.
+    /// Valid only while the target is `TARGET_QUARANTINED`, owned by `operation_id`, at
+    /// `expected_revision`; the target is loaded if it is not. Fence refusals are
+    /// [`Error::NamespaceFence`] with their stable outcome code (`OPERATION_CAPABILITY_REQUIRED`
+    /// in any other state, `FENCE_OWNED_BY_ANOTHER_OPERATION`, `FENCE_REVISION_MISMATCH`).
+    pub async fn open_import_session(
+        &self,
+        namespace: NamespaceName,
+        operation_id: uuid::Uuid,
+        expected_revision: u64,
+    ) -> crate::Result<ImportSession> {
+        let (controller, maker) = self.primary_maker(&namespace).await?;
+        let capability = controller.issue_capability(
+            CapabilityPurpose::Import,
+            operation_id,
+            expected_revision,
+        )?;
+        match maker
+            .inner()
+            .make_capability_connection(capability.clone())
+            .await
+        {
+            Ok(conn) => Ok(ImportSession::new(capability, controller, conn)),
+            Err(e) => {
+                controller.revoke_capability(capability.id());
+                Err(e)
+            }
+        }
+    }
+
+    /// The fence controller and connection maker of the primary `namespace`, loading it.
+    async fn primary_maker(
+        &self,
+        namespace: &NamespaceName,
+    ) -> crate::Result<(Arc<FenceController>, Arc<PrimaryConnectionMaker>)> {
+        let (controller, maker) = self
+            .with(namespace.clone(), |ns| {
+                let maker = match &ns.db {
+                    Database::Primary(p) => Some(p.connection_maker()),
+                    _ => None,
+                };
+                (ns.fence().clone(), maker)
+            })
+            .await?;
+        match maker {
+            Some(maker) => Ok((controller, maker)),
+            None => Err(import::not_importable(namespace)),
+        }
+    }
+
+    /// A connection to `namespace` that works under `capability`, whether or not this server
+    /// issued it: for tests that prove the WAL refuses a capability that is not the valid one.
+    #[cfg(test)]
+    pub(crate) async fn capability_connection(
+        &self,
+        namespace: &NamespaceName,
+        capability: super::fence::capability::MigrationCapability,
+    ) -> crate::Result<
+        crate::connection::legacy::LegacyConnection<super::replication_wal::ReplicationWalWrapper>,
+    > {
+        let (_, maker) = self.primary_maker(namespace).await?;
+        maker.inner().make_capability_connection(capability).await
     }
 
     /// Whether the server already knows `namespace`: its config is in memory, or the namespace

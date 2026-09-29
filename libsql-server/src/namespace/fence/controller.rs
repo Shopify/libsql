@@ -24,6 +24,7 @@ use crate::namespace::meta_store::{FenceCommit, FenceContext, MetaStore};
 use crate::namespace::NamespaceName;
 use crate::replication::FrameNo;
 
+use super::capability::{CapabilityPurpose, CapabilitySet, ImportWriter, MigrationCapability};
 use super::command::FenceRequest;
 #[cfg(test)]
 use super::hooks::FenceTestHooks;
@@ -312,6 +313,12 @@ pub struct FenceController {
     read_leases: Mutex<ReadLeaseSet>,
     /// Notified whenever a read lease is released.
     read_released: Notify,
+    /// The migration capabilities issued and not revoked, and the import calls running under
+    /// them (sections 7.2 and 10.2). Lock order: this lock may be taken before borrowing the
+    /// gate, never while a gate borrow is held.
+    capabilities: Mutex<CapabilitySet>,
+    /// Notified whenever an import call ends.
+    import_released: Notify,
     #[cfg(test)]
     hooks: FenceTestHooks,
 }
@@ -337,6 +344,8 @@ impl FenceController {
             write_drains: Mutex::new(Vec::new()),
             read_leases: Mutex::new(ReadLeaseSet::default()),
             read_released: Notify::new(),
+            capabilities: Mutex::new(CapabilitySet::default()),
+            import_released: Notify::new(),
             #[cfg(test)]
             hooks: FenceTestHooks::default(),
         })
@@ -484,6 +493,144 @@ impl FenceController {
         self.read_released.notify_waiters();
     }
 
+    /// Issue a migration capability for `purpose` to `operation_id` (section 11). The fence
+    /// must be in a state the purpose admits, owned by `operation_id`, at `expected_revision`,
+    /// with no command being installed or reconciled. The capability stays valid until the
+    /// fence moves on (every transition moves the revision) or it is revoked.
+    pub fn issue_capability(
+        &self,
+        purpose: CapabilityPurpose,
+        operation_id: Uuid,
+        expected_revision: u64,
+    ) -> Result<MigrationCapability, FenceError> {
+        let mut caps = self.capabilities.lock();
+        let gate = self.gate.borrow();
+        gate.permits(purpose.class())?;
+        let Some(record) = gate.fence.record() else {
+            return Err(FenceError::new(
+                FenceOutcome::OperationCapabilityRequired,
+                format!("namespace `{}` has no fence record", self.namespace),
+            ));
+        };
+        if record.operation_id != operation_id {
+            return Err(FenceError::new(
+                FenceOutcome::FenceOwnedByAnotherOperation,
+                format!(
+                    "the fence of namespace `{}` is owned by operation {}, not by operation \
+                     {operation_id}",
+                    self.namespace, record.operation_id
+                ),
+            ));
+        }
+        if record.revision != expected_revision {
+            return Err(FenceError::new(
+                FenceOutcome::FenceRevisionMismatch,
+                format!(
+                    "the fence of namespace `{}` is at revision {}, not at the expected revision \
+                     {expected_revision}",
+                    self.namespace, record.revision
+                ),
+            ));
+        }
+        if !purpose.admits(record.state) {
+            return Err(FenceError::new(
+                FenceOutcome::OperationCapabilityRequired,
+                format!(
+                    "namespace `{}` is in {}, which admits no new {} capability",
+                    self.namespace,
+                    record.state,
+                    purpose.as_str()
+                ),
+            ));
+        }
+        let cap = MigrationCapability::issue(
+            self.namespace.clone(),
+            operation_id,
+            purpose,
+            record.revision,
+        );
+        drop(gate);
+        caps.live.insert(cap.id(), cap.clone());
+        tracing::debug!(
+            namespace = %self.namespace,
+            %operation_id,
+            capability = %cap.id(),
+            purpose = purpose.as_str(),
+            revision = cap.fence_revision(),
+            "issued migration capability"
+        );
+        Ok(cap)
+    }
+
+    /// Revoke a capability: nothing is admitted under it any more.
+    pub fn revoke_capability(&self, id: Uuid) {
+        self.capabilities.lock().live.remove(&id);
+    }
+
+    /// Whether `id` was issued by this controller and is neither revoked nor invalidated by a
+    /// transition.
+    pub fn capability_is_live(&self, id: Uuid) -> bool {
+        self.capabilities.lock().live.contains_key(&id)
+    }
+
+    /// Admit one import call under `cap`, counted until the returned guard is dropped. The
+    /// capability is checked against the gate under the capability lock, so an import call is
+    /// either refused by a seal that closed admission before it, or counted by the seal, which
+    /// reads the count only after closing admission (section 10.2).
+    pub fn begin_import_write(
+        self: &Arc<Self>,
+        cap: &MigrationCapability,
+    ) -> Result<ImportWriter, FenceError> {
+        if cap.namespace() != &self.namespace || cap.purpose() != CapabilityPurpose::Import {
+            return Err(FenceError::new(
+                FenceOutcome::OperationCapabilityRequired,
+                format!(
+                    "a {} capability for namespace `{}` does not admit imports into `{}`",
+                    cap.purpose().as_str(),
+                    cap.namespace(),
+                    self.namespace
+                ),
+            ));
+        }
+        let mut caps = self.capabilities.lock();
+        {
+            let gate = self.gate.borrow();
+            gate.permits(OperationClass::CapabilityImport)?;
+            cap.check(&gate.fence)?;
+        }
+        if !caps.live.contains_key(&cap.id()) {
+            return Err(revoked(cap));
+        }
+        caps.import_writers += 1;
+        Ok(ImportWriter {
+            controller: self.clone(),
+        })
+    }
+
+    pub(super) fn end_import_write(&self) {
+        {
+            let mut caps = self.capabilities.lock();
+            caps.import_writers = caps.import_writers.saturating_sub(1);
+        }
+        self.import_released.notify_waiters();
+    }
+
+    /// The import calls running now.
+    pub fn import_writers(&self) -> usize {
+        self.capabilities.lock().import_writers
+    }
+
+    /// The capabilities issued and still live.
+    pub fn live_capabilities(&self) -> usize {
+        self.capabilities.lock().live.len()
+    }
+
+    /// Notified whenever an import call ends. Enable the notification before checking
+    /// [`import_writers`](Self::import_writers), so an end in between is not missed.
+    pub(crate) fn import_released(&self) -> &Notify {
+        &self.import_released
+    }
+
     /// Take the namespace's transition lock. Every fence command on the namespace runs while
     /// holding it, from its first check to its response.
     pub async fn begin_transition(self: &Arc<Self>) -> Transition {
@@ -558,6 +705,7 @@ impl FenceController {
         installing: Option<CommandKey>,
         creating_target: Option<CommandKey>,
     ) {
+        let fence_published = fence.is_some();
         let mut generation_changed = false;
         self.gate.send_modify(|gate| {
             let fence = fence.unwrap_or_else(|| gate.fence.clone());
@@ -589,6 +737,16 @@ impl FenceController {
                 creating_target = gate.creating_target.is_some(),
                 "published namespace fence gate"
             );
+        }
+        // A published transition invalidates every capability issued against an earlier state,
+        // owner or revision. Cloned first: the capability lock is never taken under a gate
+        // borrow.
+        if fence_published {
+            let fence = self.gate.borrow().fence.clone();
+            self.capabilities
+                .lock()
+                .live
+                .retain(|_, cap| cap.matches(&fence));
         }
         // After the gate is published, so that every woken writer re-checks against it.
         if generation_changed {
@@ -805,6 +963,20 @@ fn indeterminate(key: CommandKey, why: &str) -> FenceError {
     .with_detail(FenceDetail::IndeterminateCommit)
 }
 
+fn revoked(cap: &MigrationCapability) -> FenceError {
+    FenceError::new(
+        FenceOutcome::OperationCapabilityRequired,
+        format!(
+            "the {} capability {} of operation {} on namespace `{}` was revoked or was never \
+             issued by this server",
+            cap.purpose().as_str(),
+            cap.id(),
+            cap.operation_id(),
+            cap.namespace()
+        ),
+    )
+}
+
 fn pending_indeterminate((operation_id, command_id): CommandKey) -> FenceError {
     FenceError::new(
         FenceOutcome::FenceCommitIndeterminate,
@@ -857,6 +1029,9 @@ impl Drop for ProgramReadLease {
 pub struct FenceConnState {
     controller: Arc<FenceController>,
     class: OperationClass,
+    /// The migration capability this connection works under, fixed at construction. Only a
+    /// connection opened for an import or validation session has one.
+    capability: Option<MigrationCapability>,
     /// The write generation the current program was admitted under.
     program_generation: AtomicU64,
     /// The write generation the current read transaction was opened under.
@@ -875,10 +1050,30 @@ pub struct FenceConnState {
 
 impl FenceConnState {
     pub fn new(controller: Arc<FenceController>, class: OperationClass) -> Arc<Self> {
+        Self::build(controller, class, None)
+    }
+
+    /// The fence state of a connection that works under `capability` (an import or a
+    /// validation session): it is admitted as the capability's class, and only while the
+    /// capability is valid.
+    pub fn with_capability(
+        controller: Arc<FenceController>,
+        capability: MigrationCapability,
+    ) -> Arc<Self> {
+        let class = capability.class();
+        Self::build(controller, class, Some(capability))
+    }
+
+    fn build(
+        controller: Arc<FenceController>,
+        class: OperationClass,
+        capability: Option<MigrationCapability>,
+    ) -> Arc<Self> {
         let generation = controller.write_generation();
         Arc::new(Self {
             controller,
             class,
+            capability,
             program_generation: AtomicU64::new(generation),
             txn_generation: AtomicU64::new(generation),
             denial: Mutex::new(None),
@@ -974,6 +1169,10 @@ impl FenceConnState {
         self.class
     }
 
+    pub fn capability(&self) -> Option<&MigrationCapability> {
+        self.capability.as_ref()
+    }
+
     pub fn program_generation(&self) -> u64 {
         self.program_generation.load(Ordering::Acquire)
     }
@@ -1000,32 +1199,19 @@ impl FenceConnState {
     }
 
     /// The authoritative write admission (section 8.1, check 2): the live gate permits this
-    /// connection's class, and the program and its read transaction were both admitted under
-    /// the gate's current write generation. On refusal the typed outcome is left in the denial
-    /// slot and returned.
+    /// connection's class, the program and its read transaction were both admitted under the
+    /// gate's current write generation, and a capability connection's capability is still the
+    /// valid one (the fence's state, owner and revision are the ones it was issued at, and it
+    /// is live). A validation connection never writes. On refusal the typed outcome is left in
+    /// the denial slot and returned.
     pub fn admit_write(&self) -> Result<(), FenceError> {
-        let result = {
-            let gate = self.controller.gate.borrow();
-            gate.permits(self.class).and_then(|()| {
-                let current = gate.write_generation;
-                let program = self.program_generation();
-                let txn = self.txn_generation();
-                if program == current && txn == current {
-                    Ok(())
-                } else {
-                    Err(FenceError::new(
-                        FenceOutcome::MigrationWriteFenced,
-                        format!(
-                            "the namespace fence changed after this transaction began \
-                             (program admitted at generation {program}, transaction opened at \
-                             generation {txn}, current generation {current}); roll back and \
-                             begin a new transaction"
-                        ),
-                    )
-                    .with_detail(FenceDetail::StaleTransaction))
-                }
-            })
-        };
+        let result = self
+            .admit_write_under_gate()
+            .and_then(|()| match &self.capability {
+                // Outside the gate borrow: the capability lock is never taken under one.
+                Some(cap) if !self.controller.capability_is_live(cap.id()) => Err(revoked(cap)),
+                _ => Ok(()),
+            });
         if let Err(e) = &result {
             tracing::debug!(
                 namespace = %self.controller.namespace,
@@ -1035,6 +1221,37 @@ impl FenceConnState {
             *self.denial.lock() = Some(e.clone());
         }
         result
+    }
+
+    fn admit_write_under_gate(&self) -> Result<(), FenceError> {
+        let gate = self.controller.gate.borrow();
+        gate.permits(self.class)?;
+        let current = gate.write_generation;
+        let program = self.program_generation();
+        let txn = self.txn_generation();
+        if program != current || txn != current {
+            return Err(FenceError::new(
+                FenceOutcome::MigrationWriteFenced,
+                format!(
+                    "the namespace fence changed after this transaction began (program admitted \
+                     at generation {program}, transaction opened at generation {txn}, current \
+                     generation {current}); roll back and begin a new transaction"
+                ),
+            )
+            .with_detail(FenceDetail::StaleTransaction));
+        }
+        match (self.class, &self.capability) {
+            (OperationClass::CapabilityValidate, _) => Err(FenceError::new(
+                FenceOutcome::OperationCapabilityRequired,
+                "a validation capability admits reads only",
+            )),
+            (_, Some(cap)) => cap.check(&gate.fence),
+            (OperationClass::CapabilityImport, None) => Err(FenceError::new(
+                FenceOutcome::OperationCapabilityRequired,
+                "an import write needs a migration capability",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Take the typed outcome of the last refusal at the WAL, if any.
