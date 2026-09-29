@@ -16,6 +16,7 @@ use crate::connection::{Connection as _, MakeConnection, MakeThrottledConnection
 use crate::database::PrimaryConnectionMaker;
 use crate::error::LoadDumpError;
 use crate::namespace::broadcasters::BroadcasterHandle;
+use crate::namespace::fence::controller::FenceController;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::replication_wal::{make_replication_wal_wrapper, ReplicationWalWrapper};
 use crate::namespace::{
@@ -95,6 +96,7 @@ pub(super) async fn make_primary_connection_maker(
     broadcaster: BroadcasterHandle,
     make_wal_manager: Arc<dyn Fn() -> InnerWalManager + Sync + Send + 'static>,
     encryption_config: Option<EncryptionConfig>,
+    fence: Arc<FenceController>,
 ) -> crate::Result<(
     Arc<PrimaryConnectionMaker>,
     ReplicationWalWrapper,
@@ -219,6 +221,7 @@ pub(super) async fn make_primary_connection_maker(
             block_writes,
             resolve_attach_path,
             make_wal_manager.clone(),
+            fence,
         )
         .await?
         .throttled(

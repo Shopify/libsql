@@ -862,6 +862,17 @@ fn not_primary() -> FenceError {
     .with_detail(FenceDetail::NotPrimary)
 }
 
+/// A fence transaction whose `COMMIT` failed: whether it took effect is unknown, and the
+/// controller keeps the namespace closed until the same command is replayed (section 8.4).
+fn commit_indeterminate(e: rusqlite::Error) -> FenceStoreError {
+    FenceError::new(
+        FenceOutcome::FenceCommitIndeterminate,
+        format!("the metastore commit of a fence transition failed: {e}"),
+    )
+    .with_detail(FenceDetail::IndeterminateCommit)
+    .into()
+}
+
 fn unavailable_receipt(e: impl std::fmt::Display) -> FenceError {
     FenceError::new(
         FenceOutcome::FenceStateUnavailable,
@@ -987,7 +998,7 @@ fn apply_fence_command(
     if let Some(marker) = new_target_marker {
         marker.keep();
     }
-    tx.commit()?;
+    tx.commit().map_err(commit_indeterminate)?;
     // The command established the fence from the durable state; whatever startup could not
     // recover about this name is settled.
     inner.recovered.lock().remove(ns);
@@ -1131,7 +1142,7 @@ fn complete_fence_drain(
     }
     fence_store::write_record(&tx, &next, fence_store::stored_revision(&tx, ns)?)?;
     fence_store::write_receipt(&tx, &final_receipt)?;
-    tx.commit()?;
+    tx.commit().map_err(commit_indeterminate)?;
     inner.recovered.lock().remove(ns);
 
     after_fence_commit(inner, &conn, Some(&next), true);

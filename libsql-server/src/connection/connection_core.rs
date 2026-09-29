@@ -394,6 +394,7 @@ mod test {
     use crate::auth::Authenticated;
     use crate::connection::legacy::MakeLegacyConnection;
     use crate::connection::{Connection as _, RequestContext, TXN_TIMEOUT};
+    use crate::namespace::fence::controller::FenceController;
     use crate::namespace::meta_store::{metastore_connection_maker, MetaStore};
     use crate::namespace::NamespaceName;
     use crate::query_result_builder::test::{test_driver, TestBuilder};
@@ -454,6 +455,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -500,6 +502,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -551,6 +554,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -634,6 +638,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -727,6 +732,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();

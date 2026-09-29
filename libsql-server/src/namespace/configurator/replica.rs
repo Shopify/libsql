@@ -18,6 +18,7 @@ use crate::connection::MakeConnection;
 use crate::database::{Database, ReplicaDatabase};
 use crate::namespace::broadcasters::BroadcasterHandle;
 use crate::namespace::configurator::helpers::{make_stats, run_storage_monitor};
+use crate::namespace::fence::controller::FenceController;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{Namespace, NamespaceBottomlessDbIdInit, RestoreOption};
 use crate::namespace::{NamespaceName, NamespaceStore, ResetCb, ResetOp, ResolveNamespacePathFn};
@@ -60,6 +61,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
         resolve_attach_path: ResolveNamespacePathFn,
         store: NamespaceStore,
         broadcaster: BroadcasterHandle,
+        fence: Arc<FenceController>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
         Box::pin(async move {
             tracing::debug!("creating replica namespace");
@@ -104,6 +106,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
                             resolve_attach_path,
                             store,
                             broadcaster,
+                            fence,
                         )
                         .await;
                 }
@@ -220,6 +223,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
                 Arc::new(AtomicBool::new(false)), // this is always false for write proxy
                 resolve_attach_path,
                 self.make_wal_manager.clone(),
+                fence.clone(),
             )
             .await?;
 
@@ -274,6 +278,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
                 stats,
                 db_config_store: meta_store_handle,
                 path: db_path.into(),
+                fence,
             })
         })
     }

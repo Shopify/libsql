@@ -14,6 +14,8 @@ use tokio::time::Duration;
 use crate::error::Error;
 use crate::metrics::DESCRIBE_COUNT;
 use crate::namespace::broadcasters::BroadcasterHandle;
+use crate::namespace::fence::controller::{FenceConnState, FenceController};
+use crate::namespace::fence::state::OperationClass;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::ResolveNamespacePathFn;
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
@@ -47,6 +49,9 @@ pub struct MakeLegacyConnection<W> {
     block_writes: Arc<AtomicBool>,
     resolve_attach_path: ResolveNamespacePathFn,
     make_wal_manager: Arc<dyn Fn() -> InnerWalManager + Sync + Send + 'static>,
+    /// The namespace's fence controller. Every connection this maker opens, starting with the
+    /// held `_db` connection, carries a fence state bound to it.
+    fence: Arc<FenceController>,
 }
 
 impl<W> MakeLegacyConnection<W>
@@ -69,6 +74,7 @@ where
         block_writes: Arc<AtomicBool>,
         resolve_attach_path: ResolveNamespacePathFn,
         make_wal_manager: Arc<dyn Fn() -> InnerWalManager + Sync + Send + 'static>,
+        fence: Arc<FenceController>,
     ) -> Result<Self> {
         let txn_timeout = config_store.get().txn_timeout.unwrap_or(TXN_TIMEOUT);
 
@@ -89,6 +95,7 @@ where
             resolve_attach_path,
             connection_manager: ConnectionManager::new(txn_timeout),
             make_wal_manager,
+            fence,
         };
 
         let db = this.try_create_db().await?;
@@ -146,6 +153,7 @@ where
             self.resolve_attach_path.clone(),
             self.connection_manager.clone(),
             self.make_wal_manager.clone(),
+            FenceConnState::new(self.fence.clone(), OperationClass::NormalWrite),
         )
         .await
     }
@@ -165,6 +173,10 @@ where
 
 pub struct LegacyConnection<T> {
     pub(super) inner: Arc<Mutex<CoreConnection<WrappedWal<T, ManagedConnectionWal>>>>,
+    /// Shared with the connection's WAL wrapper.
+    // Read by the WAL gate and the program admission check in the next commit of this series.
+    #[allow(dead_code)]
+    pub(super) fence: Arc<FenceConnState>,
 }
 
 #[cfg(test)]
@@ -185,6 +197,10 @@ impl LegacyConnection<libsql_sys::wal::wrapper::PassthroughWalWrapper> {
             Arc::new(|_| unreachable!()),
             ConnectionManager::new(TXN_TIMEOUT),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceConnState::new(
+                FenceController::unfenced(Default::default()),
+                OperationClass::NormalWrite,
+            ),
         )
         .await
         .unwrap()
@@ -195,6 +211,7 @@ impl<T> Clone for LegacyConnection<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            fence: self.fence.clone(),
         }
     }
 }
@@ -321,11 +338,13 @@ where
         resolve_attach_path: ResolveNamespacePathFn,
         connection_manager: ConnectionManager,
         make_wal: Arc<dyn Fn() -> InnerWalManager + Sync + Send + 'static>,
+        fence: Arc<FenceConnState>,
     ) -> crate::Result<Self> {
         let (conn, id) = tokio::task::spawn_blocking({
             let connection_manager = connection_manager.clone();
+            let fence = fence.clone();
             move || -> crate::Result<_> {
-                let manager = ManagedConnectionWalWrapper::new(connection_manager);
+                let manager = ManagedConnectionWalWrapper::new(connection_manager, fence);
                 let id = manager.id();
                 let wal = make_wal().wrap(manager).wrap(wal_wrapper);
 
@@ -366,7 +385,7 @@ where
 
         connection_manager.register_connection(&inner, id);
 
-        Ok(Self { inner })
+        Ok(Self { inner, fence })
     }
 
     pub async fn execute<B: QueryResultBuilder>(
