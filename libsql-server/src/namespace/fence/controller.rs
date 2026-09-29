@@ -573,6 +573,38 @@ impl FenceController {
         self.capabilities.lock().live.contains_key(&id)
     }
 
+    /// Check that `cap` is the live server-issued capability of `purpose` for this namespace
+    /// and still matches the published fence. Validation sessions use this before every call;
+    /// import sessions perform the same checks while also incrementing their writer count.
+    pub(crate) fn check_capability(
+        &self,
+        cap: &MigrationCapability,
+        purpose: CapabilityPurpose,
+    ) -> Result<(), FenceError> {
+        if cap.namespace() != &self.namespace || cap.purpose() != purpose {
+            return Err(FenceError::new(
+                FenceOutcome::OperationCapabilityRequired,
+                format!(
+                    "a {} capability for namespace `{}` does not admit {} work on `{}`",
+                    cap.purpose().as_str(),
+                    cap.namespace(),
+                    purpose.as_str(),
+                    self.namespace
+                ),
+            ));
+        }
+        let caps = self.capabilities.lock();
+        {
+            let gate = self.gate.borrow();
+            gate.permits(purpose.class())?;
+            cap.check(&gate.fence)?;
+        }
+        if !caps.live.contains_key(&cap.id()) {
+            return Err(revoked(cap));
+        }
+        Ok(())
+    }
+
     /// Admit one import call under `cap`, counted until the returned guard is dropped. The
     /// capability is checked against the gate under the capability lock, so an import call is
     /// either refused by a seal that closed admission before it, or counted by the seal, which
