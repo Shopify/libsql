@@ -121,6 +121,16 @@ pub async fn acquire_source_write_fence(
     };
 
     // Step 7.
+    let acquired_on = commit.record.as_ref().and_then(|r| r.identity.log_id);
+    if acquired_on.is_some_and(|log_id| log_id != boundary.log_id) {
+        tracing::warn!(
+            namespace = %controller.namespace(),
+            acquired_on = ?acquired_on,
+            boundary_log_id = %boundary.log_id,
+            "the replication log was rebuilt since the write fence was acquired (the source \
+             restarted while draining); the frozen boundary names the rebuilt log"
+        );
+    }
     ctx.now_ms = now_ms();
     transition
         .complete_drain(
