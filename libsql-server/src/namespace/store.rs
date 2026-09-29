@@ -22,6 +22,7 @@ use crate::stats::Stats;
 use super::broadcasters::{BroadcasterHandle, BroadcasterRegistry};
 use super::configurator::{DynConfigurator, NamespaceConfigurators};
 use super::fence::command::{FenceCommand, FenceRequest};
+use super::fence::controller::FenceController;
 use super::fence::record::ServerIdentity;
 use super::fence::registry::FenceRegistry;
 use super::meta_store::{FenceCommit, FenceContext, MetaStore, MetaStoreHandle};
@@ -376,8 +377,12 @@ impl NamespaceStore {
             Arc::new({
                 let store = self.clone();
                 move |ns: &NamespaceName| {
-                    tokio::runtime::Handle::current()
-                        .block_on(store.with(ns.clone(), |ns| ns.path.clone()))
+                    tokio::runtime::Handle::current().block_on(store.with(ns.clone(), |ns| {
+                        super::AttachTarget {
+                            path: ns.path.clone(),
+                            fence: ns.fence().clone(),
+                        }
+                    }))
                 }
             })
         })
@@ -558,6 +563,23 @@ impl NamespaceStore {
                 FenceContext::now(server, None),
             )
             .await
+    }
+
+    /// The fence controller that admits reads of `namespace` without loading it: `None` when
+    /// the namespace does not exist (and has no fence state). A namespace whose fence state is
+    /// unavailable is refused.
+    pub(crate) async fn fence_gate(
+        &self,
+        namespace: &NamespaceName,
+    ) -> crate::Result<Option<Arc<FenceController>>> {
+        self.inner.fences.check_available(namespace)?;
+        if let Some(controller) = self.inner.fences.get(namespace) {
+            return Ok(Some(controller));
+        }
+        if self.inner.metadata.exists(namespace).await {
+            return Ok(Some(self.inner.fences.controller(namespace)));
+        }
+        Ok(None)
     }
 
     pub(crate) fn schema_locks(&self) -> &SchemaLocksRegistry {

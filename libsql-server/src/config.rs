@@ -196,6 +196,9 @@ pub struct MetaStoreConfig {
     /// How long `AcquireSourceWriteFence` waits for active writers when the request names no
     /// drain policy. `None` is the default of 30 seconds.
     pub namespace_fence_default_write_drain: Option<Duration>,
+    /// How long `SetSourceReadFence` waits for running reads and streams before it cancels
+    /// them, when the request names no drain policy. `None` is the default of 30 seconds.
+    pub namespace_fence_default_read_drain: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]

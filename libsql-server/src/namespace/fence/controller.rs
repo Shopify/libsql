@@ -10,11 +10,12 @@
 //! namespace cache, so evicting and reloading a namespace hands the reloaded namespace the
 //! same controller.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::sync::{watch, OwnedMutexGuard};
+use tokio::sync::{watch, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::connection::connection_manager::{ConnectionManager, WeakConnectionManager};
@@ -52,6 +53,11 @@ pub struct GateSnapshot {
     /// (section 8.3, step 2): write admission is closed on top of whatever `fence` allows.
     /// Never persisted.
     pub installing: Option<CommandKey>,
+    /// The in-memory read-closing gate of a `SetSourceReadFence` that is being persisted
+    /// (section 9, step 2): normal reads and streams are refused on top of whatever `fence`
+    /// allows. Never persisted, and cleared by every publication of a commit. It does not move
+    /// the write generation: write admission is already closed wherever a read fence can be set.
+    pub closing_reads: Option<CommandKey>,
 }
 
 impl GateSnapshot {
@@ -61,6 +67,7 @@ impl GateSnapshot {
             write_generation: 0,
             indeterminate: None,
             installing: None,
+            closing_reads: None,
         }
     }
 
@@ -111,6 +118,17 @@ impl GateSnapshot {
                     format!(
                         "{class:?} is not permitted: fence command {command_id} of operation \
                          {operation_id} is closing write admission"
+                    ),
+                ));
+            }
+        }
+        if let Some((operation_id, command_id)) = self.closing_reads {
+            if matches!(class, OperationClass::NormalRead | OperationClass::Stream) {
+                return Err(FenceError::new(
+                    FenceOutcome::MigrationReadFenced,
+                    format!(
+                        "{class:?} is not permitted: fence command {command_id} of operation \
+                         {operation_id} is closing read admission"
                     ),
                 ));
             }
@@ -177,6 +195,84 @@ pub(crate) struct LiveWriteDrain {
     pub(crate) current_frame_no: GetCurrentFrameNo,
 }
 
+/// What a read lease covers (section 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeaseKind {
+    /// A running SQL program (including a Hrana cursor producing rows), or an ATTACH of the
+    /// namespace by a program running on another namespace.
+    Sql,
+    /// A `/dump` stream.
+    Dump,
+    /// A replication `log_entries` or `snapshot` stream.
+    Replication,
+}
+
+/// The number of read leases held on a namespace, by kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadLeaseCounts {
+    pub sql: usize,
+    pub dump: usize,
+    pub replication: usize,
+}
+
+impl ReadLeaseCounts {
+    pub fn total(&self) -> usize {
+        self.sql + self.dump + self.replication
+    }
+}
+
+struct LeaseEntry {
+    kind: LeaseKind,
+    cancel: Box<dyn Fn() + Send + Sync>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct ReadLeaseSet {
+    next_id: u64,
+    live: HashMap<u64, LeaseEntry>,
+}
+
+/// Read work admitted by the gate and counted by the read drain until it is dropped
+/// ([`FenceController::acquire_read_lease`]).
+pub struct ReadLease {
+    controller: Arc<FenceController>,
+    id: u64,
+    kind: LeaseKind,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ReadLease {
+    pub fn kind(&self) -> LeaseKind {
+        self.kind
+    }
+
+    pub fn controller(&self) -> &Arc<FenceController> {
+        &self.controller
+    }
+
+    /// Whether the read drain cancelled this lease's work at its deadline.
+    pub fn cancelled_by_fence(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for ReadLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadLease")
+            .field("namespace", &self.controller.namespace)
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl Drop for ReadLease {
+    fn drop(&mut self) {
+        self.controller.release_read_lease(self.id);
+    }
+}
+
 /// The fence controller of one namespace.
 pub struct FenceController {
     namespace: NamespaceName,
@@ -187,6 +283,10 @@ pub struct FenceController {
     /// What the write drain needs from each of the namespace's primary connection makers
     /// (section 8.3).
     write_drains: Mutex<Vec<WriteDrainSource>>,
+    /// The read leases held on the namespace (section 9).
+    read_leases: Mutex<ReadLeaseSet>,
+    /// Notified whenever a read lease is released.
+    read_released: Notify,
     #[cfg(test)]
     hooks: FenceTestHooks,
 }
@@ -210,6 +310,8 @@ impl FenceController {
             gate,
             write_queues: Mutex::new(Vec::new()),
             write_drains: Mutex::new(Vec::new()),
+            read_leases: Mutex::new(ReadLeaseSet::default()),
+            read_released: Notify::new(),
             #[cfg(test)]
             hooks: FenceTestHooks::default(),
         })
@@ -281,6 +383,82 @@ impl FenceController {
         live
     }
 
+    /// Admit read work of `class` and hold a read lease of `kind` for it (section 9). The gate
+    /// is checked under the lease lock, so a read fence that closed admission before this call
+    /// is seen here, and one that closes after it counts this lease and waits for it. `cancel`
+    /// is how the read drain stops the work at its deadline: it must make the work end and
+    /// drop the lease, never wait for it to end. The lease is released when dropped.
+    pub fn acquire_read_lease(
+        self: &Arc<Self>,
+        class: OperationClass,
+        kind: LeaseKind,
+        cancel: impl Fn() + Send + Sync + 'static,
+    ) -> Result<ReadLease, FenceError> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let id = {
+            let mut leases = self.read_leases.lock();
+            self.permits(class)?;
+            let id = leases.next_id;
+            leases.next_id += 1;
+            leases.live.insert(
+                id,
+                LeaseEntry {
+                    kind,
+                    cancel: Box::new(cancel),
+                    cancelled: cancelled.clone(),
+                },
+            );
+            id
+        };
+        Ok(ReadLease {
+            controller: self.clone(),
+            id,
+            kind,
+            cancelled,
+        })
+    }
+
+    /// The read leases currently held, by kind.
+    pub fn read_lease_counts(&self) -> ReadLeaseCounts {
+        let leases = self.read_leases.lock();
+        let mut counts = ReadLeaseCounts::default();
+        for entry in leases.live.values() {
+            match entry.kind {
+                LeaseKind::Sql => counts.sql += 1,
+                LeaseKind::Dump => counts.dump += 1,
+                LeaseKind::Replication => counts.replication += 1,
+            }
+        }
+        counts
+    }
+
+    /// Cancel every read lease held now (the read drain's deadline). Each lease's work is asked
+    /// to stop once; the leases stay counted until they are actually released. Returns how many
+    /// were asked.
+    pub(crate) fn cancel_read_leases(&self) -> usize {
+        let leases = self.read_leases.lock();
+        let mut asked = 0;
+        for entry in leases.live.values() {
+            if !entry.cancelled.swap(true, Ordering::AcqRel) {
+                (entry.cancel)();
+                asked += 1;
+            }
+        }
+        asked
+    }
+
+    /// Notified on every read-lease release. Enable the notification before checking
+    /// [`read_lease_counts`](Self::read_lease_counts), so a release in between is not missed.
+    pub(crate) fn read_released(&self) -> &Notify {
+        &self.read_released
+    }
+
+    fn release_read_lease(&self, id: u64) {
+        let removed = self.read_leases.lock().live.remove(&id);
+        drop(removed);
+        self.read_released.notify_waiters();
+    }
+
     /// Take the namespace's transition lock. Every fence command on the namespace runs while
     /// holding it, from its first check to its response.
     pub async fn begin_transition(self: &Arc<Self>) -> Transition {
@@ -330,7 +508,8 @@ impl FenceController {
 
     /// Publish a new gate. `fence: None` keeps the published fence. The write generation moves
     /// whenever the state, the owning operation, the indeterminate flag or the installing gate
-    /// changes.
+    /// changes. Every publication removes the read-closing gate: the commit that follows it
+    /// either persists the read fence or proves that nothing changed.
     fn publish(
         &self,
         fence: Option<StoredFence>,
@@ -348,6 +527,7 @@ impl FenceController {
             gate.fence = fence;
             gate.indeterminate = indeterminate;
             gate.installing = installing;
+            gate.closing_reads = None;
             if changed {
                 gate.write_generation += 1;
                 generation_changed = true;
@@ -404,6 +584,35 @@ impl Transition {
         if installing.is_some() {
             self.controller.publish(None, indeterminate, None);
         }
+    }
+
+    /// Publish the in-memory read-closing gate for `SetSourceReadFence` `key` (section 9,
+    /// step 2): new SQL programs, dumps, replication calls and ATTACHes of the namespace are
+    /// refused with `MIGRATION_READ_FENCED`. A read lease is only ever taken after checking the
+    /// gate under the lease lock, so every lease taken once this returns was refused, and the
+    /// drain only has to wait for the leases already held. It is replaced by whatever the
+    /// command's commit publishes, or removed with
+    /// [`reopen_read_admission`](Self::reopen_read_admission) when the command is proven not to
+    /// have committed.
+    pub fn close_read_admission(&mut self, key: CommandKey) {
+        self.controller
+            .gate
+            .send_modify(|gate| gate.closing_reads = Some(key));
+        tracing::debug!(
+            namespace = %self.controller.namespace,
+            operation_id = %key.0,
+            command_id = %key.1,
+            "closed namespace read admission"
+        );
+    }
+
+    /// Remove the read-closing gate of a command that was proven not to have committed.
+    pub fn reopen_read_admission(&mut self) {
+        self.controller.gate.send_if_modified(|gate| {
+            let was_closing = gate.closing_reads.is_some();
+            gate.closing_reads = None;
+            was_closing
+        });
     }
 
     /// Commit `request` in the metastore and publish the result.
@@ -535,6 +744,34 @@ fn pending_indeterminate((operation_id, command_id): CommandKey) -> FenceError {
     .with_detail(FenceDetail::IndeterminateCommit)
 }
 
+/// The read leases of one running program ([`FenceConnState::begin_read_program`]), released
+/// when dropped.
+#[derive(Debug)]
+pub struct ProgramReadLease {
+    conn: Arc<FenceConnState>,
+    lease: ReadLease,
+}
+
+impl ProgramReadLease {
+    /// Whether the read drain cancelled the program at its deadline.
+    pub fn cancelled_by_fence(&self) -> bool {
+        self.lease.cancelled_by_fence()
+            || self
+                .conn
+                .attached_leases
+                .lock()
+                .iter()
+                .any(ReadLease::cancelled_by_fence)
+    }
+}
+
+impl Drop for ProgramReadLease {
+    fn drop(&mut self) {
+        let attached = std::mem::take(&mut *self.conn.attached_leases.lock());
+        drop(attached);
+    }
+}
+
 /// The fence state of one connection, shared by its WAL wrapper and its `CoreConnection`
 /// (section 7.4).
 ///
@@ -554,6 +791,14 @@ pub struct FenceConnState {
     txn_generation: AtomicU64,
     /// The typed outcome of the last refusal at the WAL.
     denial: Mutex<Option<FenceError>>,
+    /// The connection's cancel flag (its progress handler interrupts the running statement
+    /// while it is set), through which the read drain cancels a program at its deadline.
+    cancel: std::sync::OnceLock<Arc<AtomicBool>>,
+    /// The namespaces attached on this connection, by schema alias. An attachment outlives the
+    /// program that made it, so every later program takes a read lease on each of them too.
+    attached: Mutex<Vec<(String, Arc<FenceController>)>>,
+    /// The read leases the running program holds on attached namespaces.
+    attached_leases: Mutex<Vec<ReadLease>>,
 }
 
 impl FenceConnState {
@@ -565,7 +810,88 @@ impl FenceConnState {
             program_generation: AtomicU64::new(generation),
             txn_generation: AtomicU64::new(generation),
             denial: Mutex::new(None),
+            cancel: std::sync::OnceLock::new(),
+            attached: Mutex::new(Vec::new()),
+            attached_leases: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The flag that cancels the statement running on this connection. Set once, by the
+    /// connection that owns this state.
+    pub fn set_cancel_flag(&self, flag: Arc<AtomicBool>) {
+        let _ = self.cancel.set(flag);
+    }
+
+    /// The class this connection's reads are admitted as: a normal connection reads as
+    /// `NormalRead`; a capability connection reads under its capability.
+    pub fn read_class(&self) -> OperationClass {
+        match self.class {
+            OperationClass::NormalWrite => OperationClass::NormalRead,
+            class => class,
+        }
+    }
+
+    fn lease_canceller(&self) -> impl Fn() + Send + Sync + 'static {
+        let flag = self.cancel.get().cloned();
+        move || {
+            if let Some(flag) = &flag {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Admit a program for reading and hold its read leases until the returned guard is
+    /// dropped (section 9): one on this connection's namespace and one on each namespace
+    /// attached on the connection. `still_attached` lists the aliases attached on the
+    /// connection now (it is only asked when [`attach`](Self::attach) recorded one); `None`
+    /// keeps every recorded attachment.
+    pub fn begin_read_program(
+        self: &Arc<Self>,
+        still_attached: impl FnOnce() -> Option<Vec<String>>,
+    ) -> Result<ProgramReadLease, FenceError> {
+        let lease = self.controller.acquire_read_lease(
+            self.read_class(),
+            LeaseKind::Sql,
+            self.lease_canceller(),
+        )?;
+        let guard = ProgramReadLease {
+            conn: self.clone(),
+            lease,
+        };
+        let attached = {
+            let mut attached = self.attached.lock();
+            if !attached.is_empty() {
+                if let Some(live) = still_attached() {
+                    attached.retain(|(alias, _)| live.iter().any(|a| a == alias));
+                }
+            }
+            attached.clone()
+        };
+        for (_, controller) in attached {
+            let lease = controller.acquire_read_lease(
+                OperationClass::NormalRead,
+                LeaseKind::Sql,
+                self.lease_canceller(),
+            )?;
+            self.attached_leases.lock().push(lease);
+        }
+        Ok(guard)
+    }
+
+    /// The running program is attaching `controller`'s namespace as `alias`: admit it as a
+    /// normal read of that namespace, hold a lease on it for the rest of the program, and
+    /// remember the attachment for the connection's later programs.
+    pub fn attach(&self, alias: &str, controller: Arc<FenceController>) -> Result<(), FenceError> {
+        let lease = controller.acquire_read_lease(
+            OperationClass::NormalRead,
+            LeaseKind::Sql,
+            self.lease_canceller(),
+        )?;
+        self.attached_leases.lock().push(lease);
+        let mut attached = self.attached.lock();
+        attached.retain(|(a, _)| a != alias);
+        attached.push((alias.to_owned(), controller));
+        Ok(())
     }
 
     pub fn controller(&self) -> &Arc<FenceController> {
