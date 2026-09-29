@@ -728,7 +728,7 @@ pub(super) mod tests {
         }
     }
 
-    fn sample_receipt() -> CommandReceipt {
+    pub fn sample_receipt() -> CommandReceipt {
         CommandReceipt {
             namespace: NamespaceName::from("db1"),
             operation_id: Uuid::from_u128(1),
