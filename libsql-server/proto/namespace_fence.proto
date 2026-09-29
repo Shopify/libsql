@@ -75,7 +75,8 @@ message DrainPolicy {
 
 message FrozenBoundary {
     string log_id = 1;
-    uint64 frame_no = 2;
+    // Absent when the replication log has no frames.
+    optional uint64 frame_no = 2;
 }
 
 message LegacyBlocks {

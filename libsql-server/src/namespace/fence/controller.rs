@@ -17,9 +17,11 @@ use parking_lot::Mutex;
 use tokio::sync::{watch, OwnedMutexGuard};
 use uuid::Uuid;
 
+use crate::connection::connection_manager::{ConnectionManager, WeakConnectionManager};
 use crate::error::Error;
 use crate::namespace::meta_store::{FenceCommit, FenceContext, MetaStore};
 use crate::namespace::NamespaceName;
+use crate::replication::FrameNo;
 
 use super::command::FenceRequest;
 #[cfg(test)]
@@ -46,6 +48,10 @@ pub struct GateSnapshot {
     /// A command whose commit outcome is unknown. While set, every class except maintenance
     /// and observability is denied, and every other command is refused.
     pub indeterminate: Option<CommandKey>,
+    /// The in-memory `INSTALLING` gate of a closing transition that is being persisted
+    /// (section 8.3, step 2): write admission is closed on top of whatever `fence` allows.
+    /// Never persisted.
+    pub installing: Option<CommandKey>,
 }
 
 impl GateSnapshot {
@@ -54,6 +60,7 @@ impl GateSnapshot {
             fence,
             write_generation: 0,
             indeterminate: None,
+            installing: None,
         }
     }
 
@@ -90,7 +97,30 @@ impl GateSnapshot {
                 .with_detail(FenceDetail::IndeterminateCommit));
             }
         }
-        self.fence.permits(class)
+        self.fence.permits(class)?;
+        if let Some((operation_id, command_id)) = self.installing {
+            if matches!(
+                class,
+                OperationClass::NormalWrite
+                    | OperationClass::Vacuum
+                    | OperationClass::CapabilityImport
+                    | OperationClass::Lifecycle
+            ) {
+                return Err(FenceError::new(
+                    FenceOutcome::MigrationWriteFenced,
+                    format!(
+                        "{class:?} is not permitted: fence command {command_id} of operation \
+                         {operation_id} is closing write admission"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a closing transition is being installed.
+    pub fn is_installing(&self) -> bool {
+        self.installing.is_some()
     }
 
     /// Normal write admission.
@@ -114,6 +144,39 @@ impl GateSnapshot {
 /// once the manager is gone.
 pub type WriteQueueWaker = Box<dyn Fn() -> bool + Send + Sync>;
 
+/// The last frame committed to a namespace's replication log, `None` while it has none.
+pub type GetCurrentFrameNo = Arc<dyn Fn() -> Option<FrameNo> + Send + Sync + 'static>;
+
+/// What the write drain needs from one primary connection maker of the namespace: its
+/// connection manager (held weakly, so an evicted namespace's manager goes away with it) and
+/// its replication log.
+pub struct WriteDrainSource {
+    pub(crate) manager: WeakConnectionManager,
+    pub(crate) log_id: Uuid,
+    pub(crate) current_frame_no: GetCurrentFrameNo,
+}
+
+impl WriteDrainSource {
+    pub(crate) fn new(
+        manager: &ConnectionManager,
+        log_id: Uuid,
+        current_frame_no: GetCurrentFrameNo,
+    ) -> Self {
+        Self {
+            manager: manager.downgrade(),
+            log_id,
+            current_frame_no,
+        }
+    }
+}
+
+/// A [`WriteDrainSource`] whose manager is alive, held for the length of a drain.
+pub(crate) struct LiveWriteDrain {
+    pub(crate) manager: ConnectionManager,
+    pub(crate) log_id: Uuid,
+    pub(crate) current_frame_no: GetCurrentFrameNo,
+}
+
 /// The fence controller of one namespace.
 pub struct FenceController {
     namespace: NamespaceName,
@@ -121,6 +184,9 @@ pub struct FenceController {
     gate: watch::Sender<GateSnapshot>,
     /// The write queues of the namespace's connection managers (section 8.2).
     write_queues: Mutex<Vec<WriteQueueWaker>>,
+    /// What the write drain needs from each of the namespace's primary connection makers
+    /// (section 8.3).
+    write_drains: Mutex<Vec<WriteDrainSource>>,
     #[cfg(test)]
     hooks: FenceTestHooks,
 }
@@ -143,6 +209,7 @@ impl FenceController {
             transition_lock: Default::default(),
             gate,
             write_queues: Mutex::new(Vec::new()),
+            write_drains: Mutex::new(Vec::new()),
             #[cfg(test)]
             hooks: FenceTestHooks::default(),
         })
@@ -186,6 +253,32 @@ impl FenceController {
     /// Wakers whose manager is gone are dropped on the next change.
     pub fn register_write_queue(&self, waker: WriteQueueWaker) {
         self.write_queues.lock().push(waker);
+    }
+
+    /// Register what the write drain needs from a primary connection maker of this namespace:
+    /// its connection manager and its replication log. Sources whose manager is gone are
+    /// dropped the next time the drain looks.
+    pub fn register_write_drain(&self, source: WriteDrainSource) {
+        self.write_drains.lock().push(source);
+    }
+
+    /// The write-drain sources whose manager is still alive, oldest first. The drain holds them
+    /// (and so their managers) for as long as it runs.
+    pub(crate) fn live_write_drains(&self) -> Vec<LiveWriteDrain> {
+        let mut sources = self.write_drains.lock();
+        let mut live = Vec::with_capacity(sources.len());
+        sources.retain(|source| match source.manager.upgrade() {
+            Some(manager) => {
+                live.push(LiveWriteDrain {
+                    manager,
+                    log_id: source.log_id,
+                    current_frame_no: source.current_frame_no.clone(),
+                });
+                true
+            }
+            None => false,
+        });
+        live
     }
 
     /// Take the namespace's transition lock. Every fence command on the namespace runs while
@@ -236,17 +329,25 @@ impl FenceController {
     }
 
     /// Publish a new gate. `fence: None` keeps the published fence. The write generation moves
-    /// whenever the state, the owning operation or the indeterminate flag changes.
-    fn publish(&self, fence: Option<StoredFence>, indeterminate: Option<CommandKey>) {
+    /// whenever the state, the owning operation, the indeterminate flag or the installing gate
+    /// changes.
+    fn publish(
+        &self,
+        fence: Option<StoredFence>,
+        indeterminate: Option<CommandKey>,
+        installing: Option<CommandKey>,
+    ) {
         let mut generation_changed = false;
         self.gate.send_modify(|gate| {
             let fence = fence.unwrap_or_else(|| gate.fence.clone());
             let changed = fence.state() != gate.fence.state()
                 || fence.record().map(|r| r.operation_id)
                     != gate.fence.record().map(|r| r.operation_id)
-                || indeterminate != gate.indeterminate;
+                || indeterminate != gate.indeterminate
+                || installing != gate.installing;
             gate.fence = fence;
             gate.indeterminate = indeterminate;
+            gate.installing = installing;
             if changed {
                 gate.write_generation += 1;
                 generation_changed = true;
@@ -260,6 +361,7 @@ impl FenceController {
                 revision = gate.revision(),
                 write_generation = gate.write_generation,
                 indeterminate = gate.indeterminate.is_some(),
+                installing = gate.installing.is_some(),
                 "published namespace fence gate"
             );
         }
@@ -280,6 +382,28 @@ pub struct Transition {
 impl Transition {
     pub fn controller(&self) -> &Arc<FenceController> {
         &self.controller
+    }
+
+    /// Publish the in-memory `INSTALLING` gate for the closing command `key` (section 8.3,
+    /// step 2): write admission closes and the write generation moves, which wakes the write
+    /// queues. It is replaced by whatever the command's commit publishes, or removed with
+    /// [`remove_installing`](Self::remove_installing) when the command is proven not to have
+    /// committed.
+    pub fn install_closing_gate(&mut self, key: CommandKey) {
+        let indeterminate = self.controller.gate.borrow().indeterminate;
+        self.controller.publish(None, indeterminate, Some(key));
+    }
+
+    /// Remove the `INSTALLING` gate of a command that was proven not to have committed. The
+    /// write generation moves again, so nothing admitted before it closed can write.
+    pub fn remove_installing(&mut self) {
+        let (indeterminate, installing) = {
+            let gate = self.controller.gate.borrow();
+            (gate.indeterminate, gate.installing)
+        };
+        if installing.is_some() {
+            self.controller.publish(None, indeterminate, None);
+        }
     }
 
     /// Commit `request` in the metastore and publish the result.
@@ -353,7 +477,7 @@ impl Transition {
         match result {
             Ok(commit) => {
                 let _ = controller.hook(HookPoint::BeforeGatePublish).await;
-                controller.publish(commit.record.clone().map(StoredFence::Record), None);
+                controller.publish(commit.record.clone().map(StoredFence::Record), None, None);
                 let _ = controller.hook(HookPoint::BeforeResponse).await;
                 Ok(commit)
             }
@@ -365,7 +489,7 @@ impl Transition {
                     "fence commit outcome unknown; the namespace stays closed until the command \
                      is replayed: {e}"
                 );
-                controller.publish(None, Some(key));
+                controller.publish(None, Some(key), None);
                 Err(e.into())
             }
         }
@@ -627,7 +751,7 @@ pub(crate) mod tests {
                 DrainCompletion::SourceWrites {
                     boundary: FrozenBoundary {
                         log_id: LOG,
-                        frame_no: 0,
+                        frame_no: Some(0),
                     },
                 },
                 ctx(),
@@ -867,7 +991,7 @@ pub(crate) mod tests {
 
         // Simulate an indeterminate outcome for a command that never reached the metastore:
         // the replay applies it.
-        controller.publish(None, Some((OP, Uuid::from_u128(1))));
+        controller.publish(None, Some((OP, Uuid::from_u128(1))), None);
         assert!(controller.permits(OperationClass::NormalWrite).is_err());
         let r = controller
             .apply_command(&meta, acquire("ns", OP, 1), ctx())
@@ -1001,8 +1125,8 @@ pub(crate) mod tests {
     #[test]
     fn conn_state_starts_at_the_current_generation() {
         let controller = FenceController::unfenced("ns".into());
-        controller.publish(None, Some((OP, OP)));
-        controller.publish(None, None);
+        controller.publish(None, Some((OP, OP)), None);
+        controller.publish(None, None, None);
         let state = FenceConnState::new(controller.clone(), OperationClass::NormalWrite);
         assert_eq!(state.program_generation(), 2);
         assert_eq!(state.txn_generation(), 2);

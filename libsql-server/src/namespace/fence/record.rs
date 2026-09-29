@@ -32,7 +32,8 @@ pub struct NamespaceIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrozenBoundary {
     pub log_id: Uuid,
-    pub frame_no: u64,
+    /// The last frame committed to the replication log, or `None` when the log has no frames.
+    pub frame_no: Option<u64>,
 }
 
 /// The pre-fence values of the legacy `block_*` configuration fields, restored when the
@@ -700,7 +701,7 @@ pub(super) mod tests {
             drain_started_at_ms: Some(100),
             frozen_boundary: Some(FrozenBoundary {
                 log_id: Uuid::from_u128(10),
-                frame_no: 1234,
+                frame_no: Some(1234),
             }),
             validation: None,
             legacy_blocks: LegacyBlocks {

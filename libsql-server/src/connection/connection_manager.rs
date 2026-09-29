@@ -75,17 +75,41 @@ impl ConnectionManager {
 
     /// The connection holding the write slot, and the class it holds it for. A slot that has
     /// been handed to a queued connection that has not taken it yet counts as held.
-    // Used by the positive source write drain (section 8.3).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn active_writer(&self) -> Option<(ConnId, OperationClass)> {
         self.inner.current.lock().map(|slot| (slot.id, slot.class))
+    }
+
+    /// Whether a connection holds the write slot for a write transaction: any holder but a
+    /// checkpoint (`Maintenance`), which cannot change logical contents.
+    pub(crate) fn has_writer(&self) -> bool {
+        self.active_writer()
+            .is_some_and(|(_, class)| class != OperationClass::Maintenance)
+    }
+
+    /// Run `f` under the write-slot lock if no connection holds the slot for a write
+    /// transaction (a checkpoint may). While `f` runs no write transaction can start or end on
+    /// this manager, so, once the fence has closed write admission, anything `f` reads about the
+    /// committed log is final (`docs/NAMESPACE_FENCE.md` section 8.3, step 6). Returns the
+    /// holder otherwise.
+    pub(crate) fn with_no_writer<R>(
+        &self,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, (ConnId, OperationClass)> {
+        let current = self.inner.current.lock();
+        match *current {
+            Some(slot) if slot.class != OperationClass::Maintenance => Err((slot.id, slot.class)),
+            _ => Ok(f()),
+        }
+    }
+
+    /// A handle that does not keep the manager alive.
+    pub(crate) fn downgrade(&self) -> WeakConnectionManager {
+        WeakConnectionManager(Arc::downgrade(&self.inner))
     }
 
     /// Notified (with `notify_waiters`) every time the write slot is released or handed on. A
     /// waiter registers interest (`Notified::enable`) before it checks
     /// [`active_writer`](Self::active_writer), so a release in between is not missed.
-    // Used by the positive source write drain (section 8.3).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn released(&self) -> &tokio::sync::Notify {
         &self.inner.released
     }
@@ -94,8 +118,6 @@ impl ConnectionManager {
     /// handle it registered. Returns the connection that was asked to roll back, if any. The
     /// slot is released by the rollback itself (`end_read_txn`/`end_write_txn`), which notifies
     /// [`released`](Self::released); a connection closing at the same time is tolerated.
-    // Used by the positive source write drain (section 8.3).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn abort_active(&self) -> Option<ConnId> {
         let id = self.active_writer()?.0;
         let handle = self.inner.abort_handle.lock().get(&id).cloned();
@@ -132,6 +154,16 @@ impl ConnectionManager {
     #[cfg(test)]
     pub(crate) fn queued_writers(&self) -> usize {
         self.inner.write_queue.len()
+    }
+}
+
+/// A [`ConnectionManager`] that is not kept alive by this handle.
+#[derive(Clone)]
+pub(crate) struct WeakConnectionManager(std::sync::Weak<ConnectionManagerInner>);
+
+impl WeakConnectionManager {
+    pub(crate) fn upgrade(&self) -> Option<ConnectionManager> {
+        self.0.upgrade().map(|inner| ConnectionManager { inner })
     }
 }
 

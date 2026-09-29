@@ -903,7 +903,7 @@ mod tests {
             let boundary = DrainCompletion::SourceWrites {
                 boundary: FrozenBoundary {
                     log_id: LOG,
-                    frame_no: 42,
+                    frame_no: Some(42),
                 },
             };
             let mut h = if state.role() == Some(Role::Target) || state == S::Absent {
@@ -1083,14 +1083,14 @@ mod tests {
         h.complete(DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 7,
+                frame_no: Some(7),
             },
         });
         assert_eq!(h.state(), S::SourceWriteFenced);
         assert_eq!(h.revision(), 2);
         assert_eq!(
             h.record.as_ref().unwrap().frozen_boundary.unwrap().frame_no,
-            7
+            Some(7)
         );
         let acquire_receipt = h
             .receipts
@@ -1255,7 +1255,7 @@ mod tests {
         h.complete(DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 1,
+                frame_no: Some(1),
             },
         });
         h.run(OP, CommandKind::SetSourceReadFence).unwrap();
@@ -1464,7 +1464,7 @@ mod tests {
             DrainCompletion::SourceWrites {
                 boundary: FrozenBoundary {
                     log_id: LOG,
-                    frame_no: 3,
+                    frame_no: Some(3),
                 },
             },
             &env(),
@@ -1492,7 +1492,7 @@ mod tests {
             DrainCompletion::SourceWrites {
                 boundary: FrozenBoundary {
                     log_id: Uuid::from_u128(0x77),
-                    frame_no: 1,
+                    frame_no: Some(1),
                 },
             },
             &env(),
@@ -1506,7 +1506,7 @@ mod tests {
         let boundary = DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 1,
+                frame_no: Some(1),
             },
         };
         assert!(complete_drain(&record, &final_receipt, boundary, &env()).is_err());
@@ -1732,7 +1732,7 @@ mod tests {
         h.complete(DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 5,
+                frame_no: Some(5),
             },
         });
         assert_eq!(h.state(), S::SourceWriteFenced);

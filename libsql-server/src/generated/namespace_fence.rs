@@ -12,8 +12,9 @@ pub struct DrainPolicy {
 pub struct FrozenBoundary {
     #[prost(string, tag = "1")]
     pub log_id: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub frame_no: u64,
+    /// Absent when the replication log has no frames.
+    #[prost(uint64, optional, tag = "2")]
+    pub frame_no: ::core::option::Option<u64>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
