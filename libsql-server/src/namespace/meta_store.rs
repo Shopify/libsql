@@ -91,6 +91,12 @@ struct MetaStoreInner {
     /// `<base_path>/dbs`, where namespace directories and their fence markers are.
     dbs_path: PathBuf,
     fence: FenceSettings,
+    /// Namespaces whose state could not be recovered at startup and that are therefore
+    /// `UNKNOWN_UNAVAILABLE` (`docs/NAMESPACE_FENCE.md` section 13.3): an undecodable config
+    /// row, a fence that cannot be established, or a marker the metastore has no trustworthy
+    /// record for. They are refused by lookups and by every config or lifecycle change, and
+    /// never default-created. A fence command that commits for the name takes it out.
+    recovered: Mutex<HashMap<NamespaceName, StoredFence>>,
 }
 
 /// How this metastore treats namespace fences (`docs/NAMESPACE_FENCE.md` section 13.1).
@@ -100,6 +106,9 @@ struct FenceSettings {
     enabled: bool,
     /// The fence tables exist, so fence state is loaded and enforced.
     tables: bool,
+    /// Recovery fails closed (section 13.3): the flag is on, the fence tables exist, or a
+    /// namespace directory holds a marker.
+    fail_closed: bool,
     receipt_retention: Duration,
 }
 
@@ -216,9 +225,13 @@ impl MetaStoreInner {
         if config.namespace_fence {
             fence_store::create_tables(&conn)?;
         }
+        let tables = fence_store::tables_exist(&conn)?;
+        let dbs_path = base_path.join("dbs");
+        let marked = marked_namespaces(&dbs_path)?;
         let fence = FenceSettings {
             enabled: config.namespace_fence,
-            tables: fence_store::tables_exist(&conn)?,
+            tables,
+            fail_closed: config.namespace_fence || tables || !marked.is_empty(),
             receipt_retention: config
                 .namespace_fence_receipt_retention
                 .unwrap_or(fence_store::DEFAULT_RECEIPT_RETENTION),
@@ -229,8 +242,9 @@ impl MetaStoreInner {
             conn: conn.into(),
             wal_manager,
             db_kind,
-            dbs_path: base_path.join("dbs"),
+            dbs_path,
             fence,
+            recovered: Default::default(),
         };
 
         if config.allow_recover_from_fs {
@@ -241,8 +255,70 @@ impl MetaStoreInner {
         if this.fence.tables {
             this.restore_fences()?;
         }
+        this.register_marked(&marked)?;
 
         Ok(this)
+    }
+
+    /// Register every namespace directory with a marker that the metastore has no trustworthy
+    /// fence record for as `UNKNOWN_UNAVAILABLE` (section 13.3): a metastore that was rebuilt
+    /// (`destroy_on_error`), recovered from the filesystem, restored from an older backup, or
+    /// that lost its fence tables, and a target whose creation was interrupted.
+    fn register_marked(&mut self, marked: &[NamespaceName]) -> Result<()> {
+        for ns in marked {
+            if self.recovered.get_mut().contains_key(ns) {
+                continue;
+            }
+            let known = self.configs.get_mut().contains_key(ns);
+            if self.fence.tables {
+                if known {
+                    // `restore_fences` compared the marker with the record.
+                    continue;
+                }
+                let stored = match fence_store::read_fence(self.conn.get_mut(), &self.dbs_path, ns)
+                {
+                    Ok((stored, _)) => stored,
+                    Err(FenceStoreError::Sqlite(e)) => return Err(e.into()),
+                    Err(e) => StoredFence::Unavailable {
+                        detail: FenceDetail::CorruptRecord,
+                        reason: format!("the fence marker cannot be read: {e}"),
+                        marker: None,
+                    },
+                };
+                let (detail, reason, marker) = match stored {
+                    StoredFence::Unavailable {
+                        detail,
+                        reason,
+                        marker,
+                    } => (detail, reason, marker),
+                    other => (
+                        FenceDetail::CorruptRecord,
+                        format!(
+                            "the namespace has fence state {} but no usable config row",
+                            other.state()
+                        ),
+                        other.record().cloned(),
+                    ),
+                };
+                mark_unavailable(self.recovered.get_mut(), ns.clone(), detail, reason, marker);
+            } else {
+                let (detail, marker) = match fence_store::read_marker(&self.dbs_path, ns)? {
+                    None => continue,
+                    Some(Ok(m)) => (FenceDetail::MetastoreBehindMarker, Some(m.record)),
+                    Some(Err(_)) => (FenceDetail::CorruptRecord, None),
+                };
+                let reason = "the namespace directory holds a fence marker but the metastore has \
+                    no fence tables (it was rebuilt, recovered or restored without them)"
+                    .to_string();
+                mark_unavailable(self.recovered.get_mut(), ns.clone(), detail, reason, marker);
+            }
+        }
+        Ok(())
+    }
+
+    /// The fence error for a namespace registered as unavailable at startup.
+    fn recovery_denial(&self, namespace: &NamespaceName) -> Option<FenceError> {
+        self.recovered.lock().get(namespace).map(unavailable_error)
     }
 
     fn maybe_recover_from_fs(&mut self, base_path: &Path) -> Result<()> {
@@ -267,6 +343,16 @@ impl MetaStoreInner {
                 let config_path = entry.path().join("config.json");
                 let name =
                     NamespaceName::from_string(entry.file_name().to_str().unwrap().to_string())?;
+                if entry
+                    .path()
+                    .join(fence_store::MARKER_FILE_NAME)
+                    .try_exists()?
+                {
+                    // A fenced namespace is never recovered with a guessed config; it is
+                    // registered as unavailable below (section 13.3).
+                    tracing::warn!("not recovering fenced namespace `{name}` from the filesystem");
+                    continue;
+                }
                 let config = if config_path.try_exists()? {
                     let config_bytes = std::fs::read(&config_path)?;
                     serde_json::from_slice(&config_bytes)?
@@ -291,10 +377,10 @@ impl MetaStoreInner {
     fn restore(&mut self) -> Result<()> {
         tracing::info!("restoring meta store");
 
-        let mut stmt = self
-            .conn
-            .get_mut()
-            .prepare("SELECT namespace, config FROM namespace_configs")?;
+        let fence = self.fence;
+        let conn: &rusqlite::Connection = self.conn.get_mut();
+        let mut unavailable = Vec::new();
+        let mut stmt = conn.prepare("SELECT namespace, config FROM namespace_configs")?;
 
         let rows = stmt.query(())?.mapped(|r| {
             let ns = r.get::<_, String>(0)?;
@@ -306,9 +392,19 @@ impl MetaStoreInner {
         for row in rows {
             match row {
                 Ok((k, v)) => {
-                    let ns = match NamespaceName::from_string(k) {
+                    let ns = match NamespaceName::from_string(k.clone()) {
                         Ok(ns) => ns,
                         Err(e) => {
+                            // A name nothing can address cannot be served or default-created,
+                            // so a legacy row is skipped as before. A fenced one is an operator
+                            // problem: its fence could not be enforced or inspected.
+                            if fence.tables && fence_store::stored_revision_raw(conn, &k)?.is_some()
+                            {
+                                return Err(Error::Internal(format!(
+                                    "the metastore holds a namespace fence for `{k}`, which is not \
+                                     a valid namespace name; refusing to start"
+                                )));
+                            }
                             tracing::warn!("unable to convert namespace name: {}", e);
                             continue;
                         }
@@ -316,6 +412,11 @@ impl MetaStoreInner {
 
                     let config = match metadata::DatabaseConfig::decode(&v[..]) {
                         Ok(c) => Arc::new(DatabaseConfig::from(&c)),
+                        Err(e) if fence.fail_closed => {
+                            unavailable
+                                .push((ns, format!("the config row cannot be decoded: {e}")));
+                            continue;
+                        }
                         Err(e) => {
                             tracing::warn!("unable to convert config: {}", e);
                             continue;
@@ -338,6 +439,17 @@ impl MetaStoreInner {
             }
         }
 
+        drop(stmt);
+        for (ns, reason) in unavailable {
+            mark_unavailable(
+                self.recovered.get_mut(),
+                ns,
+                FenceDetail::CorruptRecord,
+                reason,
+                None,
+            );
+        }
+
         tracing::info!("meta store restore completed");
 
         Ok(())
@@ -358,7 +470,14 @@ impl MetaStoreInner {
                 Ok(r) => r,
                 Err(FenceStoreError::Sqlite(e)) => return Err(e.into()),
                 Err(e) => {
-                    tracing::error!(namespace = %ns, "cannot establish namespace fence: {e}");
+                    fenced += 1;
+                    mark_unavailable(
+                        self.recovered.get_mut(),
+                        ns,
+                        FenceDetail::CorruptRecord,
+                        format!("the namespace fence cannot be established: {e}"),
+                        None,
+                    );
                     continue;
                 }
             };
@@ -376,12 +495,18 @@ impl MetaStoreInner {
                     let config = fence_store::with_legacy_blocks(&config, &record.legacy_blocks);
                     sender.send_modify(|c| c.config = Arc::new(config));
                 }
-                StoredFence::Unavailable { detail, reason, .. } => {
+                StoredFence::Unavailable {
+                    detail,
+                    reason,
+                    marker,
+                } => {
                     fenced += 1;
-                    tracing::error!(
-                        namespace = %ns,
-                        %detail,
-                        "namespace fence state is UNKNOWN_UNAVAILABLE: {reason}"
+                    mark_unavailable(
+                        self.recovered.get_mut(),
+                        ns,
+                        *detail,
+                        reason.clone(),
+                        marker.clone(),
                     );
                 }
             }
@@ -389,6 +514,109 @@ impl MetaStoreInner {
         tracing::info!("loaded {fenced} namespace fence(s)");
         Ok(())
     }
+}
+
+fn mark_unavailable(
+    recovered: &mut HashMap<NamespaceName, StoredFence>,
+    namespace: NamespaceName,
+    detail: FenceDetail,
+    reason: String,
+    marker: Option<NamespaceFenceRecord>,
+) {
+    tracing::error!(
+        namespace = %namespace,
+        %detail,
+        "namespace is UNKNOWN_UNAVAILABLE: {reason}"
+    );
+    recovered.insert(
+        namespace,
+        StoredFence::Unavailable {
+            detail,
+            reason,
+            marker,
+        },
+    );
+}
+
+/// The namespaces under `dbs_path` whose directory holds a fence marker. A marker in a
+/// directory that is not a valid namespace name stops startup: the fence it records could be
+/// neither enforced nor inspected.
+fn marked_namespaces(dbs_path: &Path) -> Result<Vec<NamespaceName>> {
+    fence_store::scan_markers(dbs_path)?
+        .into_iter()
+        .map(|m| {
+            m.map_err(|raw| {
+                Error::Internal(format!(
+                    "namespace directory `{raw}` holds a fence marker but is not a valid \
+                     namespace name; refusing to start"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// A namespace's fence as the metastore holds it now, for a metastore with the fence tables:
+/// the live record and marker, unless they read as established while startup could not
+/// recover the namespace (an undecodable config row, for instance), which stays unavailable.
+fn established_fence(
+    inner: &MetaStoreInner,
+    conn: &rusqlite::Connection,
+    namespace: &NamespaceName,
+) -> std::result::Result<StoredFence, FenceStoreError> {
+    let (live, _) = fence_store::read_fence(conn, &inner.dbs_path, namespace)?;
+    if matches!(live, StoredFence::Unavailable { .. }) {
+        return Ok(live);
+    }
+    Ok(inner
+        .recovered
+        .lock()
+        .get(namespace)
+        .cloned()
+        .unwrap_or(live))
+}
+
+/// The error returned for a namespace whose fence state is `UNKNOWN_UNAVAILABLE`.
+fn unavailable_error(stored: &StoredFence) -> FenceError {
+    stored
+        .permits(OperationClass::NormalRead)
+        .err()
+        .unwrap_or_else(|| {
+            FenceError::new(
+                FenceOutcome::FenceStateUnavailable,
+                "the namespace's fence state cannot be established",
+            )
+        })
+}
+
+/// Why a name that has no config must not be created: its directory holds a marker, so it is a
+/// target being created or a namespace the metastore lost (section 13.3).
+fn marker_denial(dbs_path: &Path, namespace: &NamespaceName) -> Result<Option<FenceError>> {
+    Ok(match fence_store::read_marker(dbs_path, namespace)? {
+        None => None,
+        Some(Ok(m)) => {
+            let revision = m.record.revision;
+            Some(
+                StoredFence::Record(m.record)
+                    .permits(OperationClass::Lifecycle)
+                    .err()
+                    .unwrap_or_else(|| {
+                        unavailable_error(&StoredFence::Unavailable {
+                            detail: FenceDetail::MetastoreBehindMarker,
+                            reason: format!(
+                                "the namespace directory holds a fence marker (revision \
+                                 {revision}) but the metastore has no config for it"
+                            ),
+                            marker: None,
+                        })
+                    }),
+            )
+        }
+        Some(Err(e)) => Some(unavailable_error(&StoredFence::Unavailable {
+            detail: FenceDetail::CorruptRecord,
+            reason: format!("the fence marker cannot be decoded: {e}"),
+            marker: None,
+        })),
+    })
 }
 
 /// Handles config change updates by inserting them into the database and in-memory
@@ -442,6 +670,9 @@ fn try_process(
     namespace: &NamespaceName,
     config: &DatabaseConfig,
 ) -> Result<()> {
+    if let Some(e) = inner.recovery_denial(namespace) {
+        return Err(e.into());
+    }
     let mut conn = inner.conn.blocking_lock();
     // `BEGIN IMMEDIATE`: the write lock is what serialises this write with fence transitions
     // (docs/NAMESPACE_FENCE.md section 5.4), including those of other metastore connections.
@@ -688,6 +919,9 @@ fn apply_fence_command(
         .map_or(request.operation_id, |r| r.operation_id);
     fence_store::prune_receipts(&tx, ns, owner, ctx.now_ms, inner.fence.receipt_retention)?;
     tx.commit()?;
+    // The command established the fence from the durable state; whatever startup could not
+    // recover about this name is settled.
+    inner.recovered.lock().remove(ns);
 
     let current = record.or_else(|| stored.record().cloned());
     after_fence_commit(
@@ -796,6 +1030,7 @@ fn complete_fence_drain(
     fence_store::write_record(&tx, &next, fence_store::stored_revision(&tx, ns)?)?;
     fence_store::write_receipt(&tx, &final_receipt)?;
     tx.commit()?;
+    inner.recovered.lock().remove(ns);
 
     after_fence_commit(inner, &conn, Some(&next), true);
 
@@ -834,12 +1069,36 @@ impl MetaStore {
                 if destroy_on_error {
                     let db_path = base_path.join("metastore");
 
-                    tracing::info!(
-                        "meta store set to destroy on restore error, removing metastore db path folder ({:?})", db_path
-                    );
+                    // With fences in use the broken metastore may hold the only record of a
+                    // fence, so it is kept aside for the operator rather than deleted, and the
+                    // rebuilt metastore registers every marked namespace as unavailable
+                    // (section 13.3).
+                    let keep = config.namespace_fence
+                        || marked_namespaces(&base_path.join("dbs"))
+                            .map_or(true, |marked| !marked.is_empty());
+                    if keep {
+                        let millis = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis());
+                        let aside = base_path.join(format!("metastore.broken-{millis}"));
+                        tracing::error!(
+                            "meta store failed to restore ({e}); moving it aside to {aside:?} \
+                             and rebuilding it"
+                        );
+                        if let Err(rename) = std::fs::rename(&db_path, &aside) {
+                            tracing::error!(
+                                "failed to move the metastore aside ({rename}); not destroying it"
+                            );
+                            return Err(e);
+                        }
+                    } else {
+                        tracing::info!(
+                            "meta store set to destroy on restore error, removing metastore db path folder ({:?})", db_path
+                        );
 
-                    if let Err(e) = std::fs::remove_dir_all(&db_path) {
-                        tracing::error!("failed to remove base path({:?}): {}", &db_path, e);
+                        if let Err(e) = std::fs::remove_dir_all(&db_path) {
+                            tracing::error!("failed to remove base path({:?}): {}", &db_path, e);
+                        }
                     }
 
                     if let Err(e) = std::fs::create_dir_all(&db_path) {
@@ -900,11 +1159,38 @@ impl MetaStore {
         Ok(Self { changes_tx, inner })
     }
 
-    pub async fn handle(&self, namespace: NamespaceName) -> MetaStoreHandle {
+    /// The handle of an existing namespace, without creating one (section 13.3). `Ok(None)`
+    /// when the namespace does not exist; a fence error when its state could not be recovered.
+    /// Every path that only reads or serves a namespace uses this.
+    pub async fn lookup(&self, namespace: &NamespaceName) -> Result<Option<MetaStoreHandle>> {
+        if let Some(e) = self.inner.recovery_denial(namespace) {
+            return Err(e.into());
+        }
+        let configs = self.inner.configs.lock().await;
+        Ok(configs.get(namespace).map(|sender| MetaStoreHandle {
+            namespace: namespace.clone(),
+            inner: HandleState::External(self.changes_tx.clone(), sender.subscribe()),
+        }))
+    }
+
+    /// The handle of `namespace`, creating an empty in-memory entry when it does not exist.
+    /// Only paths that create a namespace (create, fork destination, reset, lazy creation) use
+    /// this. It refuses a namespace whose state could not be recovered, and a name without a
+    /// config whose directory holds a fence marker (a target being created, or a namespace the
+    /// metastore lost): creating either would publish a default config where a fence belongs.
+    pub async fn handle(&self, namespace: NamespaceName) -> Result<MetaStoreHandle> {
         tracing::debug!("getting meta store handle");
+        if let Some(e) = self.inner.recovery_denial(&namespace) {
+            return Err(e.into());
+        }
         let change_tx = self.changes_tx.clone();
 
         let mut configs = self.inner.configs.lock().await;
+        if !configs.contains_key(&namespace) {
+            if let Some(e) = marker_denial(&self.inner.dbs_path, &namespace)? {
+                return Err(e.into());
+            }
+        }
         let sender = configs.entry(namespace.clone()).or_insert_with(|| {
             // TODO(lucio): if no entry exists we need to ensure we send the update to
             // the bg channel.
@@ -916,14 +1202,17 @@ impl MetaStore {
 
         tracing::debug!("meta handle subscribed");
 
-        MetaStoreHandle {
+        Ok(MetaStoreHandle {
             namespace,
             inner: HandleState::External(change_tx, rx),
-        }
+        })
     }
 
     pub fn remove(&self, namespace: NamespaceName) -> Result<Option<Arc<DatabaseConfig>>> {
         tracing::debug!("removing namespace `{}` from meta store", namespace);
+        if let Some(e) = self.inner.recovery_denial(&namespace) {
+            return Err(e.into());
+        }
 
         // "configs" lock can be used in both async and sync contexts while "conn" lock always used
         // in blocking context
@@ -1055,17 +1344,24 @@ impl MetaStore {
         tokio::task::spawn_blocking(move || -> std::result::Result<_, FenceStoreError> {
             let mut conn = inner.conn.blocking_lock();
             if !inner.fence.tables {
-                let tx = conn.transaction()?;
-                let exists = fence_store::read_config_row(&tx, &namespace)?.is_some();
+                let recovered = inner.recovered.lock().get(&namespace).cloned();
+                let fence = match recovered {
+                    Some(fence) => fence,
+                    None => {
+                        let tx = conn.transaction()?;
+                        StoredFence::None {
+                            namespace_exists: fence_store::read_config_row(&tx, &namespace)?
+                                .is_some(),
+                        }
+                    }
+                };
                 return Ok(FenceInspection {
-                    fence: StoredFence::None {
-                        namespace_exists: exists,
-                    },
+                    fence,
                     receipts: Vec::new(),
                 });
             }
             let tx = conn.transaction()?;
-            let (fence, _) = fence_store::read_fence(&tx, &inner.dbs_path, &namespace)?;
+            let fence = established_fence(&inner, &tx, &namespace)?;
             let receipts = fence_store::read_receipts(&tx, &namespace)?;
             Ok(FenceInspection { fence, receipts })
         })
@@ -1078,22 +1374,33 @@ impl MetaStore {
     pub async fn load_fences(&self) -> Result<Vec<(NamespaceName, StoredFence)>> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> std::result::Result<_, FenceStoreError> {
+            let recovered: Vec<(NamespaceName, StoredFence)> = inner
+                .recovered
+                .lock()
+                .iter()
+                .map(|(ns, fence)| (ns.clone(), fence.clone()))
+                .collect();
             if !inner.fence.tables {
-                return Ok(Vec::new());
+                return Ok(recovered);
             }
             let mut conn = inner.conn.blocking_lock();
             let tx = conn.transaction()?;
-            let names: Vec<String> = {
+            let mut names: Vec<NamespaceName> = {
                 let mut stmt = tx.prepare("SELECT namespace FROM namespace_configs")?;
                 let rows = stmt.query_map((), |r| r.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<_>>()?
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    .into_iter()
+                    .filter_map(|name| NamespaceName::from_string(name).ok())
+                    .collect()
             };
+            for (ns, _) in recovered {
+                if !names.contains(&ns) {
+                    names.push(ns);
+                }
+            }
             let mut out = Vec::new();
-            for name in names {
-                let Ok(ns) = NamespaceName::from_string(name) else {
-                    continue;
-                };
-                let (fence, _) = fence_store::read_fence(&tx, &inner.dbs_path, &ns)?;
+            for ns in names {
+                let fence = established_fence(&inner, &tx, &ns)?;
                 if !matches!(fence, StoredFence::None { .. }) {
                     out.push((ns, fence));
                 }
@@ -1382,7 +1689,7 @@ mod fence_tests {
     }
 
     async fn create_namespace(store: &MetaStore, ns: &'static str) -> MetaStoreHandle {
-        let handle = store.handle(ns.into()).await;
+        let handle = store.handle(ns.into()).await.unwrap();
         handle
             .store(DatabaseConfig {
                 max_db_pages: 1234,
@@ -1485,7 +1792,7 @@ mod fence_tests {
         );
 
         // The in-memory config is the namespace's own, not the mirror.
-        let handle = store.handle("db".into()).await;
+        let handle = store.handle("db".into()).await.unwrap();
         let config = handle.get();
         assert!(!config.block_writes && !config.block_reads);
         assert_eq!(config.block_reason.as_deref(), Some("pre-fence"));
@@ -1547,7 +1854,7 @@ mod fence_tests {
                 .await,
         );
         assert_eq!(e.detail(), Some(FenceDetail::FenceDisabled));
-        let handle = store.handle("db".into()).await;
+        let handle = store.handle("db".into()).await.unwrap();
         let e = fence_error(handle.store(DatabaseConfig::default()).await);
         assert_eq!(e.outcome(), FenceOutcome::MigrationWriteFenced);
         assert_eq!(
@@ -1760,9 +2067,29 @@ mod fence_tests {
                 ..
             }
         ));
-        // The config keeps the stored mirror, so statement-level checks stay closed too.
-        let handle = store.handle("db".into()).await;
-        assert!(handle.get().block_writes);
+        // The namespace is not served and cannot be recreated. Its in-memory config keeps the
+        // stored mirror, so statement-level checks would stay closed too.
+        assert_eq!(
+            fence_error(store.lookup(&"db".into()).await).detail(),
+            Some(FenceDetail::CorruptRecord)
+        );
+        assert_eq!(
+            fence_error(store.handle("db".into()).await).detail(),
+            Some(FenceDetail::CorruptRecord)
+        );
+        let config = store.inner.configs.lock().await[&NamespaceName::from("db")]
+            .borrow()
+            .config
+            .clone();
+        assert!(config.block_writes);
+        // A handle taken before the fence became unavailable cannot write the config either.
+        let handle = MetaStoreHandle {
+            namespace: "db".into(),
+            inner: HandleState::External(
+                store.changes_tx.clone(),
+                store.inner.configs.lock().await[&NamespaceName::from("db")].subscribe(),
+            ),
+        };
 
         let release = request(
             "db",
@@ -2072,5 +2399,398 @@ mod fence_tests {
             vec![Uuid::from_u128(0xc), Uuid::from_u128(0xc)]
         );
         assert_eq!(inspection.fence.revision(), 6);
+    }
+
+    /// Fail-closed metastore recovery (`docs/NAMESPACE_FENCE.md` section 13.3).
+    mod recovery {
+        use super::*;
+
+        fn unavailable_detail(r: Result<impl std::fmt::Debug>) -> FenceDetail {
+            let e = fence_error(r);
+            assert_eq!(e.outcome(), FenceOutcome::FenceStateUnavailable, "{e}");
+            e.detail().expect("unavailable carries a detail")
+        }
+
+        async fn open_err(dir: &Path, config: MetaStoreConfig) -> Error {
+            let (maker, manager) = metastore_connection_maker(None, dir).await.unwrap();
+            let conn = maker().unwrap();
+            match MetaStore::new(config, dir, conn, manager, DatabaseKind::Primary).await {
+                Ok(_) => panic!("the metastore opened"),
+                Err(e) => e,
+            }
+        }
+
+        fn recover_from_fs(fence: bool) -> MetaStoreConfig {
+            MetaStoreConfig {
+                allow_recover_from_fs: true,
+                namespace_fence: fence,
+                ..Default::default()
+            }
+        }
+
+        /// A fenced namespace `db` (SOURCE_DRAINING, revision 1, with its marker).
+        async fn fenced_db(dir: &Path) -> NamespaceFenceRecord {
+            let store = open(dir, true).await;
+            let _handle = create_namespace(&store, "db").await;
+            store
+                .apply_fence_command(acquire("db", OP, 1), ctx(1_000))
+                .await
+                .unwrap()
+                .record
+                .unwrap()
+        }
+
+        fn assert_marker_unavailable(fence: &StoredFence, record: &NamespaceFenceRecord) {
+            match fence {
+                StoredFence::Unavailable {
+                    detail: FenceDetail::MetastoreBehindMarker,
+                    marker: Some(m),
+                    ..
+                } => assert_eq!(m, record),
+                other => panic!("expected metastore_behind_marker, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn lookup_never_creates() {
+            let dir = tempdir().unwrap();
+            let store = open(dir.path(), true).await;
+            assert!(store.lookup(&"missing".into()).await.unwrap().is_none());
+            assert!(!store.exists(&"missing".into()).await);
+
+            let _handle = create_namespace(&store, "db").await;
+            let found = store.lookup(&"db".into()).await.unwrap().unwrap();
+            assert_eq!(found.get().max_db_pages, 1234);
+            // Only the creating path adds an entry.
+            let created = store.handle("new".into()).await.unwrap();
+            assert_eq!(
+                created.get().max_db_pages,
+                DatabaseConfig::default().max_db_pages
+            );
+            assert!(store.exists(&"new".into()).await);
+        }
+
+        #[tokio::test]
+        async fn fs_recovery_with_marker_unavailable() {
+            for fence in [true, false] {
+                let dir = tempdir().unwrap();
+                let record = fenced_db(dir.path()).await;
+                // A legacy namespace directory without a marker.
+                std::fs::create_dir_all(dir.path().join("dbs").join("legacy")).unwrap();
+                std::fs::remove_dir_all(dir.path().join("metastore")).unwrap();
+
+                let store = open_with(dir.path(), recover_from_fs(fence)).await;
+                // The legacy directory is recovered as before.
+                let legacy = store.lookup(&"legacy".into()).await.unwrap().unwrap();
+                assert_eq!(
+                    legacy.get().max_db_pages,
+                    DatabaseConfig::default().max_db_pages
+                );
+                // The fenced one is not recovered with a guessed config, and is unavailable.
+                assert_eq!(
+                    unavailable_detail(store.lookup(&"db".into()).await),
+                    FenceDetail::MetastoreBehindMarker,
+                    "fence flag {fence}"
+                );
+                assert_eq!(
+                    unavailable_detail(store.handle("db".into()).await),
+                    FenceDetail::MetastoreBehindMarker
+                );
+                assert_eq!(
+                    unavailable_detail(remove_blocking(&store, "db")),
+                    FenceDetail::MetastoreBehindMarker
+                );
+                let inspection = store.inspect_fence("db".into()).await.unwrap();
+                assert_marker_unavailable(&inspection.fence, &record);
+                let fences = store.load_fences().await.unwrap();
+                assert_eq!(fences.len(), 1);
+                assert_marker_unavailable(&fences[0].1, &record);
+                // Nothing was written for it, and the marker is untouched.
+                let conn = raw(dir.path()).await;
+                assert!(fence_store::read_config_row(&conn, &"db".into())
+                    .unwrap()
+                    .is_none());
+                let marker = fence_store::read_marker(&dir.path().join("dbs"), &"db".into())
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(marker.record, record);
+            }
+        }
+
+        #[tokio::test]
+        async fn destroy_on_error_keeps_fenced_unavailable() {
+            let dir = tempdir().unwrap();
+            let record = fenced_db(dir.path()).await;
+            {
+                // Break the metastore so that restoring it fails.
+                let conn = raw(dir.path()).await;
+                conn.execute(
+                    "ALTER TABLE namespace_configs RENAME COLUMN config TO broken",
+                    (),
+                )
+                .unwrap();
+            }
+            let store = open_with(
+                dir.path(),
+                MetaStoreConfig {
+                    destroy_on_error: true,
+                    namespace_fence: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            // The broken metastore is kept aside, not deleted.
+            let aside: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.starts_with("metastore.broken-"))
+                .collect();
+            assert_eq!(aside.len(), 1, "{aside:?}");
+            assert!(dir.path().join(&aside[0]).join("data").exists());
+            // The rebuilt metastore knows nothing of `db`, so its marker makes it unavailable.
+            assert_eq!(
+                unavailable_detail(store.lookup(&"db".into()).await),
+                FenceDetail::MetastoreBehindMarker
+            );
+            assert_eq!(
+                unavailable_detail(store.handle("db".into()).await),
+                FenceDetail::MetastoreBehindMarker
+            );
+            assert_marker_unavailable(
+                &store.inspect_fence("db".into()).await.unwrap().fence,
+                &record,
+            );
+        }
+
+        #[tokio::test]
+        async fn destroy_on_error_without_fences_is_unchanged() {
+            let dir = tempdir().unwrap();
+            {
+                let store = open(dir.path(), false).await;
+                let _handle = create_namespace(&store, "db").await;
+            }
+            {
+                let conn = raw(dir.path()).await;
+                conn.execute(
+                    "ALTER TABLE namespace_configs RENAME COLUMN config TO broken",
+                    (),
+                )
+                .unwrap();
+            }
+            let store = open_with(
+                dir.path(),
+                MetaStoreConfig {
+                    destroy_on_error: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(store.lookup(&"db".into()).await.unwrap().is_none());
+            assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("metastore.")));
+        }
+
+        #[tokio::test]
+        async fn undecodable_row_unavailable() {
+            let dir = tempdir().unwrap();
+            {
+                let store = open(dir.path(), true).await;
+                let _handle = create_namespace(&store, "good").await;
+            }
+            let conn = raw(dir.path()).await;
+            conn.execute(
+                "INSERT INTO namespace_configs VALUES ('bad', X'FFFFFFFF')",
+                (),
+            )
+            .unwrap();
+            let store = open(dir.path(), true).await;
+            assert!(store.lookup(&"good".into()).await.unwrap().is_some());
+            assert_eq!(
+                unavailable_detail(store.lookup(&"bad".into()).await),
+                FenceDetail::CorruptRecord
+            );
+            // Never replaced by a default config, nor deleted.
+            assert_eq!(
+                unavailable_detail(store.handle("bad".into()).await),
+                FenceDetail::CorruptRecord
+            );
+            assert_eq!(
+                unavailable_detail(remove_blocking(&store, "bad")),
+                FenceDetail::CorruptRecord
+            );
+            assert!(matches!(
+                store.inspect_fence("bad".into()).await.unwrap().fence,
+                StoredFence::Unavailable {
+                    detail: FenceDetail::CorruptRecord,
+                    ..
+                }
+            ));
+            let bytes: Vec<u8> = conn
+                .query_row(
+                    "SELECT config FROM namespace_configs WHERE namespace = 'bad'",
+                    (),
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(bytes, vec![0xff; 4]);
+        }
+
+        #[tokio::test]
+        async fn undecodable_row_without_fences_is_skipped_as_before() {
+            let dir = tempdir().unwrap();
+            drop(open(dir.path(), false).await);
+            let conn = raw(dir.path()).await;
+            conn.execute(
+                "INSERT INTO namespace_configs VALUES ('bad', X'FFFFFFFF')",
+                (),
+            )
+            .unwrap();
+            let store = open(dir.path(), false).await;
+            assert!(store.lookup(&"bad".into()).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn undecodable_name_with_fence_fails_startup() {
+            let dir = tempdir().unwrap();
+            drop(open(dir.path(), true).await);
+            let conn = raw(dir.path()).await;
+            let config = metadata::DatabaseConfig::from(&DatabaseConfig::default()).encode_to_vec();
+            conn.execute("INSERT INTO namespace_configs VALUES ('', ?1)", [&config])
+                .unwrap();
+            // Without a fence it is skipped, as before.
+            let store = open(dir.path(), true).await;
+            assert!(store.load_fences().await.unwrap().is_empty());
+            drop(store);
+            conn.execute("INSERT INTO namespace_fences VALUES ('', 1, 1, X'00')", ())
+                .unwrap();
+            let e = open_err(dir.path(), MetaStoreConfig::default()).await;
+            assert!(matches!(e, Error::Internal(_)), "{e}");
+        }
+
+        #[tokio::test]
+        async fn marker_in_invalid_directory_fails_startup() {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = tempdir().unwrap();
+            let bad = dir
+                .path()
+                .join("dbs")
+                .join(std::ffi::OsStr::from_bytes(b"\xff"));
+            std::fs::create_dir_all(&bad).unwrap();
+            std::fs::write(bad.join(fence_store::MARKER_FILE_NAME), b"x").unwrap();
+            let e = open_err(dir.path(), MetaStoreConfig::default()).await;
+            assert!(matches!(e, Error::Internal(_)), "{e}");
+        }
+
+        #[tokio::test]
+        async fn incomplete_target_unavailable() {
+            let dir = tempdir().unwrap();
+            let store = open(dir.path(), true).await;
+            let commit = store
+                .apply_fence_command(create_target("tgt", 3), ctx(1_000))
+                .await
+                .unwrap();
+            let record = commit.record.unwrap();
+            // Committed but not yet published: nothing can create a default namespace over it.
+            let e = fence_error(store.handle("tgt".into()).await);
+            assert_eq!(e.outcome(), FenceOutcome::MigrationTargetQuarantined);
+            assert!(store.lookup(&"tgt".into()).await.unwrap().is_none());
+            drop(store);
+
+            // A crash between the marker and the commit: the marker is all that is left.
+            let conn = raw(dir.path()).await;
+            for sql in [
+                "DELETE FROM namespace_fence_receipts WHERE namespace = 'tgt'",
+                "DELETE FROM namespace_fences WHERE namespace = 'tgt'",
+                "DELETE FROM namespace_configs WHERE namespace = 'tgt'",
+            ] {
+                conn.execute(sql, ()).unwrap();
+            }
+            let store = open(dir.path(), true).await;
+            assert_eq!(
+                unavailable_detail(store.lookup(&"tgt".into()).await),
+                FenceDetail::IncompleteTargetCreation
+            );
+            assert_eq!(
+                unavailable_detail(store.handle("tgt".into()).await),
+                FenceDetail::IncompleteTargetCreation
+            );
+            let fences = store.load_fences().await.unwrap();
+            assert!(matches!(
+                fences.as_slice(),
+                [(
+                    _,
+                    StoredFence::Unavailable {
+                        detail: FenceDetail::IncompleteTargetCreation,
+                        ..
+                    }
+                )]
+            ));
+            // The same command completes the creation, which settles the name.
+            let commit = store
+                .apply_fence_command(create_target("tgt", 3), ctx(2_000))
+                .await
+                .unwrap();
+            assert_eq!(commit.kind, FenceCommitKind::Committed);
+            assert_eq!(commit.record.as_ref().unwrap().identity, record.identity);
+            assert!(store.lookup(&"tgt".into()).await.unwrap().is_none());
+            let e = fence_error(store.handle("tgt".into()).await);
+            assert_eq!(e.outcome(), FenceOutcome::MigrationTargetQuarantined);
+            assert_eq!(
+                store.inspect_fence("tgt".into()).await.unwrap().fence,
+                StoredFence::Record(commit.record.unwrap())
+            );
+        }
+
+        #[tokio::test]
+        async fn metastore_rollback_detected_by_marker() {
+            let dir = tempdir().unwrap();
+            let conn = raw(dir.path()).await;
+            let record = {
+                let store = open(dir.path(), true).await;
+                let _handle = create_namespace(&store, "db").await;
+                let record = store
+                    .apply_fence_command(acquire("db", OP, 1), ctx(1_000))
+                    .await
+                    .unwrap()
+                    .record
+                    .unwrap();
+                drop(store);
+                // A metastore restored from a backup taken before the fence: the namespace is
+                // unfenced there, and only its marker remembers the fence.
+                conn.execute("DELETE FROM namespace_fence_receipts", ())
+                    .unwrap();
+                conn.execute("DELETE FROM namespace_fences", ()).unwrap();
+                record
+            };
+            let store = open(dir.path(), true).await;
+            assert_eq!(
+                unavailable_detail(store.lookup(&"db".into()).await),
+                FenceDetail::MetastoreBehindMarker
+            );
+            // Neither served, nor deleted, nor given a new config.
+            assert_eq!(
+                unavailable_detail(store.handle("db".into()).await),
+                FenceDetail::MetastoreBehindMarker
+            );
+            assert_eq!(
+                unavailable_detail(remove_blocking(&store, "db")),
+                FenceDetail::MetastoreBehindMarker
+            );
+            assert_marker_unavailable(
+                &store.inspect_fence("db".into()).await.unwrap().fence,
+                &record,
+            );
+            // A new operation cannot acquire over the lost fence either.
+            let e = fence_error(
+                store
+                    .apply_fence_command(acquire("db", OTHER_OP, 2), ctx(2_000))
+                    .await,
+            );
+            assert_eq!(e.detail(), Some(FenceDetail::MetastoreBehindMarker));
+        }
     }
 }
