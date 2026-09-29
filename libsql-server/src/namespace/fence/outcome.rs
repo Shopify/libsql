@@ -201,6 +201,8 @@ pub enum FenceDetail {
     IncompleteTargetCreation,
     MetastoreBehindMarker,
     IndeterminateCommit,
+    // MIGRATION_WRITE_FENCED
+    StaleTransaction,
 }
 
 impl FenceDetail {
@@ -223,6 +225,7 @@ impl FenceDetail {
             FenceDetail::IncompleteTargetCreation => "incomplete_target_creation",
             FenceDetail::MetastoreBehindMarker => "metastore_behind_marker",
             FenceDetail::IndeterminateCommit => "indeterminate_commit",
+            FenceDetail::StaleTransaction => "stale_transaction",
         }
     }
 }
