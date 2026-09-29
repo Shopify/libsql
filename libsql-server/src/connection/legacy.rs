@@ -108,8 +108,6 @@ where
     }
 
     /// The write-slot manager shared by every connection this maker opens.
-    // Used by the positive source write drain (section 8.3).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn connection_manager(&self) -> &ConnectionManager {
         &self.connection_manager
     }

@@ -31,7 +31,7 @@ use crate::{
     config::MetaStoreConfig, connection::legacy::open_conn_active_checkpoint, error::Error, Result,
 };
 
-use super::fence::command::{FenceCommand, FenceRequest};
+use super::fence::command::{DrainPolicy, FenceCommand, FenceRequest, OnDeadline};
 use super::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
 use super::fence::record::{
     CommandReceipt, NamespaceFenceRecord, ServerIdentity, ValidationSnapshot,
@@ -110,6 +110,8 @@ struct FenceSettings {
     /// namespace directory holds a marker.
     fail_closed: bool,
     receipt_retention: Duration,
+    /// The write drain deadline of an `AcquireSourceWriteFence` that names no drain policy.
+    default_write_drain: Duration,
 }
 
 fn setup_connection(conn: &rusqlite::Connection) -> Result<()> {
@@ -235,6 +237,9 @@ impl MetaStoreInner {
             receipt_retention: config
                 .namespace_fence_receipt_retention
                 .unwrap_or(fence_store::DEFAULT_RECEIPT_RETENTION),
+            default_write_drain: config
+                .namespace_fence_default_write_drain
+                .unwrap_or(crate::namespace::fence::drain::DEFAULT_WRITE_DRAIN),
         };
 
         let mut this = MetaStoreInner {
@@ -1300,6 +1305,16 @@ impl MetaStore {
         self.inner.fence.enabled
     }
 
+    /// The drain policy of an `AcquireSourceWriteFence` that names none: the configured
+    /// deadline, then `DRAINING`.
+    pub fn fence_default_write_drain(&self) -> DrainPolicy {
+        DrainPolicy {
+            deadline_ms: u64::try_from(self.inner.fence.default_write_drain.as_millis())
+                .unwrap_or(u64::MAX),
+            on_deadline: OnDeadline::Fail,
+        }
+    }
+
     /// Whether this metastore holds fence state, so fences are loaded and enforced.
     pub fn fence_enforced(&self) -> bool {
         self.inner.fence.tables
@@ -1749,7 +1764,7 @@ mod fence_tests {
 
         let boundary = FrozenBoundary {
             log_id: LOG,
-            frame_no: 42,
+            frame_no: Some(42),
         };
         let commit = store
             .complete_fence_drain(
@@ -2124,7 +2139,7 @@ mod fence_tests {
                     DrainCompletion::SourceWrites {
                         boundary: FrozenBoundary {
                             log_id: LOG,
-                            frame_no: 1,
+                            frame_no: Some(1),
                         },
                     },
                     ctx(2_000),
@@ -2175,7 +2190,7 @@ mod fence_tests {
                 DrainCompletion::SourceWrites {
                     boundary: FrozenBoundary {
                         log_id: LOG,
-                        frame_no: 7,
+                        frame_no: Some(7),
                     },
                 },
                 ctx(2_000),

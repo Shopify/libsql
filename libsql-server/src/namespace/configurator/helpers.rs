@@ -24,7 +24,7 @@ use crate::connection::{Connection as _, MakeConnection, MakeThrottledConnection
 use crate::database::{PrimaryConnection, PrimaryConnectionMaker};
 use crate::error::LoadDumpError;
 use crate::namespace::broadcasters::BroadcasterHandle;
-use crate::namespace::fence::controller::FenceController;
+use crate::namespace::fence::controller::{FenceController, WriteDrainSource};
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::replication_wal::{make_replication_wal_wrapper, ReplicationWalWrapper};
 use crate::namespace::{
@@ -160,26 +160,33 @@ pub(super) async fn make_primary_connection_maker(
         let rcv = logger.new_frame_notifier.subscribe();
         move || *rcv.borrow()
     });
+    let legacy_maker = MakeLegacyConnection::new(
+        db_path.to_path_buf(),
+        wal_wrapper.clone(),
+        stats.clone(),
+        broadcaster,
+        meta_store_handle.clone(),
+        base_config.extensions.clone(),
+        base_config.max_response_size,
+        base_config.max_total_response_size,
+        auto_checkpoint,
+        get_current_frame_no.clone(),
+        encryption_config,
+        block_writes,
+        resolve_attach_path,
+        make_wal_manager.clone(),
+        fence.clone(),
+    )
+    .await?;
+    // The positive write drain waits on this maker's write slot and reads the frozen boundary
+    // from its replication log (`docs/NAMESPACE_FENCE.md` section 8.3).
+    fence.register_write_drain(WriteDrainSource::new(
+        legacy_maker.connection_manager(),
+        logger.log_id(),
+        get_current_frame_no,
+    ));
     let connection_maker = Arc::new(
-        MakeLegacyConnection::new(
-            db_path.to_path_buf(),
-            wal_wrapper.clone(),
-            stats.clone(),
-            broadcaster,
-            meta_store_handle.clone(),
-            base_config.extensions.clone(),
-            base_config.max_response_size,
-            base_config.max_total_response_size,
-            auto_checkpoint,
-            get_current_frame_no,
-            encryption_config,
-            block_writes,
-            resolve_attach_path,
-            make_wal_manager.clone(),
-            fence,
-        )
-        .await?
-        .throttled(
+        legacy_maker.throttled(
             base_config.max_concurrent_connections.clone(),
             base_config
                 .connection_creation_timeout
