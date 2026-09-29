@@ -9,7 +9,8 @@
 //! ([`transition`]), the metastore tables, compare-and-swap and marker file that persist them
 //! ([`store`], driven by `MetaStore::apply_fence_command`), and the in-memory authority built
 //! on them: the per-namespace [`controller`] with its gate and read leases, the positive write
-//! [`drain`], the source [`read`] fence, the [`registry`] that holds the controllers outside the
+//! [`drain`], the source [`read`] fence and its
+//! [`stream`] leases for dump and replication, the [`registry`] that holds the controllers outside the
 //! namespace cache, and the test [`hooks`] on their paths.
 
 // The persistence, controller and protocol layers that consume these types land in the
@@ -27,6 +28,7 @@ pub mod record;
 pub mod registry;
 pub mod state;
 pub mod store;
+pub mod stream;
 pub mod transition;
 
 #[cfg(test)]

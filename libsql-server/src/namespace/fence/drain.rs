@@ -304,7 +304,7 @@ pub(crate) mod tests {
     use crate::namespace::fence::record::ServerIdentity;
     use crate::namespace::fence::state::FenceState;
     use crate::namespace::meta_store::FenceCommitKind;
-    use crate::namespace::store::fence_tests::open_store;
+    use crate::namespace::store::fence_tests::open_store_with_max_log_size;
     use crate::namespace::store::NamespaceStore;
     use crate::namespace::RestoreOption;
     use crate::replication::primary::logger::ReplicationLogger;
@@ -325,13 +325,19 @@ pub(crate) mod tests {
         _dir: TempDir,
         pub(crate) store: NamespaceStore,
         pub(crate) fence: Arc<FenceController>,
-        logger: Arc<ReplicationLogger>,
+        pub(crate) logger: Arc<ReplicationLogger>,
     }
 
     impl Source {
         pub(crate) async fn new() -> Self {
+            Self::with_max_log_size(1_000_000_000).await
+        }
+
+        /// A source whose replication log is compacted into a snapshot once it holds more than
+        /// `max_log_size` MB (`0`: at the next compaction).
+        pub(crate) async fn with_max_log_size(max_log_size: u64) -> Self {
             let dir = tempdir().unwrap();
-            let store = open_store(dir.path()).await;
+            let store = open_store_with_max_log_size(dir.path(), max_log_size).await;
             store
                 .create(
                     "ns".into(),

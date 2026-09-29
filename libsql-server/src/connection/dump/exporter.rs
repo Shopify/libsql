@@ -7,15 +7,30 @@ use anyhow::bail;
 use rusqlite::types::ValueRef;
 use rusqlite::OptionalExtension;
 
-struct DumpState<W: Write> {
+struct DumpState<'a, W: Write> {
     /// true if db is in writable_schema mode
     writable_schema: bool,
     writer: W,
+    /// Checked before every row: once it returns `true` the export stops with [`DumpCancelled`].
+    cancelled: &'a dyn Fn() -> bool,
 }
+
+/// The export was stopped by its caller before it completed (for example by a namespace read
+/// fence). The output is incomplete: it never reaches its final `COMMIT;`.
+#[derive(Debug, thiserror::Error)]
+#[error("the dump was cancelled before it completed")]
+pub struct DumpCancelled;
 
 use rusqlite::ffi::{sqlite3_keyword_check, sqlite3_table_column_metadata, SQLITE_OK};
 
-impl<W: Write> DumpState<W> {
+impl<W: Write> DumpState<'_, W> {
+    fn check_cancelled(&self) -> anyhow::Result<()> {
+        if (self.cancelled)() {
+            return Err(DumpCancelled.into());
+        }
+        Ok(())
+    }
+
     fn run_schema_dump_query(
         &mut self,
         txn: &rusqlite::Connection,
@@ -25,6 +40,7 @@ impl<W: Write> DumpState<W> {
         let mut stmt = txn.prepare(stmt)?;
         let mut rows = stmt.query(())?;
         while let Some(row) = rows.next()? {
+            self.check_cancelled()?;
             let ValueRef::Text(table) = row.get_ref(0)? else {
                 bail!("invalid schema table")
             };
@@ -103,6 +119,7 @@ impl<W: Write> DumpState<W> {
                 let mut stmt = txn.prepare(&select)?;
                 let mut rows = stmt.query(())?;
                 while let Some(row) = rows.next()? {
+                    self.check_cancelled()?;
                     write!(self.writer, "{insert}")?;
                     if row_id_col.is_some() {
                         write_value_ref(&mut self.writer, row.get_ref(0)?)?;
@@ -128,6 +145,7 @@ impl<W: Write> DumpState<W> {
         let col_count = stmt.column_count();
         let mut rows = stmt.query(())?;
         while let Some(row) = rows.next()? {
+            self.check_cancelled()?;
             let ValueRef::Text(sql) = row.get_ref(0)? else {
                 bail!("the first row in a table dump query should be of type text")
             };
@@ -438,12 +456,24 @@ pub fn export_dump(
     writer: impl Write,
     preserve_rowids: bool,
 ) -> anyhow::Result<()> {
+    export_dump_cancellable(db, writer, preserve_rowids, &|| false)
+}
+
+/// [`export_dump`], stopped with a [`DumpCancelled`] error as soon as `cancelled` returns `true`
+/// (it is checked before every row and before the final `COMMIT;`).
+pub fn export_dump_cancellable(
+    db: &mut rusqlite::Connection,
+    writer: impl Write,
+    preserve_rowids: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> anyhow::Result<()> {
     let mut txn = db.transaction()?;
     txn.execute("PRAGMA writable_schema=ON", ())?;
     let savepoint = txn.savepoint_with_name("dump")?;
     let mut state = DumpState {
         writable_schema: false,
         writer,
+        cancelled,
     };
 
     writeln!(state.writer, "PRAGMA foreign_keys=OFF;")?;
@@ -469,6 +499,7 @@ AND type IN ('index','trigger','view')";
         writeln!(state.writer, "PRAGMA writable_schema=OFF;")?;
     }
 
+    state.check_cancelled()?;
     writeln!(state.writer, "COMMIT;")?;
 
     let _ = savepoint.execute("PRAGMA writable_schema = OFF;", ());

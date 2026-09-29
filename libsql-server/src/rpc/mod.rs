@@ -29,6 +29,7 @@ pub async fn run_rpc_server<A: crate::net::Accept>(
     maybe_tls: Option<TlsConfig>,
     idle_shutdown_layer: Option<IdleShutdownKicker>,
     service: BoxReplicationService,
+    http2_keepalive_interval: Option<std::time::Duration>,
 ) -> anyhow::Result<()> {
     if let Some(tls_config) = maybe_tls {
         let cert_pem = tokio::fs::read_to_string(&tls_config.cert).await?;
@@ -81,8 +82,13 @@ pub async fn run_rpc_server<A: crate::net::Accept>(
             .service(router);
 
         tracing::info!("serving internal rpc server with tls");
-        let h2c = crate::h2c::H2cMaker::new(svc);
-        hyper::server::Server::builder(acceptor).serve(h2c).await?;
+        let h2c = crate::h2c::H2cMaker::new(svc).with_http2_keepalive(http2_keepalive_interval);
+        crate::h2c::with_http2_keepalive(
+            hyper::server::Server::builder(acceptor),
+            http2_keepalive_interval,
+        )
+        .serve(h2c)
+        .await?;
     } else {
         let proxy = ProxyServer::new(proxy_service);
         let replication = ReplicationLogServer::new(service);
@@ -105,11 +111,16 @@ pub async fn run_rpc_server<A: crate::net::Accept>(
             )
             .service(router);
 
-        let h2c = crate::h2c::H2cMaker::new(svc);
+        let h2c = crate::h2c::H2cMaker::new(svc).with_http2_keepalive(http2_keepalive_interval);
 
         tracing::info!("serving internal rpc server without tls");
 
-        hyper::server::Server::builder(acceptor).serve(h2c).await?;
+        crate::h2c::with_http2_keepalive(
+            hyper::server::Server::builder(acceptor),
+            http2_keepalive_interval,
+        )
+        .serve(h2c)
+        .await?;
     }
     Ok(())
 }
