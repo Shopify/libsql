@@ -11,6 +11,7 @@ use crate::connection::legacy::open_conn_active_checkpoint;
 use crate::error::Error;
 use crate::metrics::{PROGRAM_EXEC_COUNT, QUERY_CANCELED, VACUUM_COUNT, WAL_CHECKPOINT_COUNT};
 use crate::namespace::broadcasters::BroadcasterHandle;
+use crate::namespace::fence::controller::FenceConnState;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::ResolveNamespacePathFn;
 use crate::query_analysis::StmtKind;
@@ -37,6 +38,8 @@ pub(super) struct CoreConnection<W> {
     broadcaster: BroadcasterHandle,
     hooked: bool,
     canceled: Arc<AtomicBool>,
+    /// Shared with this connection's WAL wrapper (`docs/NAMESPACE_FENCE.md` section 7.4).
+    fence: Arc<FenceConnState>,
 }
 
 fn update_stats(
@@ -68,6 +71,7 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         get_current_frame_no: GetCurrentFrameNo,
         block_writes: Arc<AtomicBool>,
         resolve_attach_path: ResolveNamespacePathFn,
+        fence: Arc<FenceConnState>,
     ) -> Result<Self> {
         let conn = open_conn_active_checkpoint(
             path,
@@ -113,6 +117,7 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
             hooked: false,
             canceled,
             get_current_frame_no,
+            fence,
         };
 
         for ext in extensions.iter() {
@@ -188,17 +193,21 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         pgm: Program,
         mut builder: B,
     ) -> Result<B> {
-        let (config, stats, block_writes, resolve_attach_path) = {
+        let (config, stats, block_writes, resolve_attach_path, fence) = {
             let mut lock = this.lock();
             let config = lock.config_store.get();
             let stats = lock.stats.clone();
             let block_writes = lock.block_writes.clone();
             let resolve_attach_path = lock.resolve_attach_path.clone();
+            let fence = lock.fence.clone();
 
             lock.update_hooks();
 
-            (config, stats, block_writes, resolve_attach_path)
+            (config, stats, block_writes, resolve_attach_path, fence)
         };
+        // The program is admitted under the gate's current write generation; a write
+        // transaction it opens must start under the same one (section 8.1).
+        fence.begin_program();
 
         builder.init(&this.lock().builder_config)?;
         let mut vm = Vm::new(
@@ -229,7 +238,8 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
                 update_stats(&stats, sql, rows_read, rows_written, mem_used, elapsed)
             },
             resolve_attach_path,
-        );
+        )
+        .with_fence(fence);
 
         let mut has_timeout = false;
         while !vm.finished() {
@@ -296,6 +306,7 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
     }
 
     pub(super) fn vacuum_if_needed(&self) -> Result<()> {
+        self.fence.begin_program();
         let page_count = self
             .conn
             .query_row("PRAGMA page_count", (), |row| row.get::<_, i64>(0))?;
@@ -416,6 +427,10 @@ mod test {
             hooked: false,
             canceled: Arc::new(false.into()),
             get_current_frame_no: Arc::new(|| None),
+            fence: FenceConnState::new(
+                FenceController::unfenced(Default::default()),
+                crate::namespace::fence::state::OperationClass::NormalWrite,
+            ),
         };
 
         let conn = Arc::new(Mutex::new(conn));

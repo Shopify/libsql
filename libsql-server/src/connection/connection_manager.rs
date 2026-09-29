@@ -120,9 +120,6 @@ pub struct ManagedConnectionWalWrapper {
     manager: ConnectionManager,
     /// The connection's fence state, which `begin_write_txn` checks against the namespace's
     /// gate (`docs/NAMESPACE_FENCE.md` section 8.1).
-    // Installed here so that no connection exists without it; the check itself lands in the
-    // next commit of this series.
-    #[allow(dead_code)]
     fence: Arc<FenceConnState>,
 }
 
@@ -417,6 +414,13 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
     #[tracing::instrument(skip_all, fields(id = self.id))]
     fn begin_write_txn(&mut self, wrapped: &mut InnerWal) -> libsql_sys::wal::Result<()> {
         tracing::debug!("begin write");
+        // The authoritative fence check. It runs before `acquire()`, so a refusal holds no slot
+        // and releases none, and it returns `SQLITE_AUTH` rather than `SQLITE_BUSY`, so SQLite's
+        // busy handler does not retry it. The typed reason is left in the connection's fence
+        // state for the program layer.
+        if self.fence.admit_write().is_err() {
+            return Err(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_AUTH));
+        }
         self.acquire()?;
         match wrapped.begin_write_txn() {
             Ok(_) => {
@@ -498,6 +502,9 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
     #[tracing::instrument(skip_all, fields(id = self.id))]
     fn begin_read_txn(&mut self, wrapped: &mut InnerWal) -> libsql_sys::wal::Result<bool> {
         tracing::debug!("begin read txn");
+        // Recorded before the snapshot is taken: a transition racing with it leaves the
+        // transaction with the older generation, which can only refuse a later upgrade.
+        self.fence.begin_read_txn();
         wrapped.begin_read_txn()
     }
 
@@ -561,5 +568,375 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
         self.manager.inner.abort_handle.lock().remove(&self.id);
         tracing::debug!(id = self.id, "closed in {:?}", before.elapsed());
         ret
+    }
+}
+
+/// The WAL write gate (`docs/NAMESPACE_FENCE.md` section 8.1): tests on real connections of a
+/// namespace whose fence controller goes through committed metastore transitions.
+#[cfg(test)]
+mod fence_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use libsql_sys::wal::wrapper::PassthroughWalWrapper;
+    use libsql_sys::wal::Sqlite3WalManager;
+    use rusqlite::functions::FunctionFlags;
+    use rusqlite::ErrorCode;
+    use tempfile::tempdir;
+
+    use crate::connection::connection_core::CoreConnection;
+    use crate::connection::legacy::{LegacyConnection, MakeLegacyConnection};
+    use crate::connection::program::Program;
+    use crate::connection::Connection as _;
+    use crate::error::Error;
+    use crate::namespace::fence::controller::tests::{
+        create_namespace, ctx, fence_source, open_metastore, release, OP,
+    };
+    use crate::namespace::fence::controller::FenceController;
+    use crate::namespace::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
+    use crate::namespace::fence::state::FenceState;
+    use crate::namespace::meta_store::{MetaStore, MetaStoreHandle};
+    use crate::query_result_builder::test::{StepResult, TestBuilder};
+    use crate::query_result_builder::QueryResultBuilder as _;
+    use crate::DEFAULT_AUTO_CHECKPOINT;
+
+    type Conn = LegacyConnection<PassthroughWalWrapper>;
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        meta: MetaStore,
+        controller: Arc<FenceController>,
+        maker: MakeLegacyConnection<PassthroughWalWrapper>,
+    }
+
+    impl Harness {
+        async fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let meta_dir = dir.path().join("meta");
+            let db_dir = dir.path().join("db");
+            std::fs::create_dir_all(&meta_dir).unwrap();
+            std::fs::create_dir_all(&db_dir).unwrap();
+            let meta = open_metastore(&meta_dir).await;
+            create_namespace(&meta, "ns").await;
+            let controller = FenceController::unfenced("ns".into());
+            let maker = make_connections(&db_dir, controller.clone()).await;
+            let this = Self {
+                _dir: dir,
+                meta,
+                controller,
+                maker,
+            };
+            let conn = this.conn().await;
+            assert_ok(&run(&conn, &["create table t (x)"]).await);
+            this
+        }
+
+        async fn conn(&self) -> Conn {
+            self.maker.make_connection().await.unwrap()
+        }
+
+        /// UNFENCED -> SOURCE_DRAINING -> SOURCE_WRITE_FENCED.
+        async fn fence(&self) {
+            fence_source(&self.meta, &self.controller, OP).await;
+            assert_eq!(
+                self.controller.gate().state(),
+                FenceState::SourceWriteFenced
+            );
+        }
+
+        /// SOURCE_WRITE_FENCED -> RELEASED: writes are admitted again, under a new generation.
+        async fn release(&self) {
+            let revision = self.controller.gate().revision();
+            self.controller
+                .apply_command(&self.meta, release("ns", OP, 2, revision), ctx())
+                .await
+                .unwrap();
+            assert_eq!(self.controller.gate().state(), FenceState::Released);
+        }
+    }
+
+    async fn make_connections(
+        path: &Path,
+        fence: Arc<FenceController>,
+    ) -> MakeLegacyConnection<PassthroughWalWrapper> {
+        MakeLegacyConnection::new(
+            path.into(),
+            PassthroughWalWrapper,
+            Default::default(),
+            Default::default(),
+            MetaStoreHandle::load(path).unwrap(),
+            Arc::new([]),
+            100000000,
+            100000000,
+            DEFAULT_AUTO_CHECKPOINT,
+            Arc::new(|| None),
+            None,
+            Default::default(),
+            Arc::new(|_| unreachable!()),
+            Arc::new(|| Sqlite3WalManager::default()),
+            fence,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn run(conn: &Conn, stmts: &[&'static str]) -> Vec<StepResult> {
+        let inner = conn.inner.clone();
+        let stmts = stmts.to_vec();
+        tokio::task::spawn_blocking(move || {
+            CoreConnection::run(inner, Program::seq(&stmts), TestBuilder::default())
+                .unwrap()
+                .into_ret()
+        })
+        .await
+        .unwrap()
+    }
+
+    fn assert_ok(steps: &[StepResult]) {
+        for (i, step) in steps.iter().enumerate() {
+            assert!(step.is_ok(), "step {i} failed: {step:?}");
+        }
+    }
+
+    fn fence_error(step: &StepResult) -> &FenceError {
+        match step {
+            Err(Error::NamespaceFence(e)) => e,
+            other => panic!("expected a fence denial, got {other:?}"),
+        }
+    }
+
+    async fn count(conn: &Conn) -> i64 {
+        conn.with_raw(|c| c.query_row("select count(*) from t", (), |r| r.get(0)))
+            .unwrap()
+    }
+
+    /// A program is admitted, the fence is acquired and released while it runs, and the write it
+    /// then attempts is refused at the WAL although the live gate is open again: the program was
+    /// admitted under a generation that is no longer current. The race is held open by a SQL
+    /// function that parks the program between admission and its write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wal_gate_rejects_program_admitted_before_fence() {
+        let h = Harness::new().await;
+        let conn = h.conn().await;
+
+        let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let parked = std::panic::AssertUnwindSafe((reached_tx, std::sync::Mutex::new(resume_rx)));
+        conn.with_raw(move |c| {
+            c.create_scalar_function("park", 0, FunctionFlags::SQLITE_UTF8, move |_| {
+                let (reached, resume) = &*parked;
+                reached.send(()).unwrap();
+                resume.lock().unwrap().recv().unwrap();
+                Ok(1)
+            })
+        })
+        .unwrap();
+
+        let admitted_at = h.controller.write_generation();
+        let program = tokio::spawn({
+            let conn = conn.clone();
+            async move { run(&conn, &["select park()", "insert into t values (1)"]).await }
+        });
+        reached_rx.recv().await.unwrap();
+        assert_eq!(conn.fence.program_generation(), admitted_at);
+
+        h.fence().await;
+        h.release().await;
+        assert!(h.controller.write_generation() > admitted_at);
+        resume_tx.send(()).unwrap();
+
+        let steps = program.await.unwrap();
+        assert!(steps[0].is_ok());
+        let e = fence_error(&steps[1]);
+        assert_eq!(e.outcome(), FenceOutcome::MigrationWriteFenced);
+        assert_eq!(e.detail(), Some(FenceDetail::StaleTransaction));
+        assert_eq!(count(&conn).await, 0);
+
+        // The next program is admitted under the current generation and writes.
+        assert_ok(&run(&conn, &["insert into t values (2)"]).await);
+        assert_eq!(count(&conn).await, 1);
+    }
+
+    /// A read transaction opened before a transition cannot be upgraded to a write transaction
+    /// after it, whether the gate is still closed or open again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fence_rejects_read_to_write_upgrade() {
+        let h = Harness::new().await;
+        let conn = h.conn().await;
+
+        // Gate closed: refused before the write runs.
+        assert_ok(&run(&conn, &["begin", "select * from t"]).await);
+        h.fence().await;
+        let steps = run(&conn, &["insert into t values (1)"]).await;
+        assert_eq!(
+            fence_error(&steps[0]).outcome(),
+            FenceOutcome::MigrationWriteFenced
+        );
+
+        // Gate open again: the transaction still belongs to the old generation, and only the
+        // WAL gate can tell.
+        h.release().await;
+        let steps = run(&conn, &["insert into t values (1)"]).await;
+        let e = fence_error(&steps[0]);
+        assert_eq!(e.outcome(), FenceOutcome::MigrationWriteFenced);
+        assert_eq!(e.detail(), Some(FenceDetail::StaleTransaction));
+        assert_ok(&run(&conn, &["rollback"]).await);
+
+        // A fresh transaction writes.
+        assert_ok(&run(&conn, &["begin", "insert into t values (1)", "commit"]).await);
+        assert_eq!(count(&conn).await, 1);
+    }
+
+    /// DDL, a pragma that writes the header, and `BEGIN IMMEDIATE` are refused while writes are
+    /// fenced; reads keep working, and nothing was written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fence_rejects_ddl_and_pragma() {
+        let h = Harness::new().await;
+        let conn = h.conn().await;
+        h.fence().await;
+
+        for stmt in [
+            "create table u (x)",
+            "create index i on t (x)",
+            "drop table t",
+            "pragma user_version = 7",
+            "begin immediate",
+        ] {
+            let steps = run(&conn, &[stmt]).await;
+            assert_eq!(
+                fence_error(&steps[0]).outcome(),
+                FenceOutcome::MigrationWriteFenced,
+                "{stmt}"
+            );
+            assert!(conn.inner.lock().is_autocommit(), "{stmt}");
+        }
+        assert_ok(&run(&conn, &["select * from t"]).await);
+
+        h.release().await;
+        let version: i64 = conn
+            .with_raw(|c| c.query_row("pragma user_version", (), |r| r.get(0)))
+            .unwrap();
+        assert_eq!(version, 0);
+        let tables: i64 = conn
+            .with_raw(|c| {
+                c.query_row(
+                    "select count(*) from sqlite_schema where name in ('u', 'i')",
+                    (),
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(tables, 0);
+    }
+
+    /// `with_raw` users (admin shell, schema migration, dump load) bypass statement
+    /// classification but not the WAL: the write fails with `SQLITE_AUTH` and the typed reason
+    /// is in the connection's denial slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fence_rejects_raw_with_raw_write() {
+        let h = Harness::new().await;
+        let conn = h.conn().await;
+        h.fence().await;
+
+        for sql in ["insert into t values (1)", "begin immediate", "vacuum"] {
+            let err = conn.with_raw(|c| c.execute_batch(sql)).unwrap_err();
+            match err {
+                rusqlite::Error::SqliteFailure(e, _) => {
+                    assert_eq!(e.code, ErrorCode::AuthorizationForStatementDenied, "{sql}")
+                }
+                e => panic!("{sql}: unexpected error {e}"),
+            }
+            assert_eq!(
+                conn.fence.take_denial().unwrap().outcome(),
+                FenceOutcome::MigrationWriteFenced,
+                "{sql}"
+            );
+        }
+        assert_eq!(count(&conn).await, 0);
+
+        h.release().await;
+        conn.with_raw(|c| c.execute_batch("insert into t values (1)"))
+            .unwrap();
+        assert_eq!(count(&conn).await, 1);
+    }
+
+    /// The fence acquired and released between a transaction's first read and its write: the
+    /// write is refused although the gate is open, while a connection that was idle across the
+    /// transition, and the same connection after a rollback, write normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_generation_cannot_write_after_release() {
+        let h = Harness::new().await;
+        let in_txn = h.conn().await;
+        let idle = h.conn().await;
+
+        assert_ok(&run(&in_txn, &["begin", "select count(*) from t"]).await);
+        h.fence().await;
+        h.release().await;
+        assert!(h
+            .controller
+            .permits(crate::namespace::fence::state::OperationClass::NormalWrite)
+            .is_ok());
+
+        let steps = run(&in_txn, &["insert into t values (1)", "commit"]).await;
+        assert_eq!(
+            fence_error(&steps[0]).detail(),
+            Some(FenceDetail::StaleTransaction)
+        );
+        // The commit that follows ends the transaction without having written anything.
+        assert!(steps[1].is_ok());
+        assert!(in_txn.inner.lock().is_autocommit());
+        assert_ok(&run(&idle, &["insert into t values (2)"]).await);
+        assert_ok(&run(&in_txn, &["insert into t values (3)"]).await);
+        assert_eq!(count(&idle).await, 2);
+    }
+
+    /// A namespace that never had a fence behaves as before: generation 0 everywhere, every
+    /// kind of write works, and a plain `SQLITE_AUTH` from an authorizer is reported as the
+    /// SQLite error it is, not as a fence denial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfenced_namespace_is_unchanged() {
+        let h = Harness::new().await;
+        let conn = h.conn().await;
+
+        assert_ok(
+            &run(
+                &conn,
+                &[
+                    "insert into t values (1)",
+                    "begin",
+                    "select * from t",
+                    "insert into t values (2)",
+                    "commit",
+                    "create table u (x)",
+                    "pragma user_version = 3",
+                ],
+            )
+            .await,
+        );
+        conn.with_raw(|c| c.execute_batch("insert into t values (3)"))
+            .unwrap();
+        assert_eq!(count(&conn).await, 3);
+        assert_eq!(h.controller.write_generation(), 0);
+        assert_eq!(conn.fence.program_generation(), 0);
+        assert_eq!(conn.fence.txn_generation(), 0);
+
+        conn.with_raw(|c| {
+            c.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+                match ctx.action {
+                    rusqlite::hooks::AuthAction::Insert { .. } => {
+                        rusqlite::hooks::Authorization::Deny
+                    }
+                    _ => rusqlite::hooks::Authorization::Allow,
+                }
+            }))
+        });
+        let steps = run(&conn, &["insert into t values (4)"]).await;
+        match &steps[0] {
+            Err(Error::RusqliteErrorExtended(rusqlite::Error::SqliteFailure(e, _), _)) => {
+                assert_eq!(e.code, ErrorCode::AuthorizationForStatementDenied)
+            }
+            other => panic!("expected the authorizer's error, got {other:?}"),
+        }
+        assert!(conn.fence.take_denial().is_none());
     }
 }

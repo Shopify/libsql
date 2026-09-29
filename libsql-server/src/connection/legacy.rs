@@ -173,9 +173,7 @@ where
 
 pub struct LegacyConnection<T> {
     pub(super) inner: Arc<Mutex<CoreConnection<WrappedWal<T, ManagedConnectionWal>>>>,
-    /// Shared with the connection's WAL wrapper.
-    // Read by the WAL gate and the program admission check in the next commit of this series.
-    #[allow(dead_code)]
+    /// Shared with the connection's WAL wrapper and its `CoreConnection`.
     pub(super) fence: Arc<FenceConnState>,
 }
 
@@ -344,7 +342,7 @@ where
             let connection_manager = connection_manager.clone();
             let fence = fence.clone();
             move || -> crate::Result<_> {
-                let manager = ManagedConnectionWalWrapper::new(connection_manager, fence);
+                let manager = ManagedConnectionWalWrapper::new(connection_manager, fence.clone());
                 let id = manager.id();
                 let wal = make_wal().wrap(manager).wrap(wal_wrapper);
 
@@ -359,6 +357,7 @@ where
                     current_frame_no_receiver,
                     block_writes,
                     resolve_attach_path,
+                    fence,
                 )?;
 
                 let namespace = path
@@ -464,6 +463,9 @@ where
 
     fn with_raw<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
         let mut inner = self.inner.lock();
+        // A raw use of the connection is a program like any other: the WAL gate admits a write
+        // transaction it opens only under the generation it started under.
+        self.fence.begin_program();
         f(inner.raw_mut())
     }
 }

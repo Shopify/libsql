@@ -384,7 +384,14 @@ fn pending_indeterminate((operation_id, command_id): CommandKey) -> FenceError {
 }
 
 /// The fence state of one connection, shared by its WAL wrapper and its `CoreConnection`
-/// (section 7.4). The WAL gate reads and writes it; this commit only installs it.
+/// (section 7.4).
+///
+/// - A program (a `CoreConnection::run`, a `with_raw` call, a vacuum) starts with
+///   [`begin_program`](Self::begin_program), which records the generation it was admitted under.
+/// - The WAL wrapper calls [`begin_read_txn`](Self::begin_read_txn) whenever SQLite opens a read
+///   transaction, and [`admit_write`](Self::admit_write) in `begin_write_txn` before it queues for
+///   the write slot. A refusal leaves its typed outcome in the denial slot, which the program
+///   layer takes to report the fence error instead of the bare `SQLITE_AUTH` the WAL returns.
 #[derive(Debug)]
 pub struct FenceConnState {
     controller: Arc<FenceController>,
@@ -425,13 +432,69 @@ impl FenceConnState {
         self.txn_generation.load(Ordering::Acquire)
     }
 
+    /// Start a program on this connection: record the generation it is admitted under and
+    /// forget any denial a previous program left behind. Returns that generation.
+    pub fn begin_program(&self) -> u64 {
+        let generation = self.controller.write_generation();
+        self.program_generation.store(generation, Ordering::Release);
+        *self.denial.lock() = None;
+        generation
+    }
+
+    /// SQLite is opening a new read transaction on this connection: record the generation it
+    /// is opened under. A later upgrade of that transaction to a write transaction must happen
+    /// under the same generation.
+    pub fn begin_read_txn(&self) {
+        self.txn_generation
+            .store(self.controller.write_generation(), Ordering::Release);
+    }
+
+    /// The authoritative write admission (section 8.1, check 2): the live gate permits this
+    /// connection's class, and the program and its read transaction were both admitted under
+    /// the gate's current write generation. On refusal the typed outcome is left in the denial
+    /// slot and returned.
+    pub fn admit_write(&self) -> Result<(), FenceError> {
+        let result = {
+            let gate = self.controller.gate.borrow();
+            gate.permits(self.class).and_then(|()| {
+                let current = gate.write_generation;
+                let program = self.program_generation();
+                let txn = self.txn_generation();
+                if program == current && txn == current {
+                    Ok(())
+                } else {
+                    Err(FenceError::new(
+                        FenceOutcome::MigrationWriteFenced,
+                        format!(
+                            "the namespace fence changed after this transaction began \
+                             (program admitted at generation {program}, transaction opened at \
+                             generation {txn}, current generation {current}); roll back and \
+                             begin a new transaction"
+                        ),
+                    )
+                    .with_detail(FenceDetail::StaleTransaction))
+                }
+            })
+        };
+        if let Err(e) = &result {
+            tracing::debug!(
+                namespace = %self.controller.namespace,
+                class = ?self.class,
+                "write transaction refused by the namespace fence: {e}"
+            );
+            *self.denial.lock() = Some(e.clone());
+        }
+        result
+    }
+
+    /// Take the typed outcome of the last refusal at the WAL, if any.
     pub fn take_denial(&self) -> Option<FenceError> {
         self.denial.lock().take()
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::Path;
 
     use tempfile::tempdir;
@@ -445,7 +508,7 @@ mod tests {
     use crate::namespace::meta_store::{metastore_connection_maker, FenceCommitKind};
 
     const LOG: Uuid = Uuid::from_u128(0x10);
-    const OP: Uuid = Uuid::from_u128(0xa);
+    pub(crate) const OP: Uuid = Uuid::from_u128(0xa);
     const OTHER_OP: Uuid = Uuid::from_u128(0xb);
 
     pub(crate) async fn open_metastore(dir: &Path) -> MetaStore {
@@ -474,7 +537,7 @@ mod tests {
             .unwrap();
     }
 
-    fn ctx() -> FenceContext {
+    pub(crate) fn ctx() -> FenceContext {
         FenceContext::now(
             ServerIdentity {
                 build: "test".into(),
@@ -484,7 +547,7 @@ mod tests {
         )
     }
 
-    fn acquire(ns: &'static str, op: Uuid, command_id: u128) -> FenceRequest {
+    pub(crate) fn acquire(ns: &'static str, op: Uuid, command_id: u128) -> FenceRequest {
         FenceRequest {
             namespace: ns.into(),
             operation_id: op,
@@ -498,7 +561,12 @@ mod tests {
         }
     }
 
-    fn release(ns: &'static str, op: Uuid, command_id: u128, revision: u64) -> FenceRequest {
+    pub(crate) fn release(
+        ns: &'static str,
+        op: Uuid,
+        command_id: u128,
+        revision: u64,
+    ) -> FenceRequest {
         FenceRequest {
             namespace: ns.into(),
             operation_id: op,
@@ -519,7 +587,11 @@ mod tests {
 
     /// Acquire and complete the drain directly, as the write drain will: the controller ends in
     /// `SOURCE_WRITE_FENCED`.
-    async fn fence_source(meta: &MetaStore, controller: &Arc<FenceController>, op: Uuid) {
+    pub(crate) async fn fence_source(
+        meta: &MetaStore,
+        controller: &Arc<FenceController>,
+        op: Uuid,
+    ) {
         let commit = controller
             .apply_command(meta, acquire("ns", op, 1), ctx())
             .await
