@@ -56,7 +56,9 @@ pub enum HookAction {
     /// Fail at this point with `error`, as if the step had failed before it took effect.
     Fail(FenceError),
     /// At `AfterMetastoreCommit`: report the commit as indeterminate even though it happened,
-    /// which is what a lost commit acknowledgement looks like to the controller.
+    /// which is what a lost commit acknowledgement looks like to the controller. At
+    /// `BeforeMetastoreCommit`: report it as indeterminate without running it, which is a
+    /// commit that failed without applying but whose outcome the controller cannot know.
     Indeterminate,
 }
 

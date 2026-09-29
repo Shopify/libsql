@@ -458,11 +458,17 @@ impl Transition {
             }
         }
 
-        if let HookOutcome::Fail(e) = controller.hook(HookPoint::BeforeMetastoreCommit).await {
-            return Err(e.into());
-        }
+        let result = match controller.hook(HookPoint::BeforeMetastoreCommit).await {
+            HookOutcome::Continue => run.await,
+            HookOutcome::Fail(e) => return Err(e.into()),
+            // A commit that failed without applying, but whose outcome the controller cannot
+            // know (test hook).
+            HookOutcome::Indeterminate => {
+                Err(indeterminate(key, "the commit was not acknowledged (test hook)").into())
+            }
+        };
 
-        let result = match run.await {
+        let result = match result {
             Ok(commit) => match controller.hook(HookPoint::AfterMetastoreCommit).await {
                 HookOutcome::Continue => Ok(commit),
                 HookOutcome::Indeterminate | HookOutcome::Fail(_) => Err(indeterminate(

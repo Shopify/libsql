@@ -28,6 +28,9 @@ pub mod state;
 pub mod store;
 pub mod transition;
 
+#[cfg(test)]
+mod tests;
+
 #[allow(clippy::all)]
 pub(crate) mod proto {
     include!("../../generated/namespace_fence.rs");
