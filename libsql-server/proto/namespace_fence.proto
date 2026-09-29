@@ -1,0 +1,205 @@
+// Durable encoding of namespace fence records, command receipts and markers.
+//
+// See docs/NAMESPACE_FENCE.md. Every message here is stored, so fields are only ever added.
+// Readers reject unknown enum values and missing required fields instead of guessing.
+syntax = "proto3";
+
+package namespace_fence;
+
+enum FenceRole {
+    FENCE_ROLE_UNSPECIFIED = 0;
+    FENCE_ROLE_SOURCE = 1;
+    FENCE_ROLE_TARGET = 2;
+}
+
+// `UNFENCED` and `ABSENT` are never stored in a record; they appear as the `expected_state` of a
+// request against a namespace that has no record. `UNKNOWN_UNAVAILABLE` is derived and never
+// stored either.
+enum FenceState {
+    FENCE_STATE_UNSPECIFIED = 0;
+    FENCE_STATE_UNFENCED = 1;
+    FENCE_STATE_ABSENT = 2;
+    FENCE_STATE_SOURCE_DRAINING = 3;
+    FENCE_STATE_SOURCE_WRITE_FENCED = 4;
+    FENCE_STATE_SOURCE_READ_DRAINING = 5;
+    FENCE_STATE_SOURCE_READ_FENCED = 6;
+    FENCE_STATE_RELEASED = 7;
+    FENCE_STATE_TARGET_QUARANTINED = 8;
+    FENCE_STATE_TARGET_IMPORT_DRAINING = 9;
+    FENCE_STATE_TARGET_VALIDATING = 10;
+    FENCE_STATE_TARGET_WRITE_FENCED = 11;
+    FENCE_STATE_TARGET_WRITABLE = 12;
+    FENCE_STATE_TARGET_ABORTED = 13;
+    FENCE_STATE_UNKNOWN_UNAVAILABLE = 14;
+}
+
+enum CommandKind {
+    COMMAND_KIND_UNSPECIFIED = 0;
+    COMMAND_KIND_ACQUIRE_SOURCE_WRITE_FENCE = 1;
+    COMMAND_KIND_SET_SOURCE_READ_FENCE = 2;
+    COMMAND_KIND_CLEAR_SOURCE_READ_FENCE = 3;
+    COMMAND_KIND_RELEASE_SOURCE_WRITE_FENCE = 4;
+    COMMAND_KIND_CREATE_TARGET_QUARANTINED = 5;
+    COMMAND_KIND_SEAL_TARGET_IMPORT = 6;
+    COMMAND_KIND_RECORD_TARGET_VALIDATION = 7;
+    COMMAND_KIND_PUBLISH_TARGET_READABLE_WRITE_FENCED = 8;
+    COMMAND_KIND_ENABLE_TARGET_WRITES = 9;
+    COMMAND_KIND_ABORT_QUARANTINED_TARGET = 10;
+    COMMAND_KIND_ADOPT_FENCE = 11;
+}
+
+// Only the outcomes a receipt can record. Errors are never stored.
+enum ReceiptOutcome {
+    RECEIPT_OUTCOME_UNSPECIFIED = 0;
+    RECEIPT_OUTCOME_APPLIED = 1;
+    RECEIPT_OUTCOME_ALREADY_APPLIED = 2;
+    RECEIPT_OUTCOME_DRAINING = 3;
+}
+
+enum OnDeadline {
+    ON_DEADLINE_UNSPECIFIED = 0;
+    ON_DEADLINE_FAIL = 1;
+    ON_DEADLINE_FORCE_ROLLBACK = 2;
+}
+
+enum ValidationResult {
+    VALIDATION_RESULT_UNSPECIFIED = 0;
+    VALIDATION_RESULT_OK = 1;
+    VALIDATION_RESULT_FAILED = 2;
+}
+
+message DrainPolicy {
+    uint64 deadline_ms = 1;
+    OnDeadline on_deadline = 2;
+}
+
+message FrozenBoundary {
+    string log_id = 1;
+    uint64 frame_no = 2;
+}
+
+message LegacyBlocks {
+    bool block_reads = 1;
+    bool block_writes = 2;
+    optional string block_reason = 3;
+}
+
+message ServerIdentity {
+    string build = 1;
+    string instance_id = 2;
+}
+
+message TargetConfig {
+    optional uint64 max_db_size = 1;
+    optional string jwt_key = 2;
+    optional uint64 txn_timeout_s = 3;
+    bool allow_attach = 4;
+    optional string durability_mode = 5;
+    optional string bottomless_db_id = 6;
+}
+
+message ValidationSnapshot {
+    string log_id = 1;
+    uint64 frame_no = 2;
+    uint64 page_count = 3;
+}
+
+message ValidationRecord {
+    string operation_id = 1;
+    string command_id = 2;
+    ValidationResult result = 3;
+    string summary = 4;
+    optional ValidationSnapshot snapshot = 5;
+    int64 recorded_at_ms = 6;
+}
+
+message Adoption {
+    string previous_operation_id = 1;
+    string new_operation_id = 2;
+    string command_id = 3;
+    repeated string approvers = 4;
+    string incident_ref = 5;
+    string reason = 6;
+    int64 at_ms = 7;
+    uint64 revision = 8;
+}
+
+message FenceRecord {
+    string namespace = 1;
+    FenceRole role = 2;
+    FenceState state = 3;
+    uint64 revision = 4;
+    string operation_id = 5;
+    optional string log_id = 6;
+    optional string target_incarnation_id = 7;
+    optional DrainPolicy drain_policy = 8;
+    optional int64 drain_started_at_ms = 9;
+    optional FrozenBoundary frozen_boundary = 10;
+    optional ValidationRecord validation = 11;
+    LegacyBlocks legacy_blocks = 12;
+    int64 created_at_ms = 13;
+    int64 last_transition_at_ms = 14;
+    string last_command_id = 15;
+    ServerIdentity written_by = 16;
+    repeated Adoption adoptions = 17;
+}
+
+message CommandReceipt {
+    string namespace = 1;
+    string operation_id = 2;
+    string command_id = 3;
+    CommandKind command = 4;
+    bytes fingerprint = 5;
+    ReceiptOutcome outcome = 6;
+    uint64 revision_before = 7;
+    uint64 revision_after = 8;
+    FenceState state_after = 9;
+    int64 applied_at_ms = 10;
+    string instance_id = 11;
+    optional Adoption adoption = 12;
+}
+
+// Contents of `dbs/<namespace>/.fence`: a copy of the last committed record (or, for
+// `CreateTargetQuarantined`, of the record about to be committed).
+message FenceMarker {
+    uint32 format_version = 1;
+    FenceRecord record = 2;
+}
+
+// Canonical input of a command fingerprint: everything in the request except `command_id`.
+message FingerprintInput {
+    string namespace = 1;
+    string operation_id = 2;
+    CommandKind kind = 3;
+    FenceState expected_state = 4;
+    uint64 expected_revision = 5;
+    oneof args {
+        AcquireSourceWriteFenceArgs acquire_source_write_fence = 10;
+        DrainArgs set_source_read_fence = 11;
+        DrainArgs seal_target_import = 12;
+        TargetConfig create_target_quarantined = 13;
+        RecordTargetValidationArgs record_target_validation = 14;
+        AdoptFenceArgs adopt_fence = 15;
+    }
+}
+
+message AcquireSourceWriteFenceArgs {
+    string expected_log_id = 1;
+    optional DrainPolicy drain_policy = 2;
+}
+
+message DrainArgs {
+    optional DrainPolicy drain_policy = 1;
+}
+
+message RecordTargetValidationArgs {
+    ValidationResult result = 1;
+    string summary = 2;
+}
+
+message AdoptFenceArgs {
+    string current_operation_id = 1;
+    repeated string approvers = 2;
+    string incident_ref = 3;
+    string reason = 4;
+}

@@ -3,7 +3,7 @@ use std::process::Command;
 
 #[test]
 fn bootstrap() {
-    let iface_files = &["proto/admin_shell.proto"];
+    let iface_files = &["proto/admin_shell.proto", "proto/namespace_fence.proto"];
     let dirs = &["proto"];
 
     let out_dir = PathBuf::from(std::env!("CARGO_MANIFEST_DIR"))

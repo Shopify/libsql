@@ -21,6 +21,7 @@ pub use self::store::NamespaceStore;
 pub mod broadcasters;
 pub(crate) mod configurator;
 pub mod dump_import;
+pub mod fence;
 pub(crate) mod incomplete;
 pub mod meta_store;
 mod name;
