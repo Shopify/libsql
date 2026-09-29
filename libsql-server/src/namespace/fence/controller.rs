@@ -110,11 +110,17 @@ impl GateSnapshot {
     }
 }
 
+/// Wakes one connection manager's write queue after a write-generation change; returns `false`
+/// once the manager is gone.
+pub type WriteQueueWaker = Box<dyn Fn() -> bool + Send + Sync>;
+
 /// The fence controller of one namespace.
 pub struct FenceController {
     namespace: NamespaceName,
     transition_lock: Arc<tokio::sync::Mutex<()>>,
     gate: watch::Sender<GateSnapshot>,
+    /// The write queues of the namespace's connection managers (section 8.2).
+    write_queues: Mutex<Vec<WriteQueueWaker>>,
     #[cfg(test)]
     hooks: FenceTestHooks,
 }
@@ -136,6 +142,7 @@ impl FenceController {
             namespace,
             transition_lock: Default::default(),
             gate,
+            write_queues: Mutex::new(Vec::new()),
             #[cfg(test)]
             hooks: FenceTestHooks::default(),
         })
@@ -172,6 +179,13 @@ impl FenceController {
     /// The live gate's decision for work of `class`.
     pub fn permits(&self, class: OperationClass) -> Result<(), FenceError> {
         self.gate.borrow().permits(class)
+    }
+
+    /// Register a connection manager's write queue, to be woken after every change of the write
+    /// generation so that queued writers re-check the gate instead of waiting for the slot.
+    /// Wakers whose manager is gone are dropped on the next change.
+    pub fn register_write_queue(&self, waker: WriteQueueWaker) {
+        self.write_queues.lock().push(waker);
     }
 
     /// Take the namespace's transition lock. Every fence command on the namespace runs while
@@ -224,6 +238,7 @@ impl FenceController {
     /// Publish a new gate. `fence: None` keeps the published fence. The write generation moves
     /// whenever the state, the owning operation or the indeterminate flag changes.
     fn publish(&self, fence: Option<StoredFence>, indeterminate: Option<CommandKey>) {
+        let mut generation_changed = false;
         self.gate.send_modify(|gate| {
             let fence = fence.unwrap_or_else(|| gate.fence.clone());
             let changed = fence.state() != gate.fence.state()
@@ -234,17 +249,24 @@ impl FenceController {
             gate.indeterminate = indeterminate;
             if changed {
                 gate.write_generation += 1;
+                generation_changed = true;
             }
         });
-        let gate = self.gate.borrow();
-        tracing::debug!(
-            namespace = %self.namespace,
-            state = %gate.state(),
-            revision = gate.revision(),
-            write_generation = gate.write_generation,
-            indeterminate = gate.indeterminate.is_some(),
-            "published namespace fence gate"
-        );
+        {
+            let gate = self.gate.borrow();
+            tracing::debug!(
+                namespace = %self.namespace,
+                state = %gate.state(),
+                revision = gate.revision(),
+                write_generation = gate.write_generation,
+                indeterminate = gate.indeterminate.is_some(),
+                "published namespace fence gate"
+            );
+        }
+        // After the gate is published, so that every woken writer re-checks against it.
+        if generation_changed {
+            self.write_queues.lock().retain(|wake| wake());
+        }
     }
 }
 
@@ -680,6 +702,60 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(replay.kind, FenceCommitKind::Replayed);
         assert_eq!(controller.gate(), before);
+    }
+
+    /// Registered write queues are woken after every change of the write generation, and only
+    /// then; a waker whose manager is gone is forgotten.
+    #[tokio::test]
+    async fn write_queues_are_woken_on_every_generation_change() {
+        let tmp = tempdir().unwrap();
+        let meta = open_metastore(tmp.path()).await;
+        create_namespace(&meta, "ns").await;
+        let controller = FenceController::unfenced("ns".into());
+
+        let woken = Arc::new(AtomicU64::new(0));
+        let seen_generation = Arc::new(AtomicU64::new(0));
+        controller.register_write_queue(Box::new({
+            let woken = woken.clone();
+            let seen_generation = seen_generation.clone();
+            let controller = Arc::downgrade(&controller);
+            move || {
+                // The gate is already published when the queue is woken.
+                if let Some(c) = controller.upgrade() {
+                    seen_generation.store(c.write_generation(), Ordering::SeqCst);
+                }
+                woken.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        }));
+        let gone = Arc::new(AtomicU64::new(0));
+        controller.register_write_queue(Box::new({
+            let gone = gone.clone();
+            move || {
+                gone.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        }));
+        assert_eq!(controller.write_queues.lock().len(), 2);
+
+        fence_source(&meta, &controller, OP).await;
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
+        assert_eq!(seen_generation.load(Ordering::SeqCst), 2);
+        assert_eq!(gone.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.write_queues.lock().len(), 1);
+
+        // A replay does not move the generation and wakes nobody.
+        let revision = controller.gate().revision();
+        controller
+            .apply_command(&meta, release("ns", OP, 2, revision), ctx())
+            .await
+            .unwrap();
+        assert_eq!(woken.load(Ordering::SeqCst), 3);
+        controller
+            .apply_command(&meta, release("ns", OP, 2, revision), ctx())
+            .await
+            .unwrap();
+        assert_eq!(woken.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

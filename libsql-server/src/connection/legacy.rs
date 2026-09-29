@@ -77,6 +77,9 @@ where
         fence: Arc<FenceController>,
     ) -> Result<Self> {
         let txn_timeout = config_store.get().txn_timeout.unwrap_or(TXN_TIMEOUT);
+        let connection_manager = ConnectionManager::new(txn_timeout);
+        // Queued writers re-check the fence whenever its write generation changes.
+        fence.register_write_queue(connection_manager.fence_waker());
 
         let mut this = Self {
             db_path,
@@ -93,7 +96,7 @@ where
             encryption_config,
             block_writes,
             resolve_attach_path,
-            connection_manager: ConnectionManager::new(txn_timeout),
+            connection_manager,
             make_wal_manager,
             fence,
         };
@@ -102,6 +105,13 @@ where
         this._db = Some(db);
 
         Ok(this)
+    }
+
+    /// The write-slot manager shared by every connection this maker opens.
+    // Used by the positive source write drain (section 8.3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn connection_manager(&self) -> &ConnectionManager {
+        &self.connection_manager
     }
 
     /// Tries to create a database, retrying if the database is busy.
