@@ -20,6 +20,7 @@ pub use self::store::NamespaceStore;
 
 pub mod broadcasters;
 pub(crate) mod configurator;
+pub mod fence;
 pub mod meta_store;
 mod name;
 pub mod replication_wal;
