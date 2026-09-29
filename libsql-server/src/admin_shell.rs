@@ -10,6 +10,8 @@ use tonic::metadata::{AsciiMetadataValue, BinaryMetadataValue};
 
 use crate::connection::Connection as _;
 use crate::database::Connection;
+use crate::namespace::fence::controller::{FenceController, LeaseKind};
+use crate::namespace::fence::state::OperationClass;
 use crate::namespace::{NamespaceName, NamespaceStore};
 
 use self::rpc::admin_shell_service_server::{AdminShellService, AdminShellServiceServer};
@@ -41,17 +43,20 @@ impl AdminShell {
         queries: impl Stream<Item = Result<rpc::Query, tonic::Status>>,
     ) -> anyhow::Result<impl Stream<Item = Result<rpc::Response, tonic::Status>>> {
         let namespace = NamespaceName::from_bytes(ns).unwrap();
-        let connection_maker = self
+        let (connection_maker, fence) = self
             .namespace_store
-            .with(namespace, |ns| ns.db.connection_maker())
+            .with(namespace, |ns| {
+                (ns.db.connection_maker(), ns.fence().clone())
+            })
             .await?;
         let connection = connection_maker.create().await?;
-        Ok(run_shell(connection, queries))
+        Ok(run_shell(connection, fence, queries))
     }
 }
 
 fn run_shell(
     conn: Connection,
+    fence: std::sync::Arc<FenceController>,
     queries: impl Stream<Item = Result<rpc::Query, tonic::Status>>,
 ) -> impl Stream<Item = Result<rpc::Response, tonic::Status>> {
     async_stream::stream! {
@@ -59,14 +64,45 @@ fn run_shell(
         while let Some(q) = queries.next().await {
             let Ok(q) = q else { break };
             let res = tokio::task::block_in_place(|| {
-                conn.with_raw(move |conn| {
-                    run_one(conn, q.query)
-                })
+                conn.with_raw(|conn| run_admitted(&fence, conn, q.query))
             });
 
             yield res
         }
     }
+}
+
+/// Run one shell query as a read of the namespace (`docs/NAMESPACE_FENCE.md` section 9): the
+/// shell runs raw SQL, so the read gate is checked, and a read lease held, per query. Writes are
+/// refused by the WAL gate like any other connection's.
+fn run_admitted(
+    fence: &std::sync::Arc<FenceController>,
+    conn: &mut rusqlite::Connection,
+    q: String,
+) -> Result<rpc::Response, tonic::Status> {
+    let interrupt = conn.get_interrupt_handle();
+    let lease =
+        match fence.acquire_read_lease(OperationClass::NormalRead, LeaseKind::Sql, move || {
+            interrupt.interrupt()
+        }) {
+            Ok(lease) => lease,
+            Err(e) => {
+                return Ok(rpc::Response {
+                    resp: Some(Resp::Error(rpc::Error {
+                        error: e.to_string(),
+                    })),
+                })
+            }
+        };
+    let res = run_one(conn, q);
+    if lease.cancelled_by_fence() {
+        return Ok(rpc::Response {
+            resp: Some(Resp::Error(rpc::Error {
+                error: "the query was cancelled by the namespace read fence".into(),
+            })),
+        });
+    }
+    res
 }
 
 fn run_one(conn: &mut rusqlite::Connection, q: String) -> Result<rpc::Response, tonic::Status> {
@@ -240,5 +276,71 @@ impl Display for RowsFormatter {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::namespace::fence::command::{FenceCommand, FenceRequest};
+    use crate::namespace::fence::drain::tests::{fence_outcome, raw, Source, LONG, OP};
+    use crate::namespace::fence::outcome::FenceOutcome;
+
+    fn error(resp: &rpc::Response) -> &str {
+        match &resp.resp {
+            Some(Resp::Error(e)) => &e.error,
+            other => panic!("expected an error response, got {other:?}"),
+        }
+    }
+
+    /// The shell runs raw SQL, so it checks the read gate per query: reads are served while
+    /// the source is only write-fenced (writes are refused by the WAL gate), and refused once
+    /// its reads are fenced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_shell_read_denied() {
+        let s = Source::new().await;
+        raw(&s.conn().await, "insert into t values (1)")
+            .await
+            .unwrap();
+        let acquired = s.execute(s.acquire(OP, 1, LONG)).await.unwrap();
+        assert_eq!(fence_outcome(&acquired), FenceOutcome::Applied);
+
+        let conn = s.conn().await;
+        let rows = conn
+            .with_raw(|c| run_admitted(&s.fence, c, "select count(*) from t".into()))
+            .unwrap();
+        assert!(matches!(rows.resp, Some(Resp::Rows(ref r)) if r.rows.len() == 1));
+        let write = conn
+            .with_raw(|c| run_admitted(&s.fence, c, "insert into t values (2)".into()))
+            .unwrap();
+        assert!(error(&write).contains("authoriz"), "{}", error(&write));
+
+        let gate = s.fence.gate();
+        let fenced = s
+            .execute(FenceRequest {
+                namespace: "ns".into(),
+                operation_id: OP,
+                command_id: Uuid::from_u128(2),
+                expected_state: gate.state(),
+                expected_revision: gate.revision(),
+                command: FenceCommand::SetSourceReadFence {
+                    drain_policy: Some(LONG),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(fence_outcome(&fenced), FenceOutcome::Applied);
+
+        let refused = conn
+            .with_raw(|c| run_admitted(&s.fence, c, "select count(*) from t".into()))
+            .unwrap();
+        assert!(
+            error(&refused).starts_with("MIGRATION_READ_FENCED"),
+            "{}",
+            error(&refused)
+        );
+        assert_eq!(s.fence.read_lease_counts().total(), 0);
     }
 }

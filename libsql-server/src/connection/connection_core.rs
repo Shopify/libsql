@@ -11,7 +11,8 @@ use crate::connection::legacy::open_conn_active_checkpoint;
 use crate::error::Error;
 use crate::metrics::{PROGRAM_EXEC_COUNT, QUERY_CANCELED, VACUUM_COUNT, WAL_CHECKPOINT_COUNT};
 use crate::namespace::broadcasters::BroadcasterHandle;
-use crate::namespace::fence::controller::FenceConnState;
+use crate::namespace::fence::controller::{FenceConnState, LeaseKind};
+use crate::namespace::fence::outcome::{FenceError, FenceOutcome};
 use crate::namespace::fence::state::OperationClass;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::ResolveNamespacePathFn;
@@ -102,6 +103,8 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         );
 
         let canceled = Arc::new(AtomicBool::new(false));
+        // The read drain cancels a running program at its deadline through the same flag.
+        fence.set_cancel_flag(canceled.clone());
 
         conn.progress_handler(100, {
             let canceled = canceled.clone();
@@ -218,6 +221,22 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         // The program is admitted under the gate's current write generation; a write
         // transaction it opens must start under the same one (section 8.1).
         fence.begin_program();
+        // ...and admitted for reading, holding a read lease for as long as it runs, including
+        // while a cursor is still producing rows (section 9). A connection left idle in a
+        // transaction held no lease; its next program is refused here and its transaction is
+        // rolled back.
+        let read_lease = {
+            let lock = this.lock();
+            match fence.begin_read_program(|| attached_schemas(lock.raw())) {
+                Ok(lease) => lease,
+                Err(e) => {
+                    if !lock.conn.is_autocommit() {
+                        lock.rollback();
+                    }
+                    return Err(Error::NamespaceFence(e));
+                }
+            }
+        };
 
         builder.init(&this.lock().builder_config)?;
         let mut vm = Vm::new(
@@ -272,14 +291,38 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
             vm.step(&conn.raw())?;
         }
 
+        if read_lease.cancelled_by_fence() {
+            // The read drain reached its deadline and interrupted the program: report the fence,
+            // not the interruption, and leave no transaction behind.
+            let lock = this.lock();
+            if !lock.conn.is_autocommit() {
+                lock.rollback();
+            }
+            return Err(Error::NamespaceFence(FenceError::new(
+                FenceOutcome::MigrationReadFenced,
+                "the program was cancelled by the namespace read fence",
+            )));
+        }
+
         {
             let lock = this.lock();
             let is_autocommit = lock.conn.is_autocommit();
             let current_fno = (lock.get_current_frame_no)();
             vm.builder().finish(current_fno, is_autocommit)?;
         }
+        drop(read_lease);
 
         Ok(vm.into_builder())
+    }
+
+    pub(super) fn describe_admitted(&self, sql: &str) -> crate::Result<DescribeResponse> {
+        // Describing prepares the statement, which reads the schema: it is a read.
+        let _lease = self.fence.controller().acquire_read_lease(
+            self.fence.read_class(),
+            LeaseKind::Sql,
+            || (),
+        )?;
+        self.describe(sql)
     }
 
     fn rollback(&self) {
@@ -423,6 +466,28 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         self.conn.commit_hook(commit_fn);
         self.conn.rollback_hook(rollback_fn);
     }
+}
+
+/// The schema aliases attached on `conn` (other than `main` and `temp`).
+/// `None` when they cannot be listed.
+fn attached_schemas<W: Wal>(conn: &libsql_sys::Connection<W>) -> Option<Vec<String>> {
+    let mut aliases = Vec::new();
+    let result = conn.prepare("PRAGMA database_list").and_then(|mut stmt| {
+        let mut rows = stmt.query(())?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name != "main" && name != "temp" {
+                aliases.push(name);
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        // Keep every recorded attachment: over-leasing is safe, missing one is not.
+        tracing::warn!("could not list attached schemas: {e}");
+        return None;
+    }
+    Some(aliases)
 }
 
 #[cfg(test)]

@@ -27,6 +27,10 @@ pub enum HookPoint {
     AfterInstallingGate,
     /// Under the transition lock, immediately before the metastore transaction runs.
     BeforeMetastoreCommit,
+    /// The in-memory read-closing gate of `SetSourceReadFence` has been published.
+    AfterClosingReads,
+    /// The read drain's deadline passed; the leases still held are about to be cancelled.
+    BeforeReadLeaseCancel,
     /// The metastore transaction returned a committed result.
     AfterMetastoreCommit,
     /// The committed result is about to be published to the gate.

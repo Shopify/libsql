@@ -438,7 +438,7 @@ where
         DESCRIBE_COUNT.increment(1);
         check_describe_auth(ctx)?;
         let conn = self.inner.clone();
-        let res = tokio::task::spawn_blocking(move || conn.lock().describe(&sql))
+        let res = tokio::task::spawn_blocking(move || conn.lock().describe_admitted(&sql))
             .await
             .unwrap();
 

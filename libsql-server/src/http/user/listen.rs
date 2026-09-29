@@ -1,6 +1,9 @@
 use crate::broadcaster::BroadcastMsg;
 use crate::error::Error;
 use crate::metrics::{LISTEN_EVENTS_DROPPED, LISTEN_EVENTS_SENT};
+use crate::namespace::fence::controller::{FenceController, GateSnapshot};
+use crate::namespace::fence::outcome::FenceError;
+use crate::namespace::fence::state::OperationClass;
 use crate::{
     auth::Authenticated,
     namespace::{NamespaceName, NamespaceStore},
@@ -18,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use std::boxed::Box;
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::db_factory::namespace_from_headers;
@@ -93,11 +98,19 @@ pub(super) async fn handle_listen(
         return Ok(ListenResponse::Redirect(Redirect::temporary(&url)));
     }
 
+    // Change notifications are a read of the namespace: refused where reads are denied, and
+    // ended when the namespace's reads are fenced (`docs/NAMESPACE_FENCE.md` section 9).
+    let fence = state.namespaces.fence_gate(&namespace).await?;
+    if let Some(fence) = &fence {
+        fence.permits(OperationClass::NormalRead)?;
+    }
+
     let stream = sse_stream(
         state.namespaces.clone(),
         namespace,
         query.table.clone(),
         query.action.clone(),
+        fence,
     )
     .await;
 
@@ -115,9 +128,10 @@ async fn sse_stream(
     namespace: NamespaceName,
     table: String,
     actions: Option<Vec<Action>>,
+    fence: Option<Arc<FenceController>>,
 ) -> SseStream {
     Box::pin(
-        listen_stream(store, namespace, table, actions)
+        listen_stream(store, namespace, table, actions, fence)
             .await
             .map(|result| {
                 Ok(match result {
@@ -136,12 +150,19 @@ async fn listen_stream(
     namespace: NamespaceName,
     table: String,
     actions: Option<Vec<Action>>,
+    fence: Option<Arc<FenceController>>,
 ) -> impl Stream<Item = crate::Result<AggregatorEvent>> {
     async_stream::try_stream! {
         let _sub = Subscription::new(store.clone(), namespace.clone(), table.clone());
         let mut stream = store.subscribe(namespace.clone(), table.clone());
+        let mut gate = fence.as_ref().map(|fence| fence.subscribe());
 
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                item = stream.next() => Ok(item),
+                denied = read_denied(&mut gate) => Err(Error::NamespaceFence(denied)),
+            };
+            let Some(item) = item? else { break };
             match item {
                 Ok(msg) => if filter_actions(&msg, &actions) {
                     LISTEN_EVENTS_SENT.increment(1);
@@ -152,6 +173,21 @@ async fn listen_stream(
                     yield AggregatorEvent::Error(LAGGED_MSG);
                 },
             }
+        }
+    }
+}
+
+/// Resolves once the gate denies normal reads, with the denial; never without a gate.
+async fn read_denied(gate: &mut Option<watch::Receiver<GateSnapshot>>) -> FenceError {
+    let Some(gate) = gate else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Err(e) = gate.borrow_and_update().permits(OperationClass::NormalRead) {
+            return e;
+        }
+        if gate.changed().await.is_err() {
+            return std::future::pending().await;
         }
     }
 }
