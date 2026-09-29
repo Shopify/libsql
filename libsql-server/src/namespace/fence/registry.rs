@@ -66,13 +66,13 @@ impl FenceRegistry {
         self.controllers.lock().remove(namespace)
     }
 
-    /// Refuse a namespace whose fence state is `UNKNOWN_UNAVAILABLE`, before any work is done
-    /// to serve it.
+    /// Refuse a namespace whose fence state is `UNKNOWN_UNAVAILABLE`, or that is being created
+    /// as a quarantined target, before any work is done to serve it.
     pub fn check_available(&self, namespace: &NamespaceName) -> Result<(), FenceError> {
         match self.get(namespace) {
             Some(controller) => {
                 let gate = controller.gate();
-                if gate.is_unavailable() {
+                if gate.is_unavailable() || gate.is_creating_target() {
                     gate.permits(OperationClass::NormalRead)
                 } else {
                     Ok(())
