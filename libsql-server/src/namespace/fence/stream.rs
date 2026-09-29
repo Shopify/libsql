@@ -221,6 +221,7 @@ pub fn fence_status(error: FenceError) -> tonic::Status {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use futures::stream::BoxStream;
     use futures::{Stream, StreamExt};
     use libsql_replication::rpc::replication::replication_log_server::ReplicationLog;
     use libsql_replication::rpc::replication::{
@@ -513,19 +514,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        tokio::time::timeout(PROMPT, async {
-            // The snapshot is written by the compactor's own thread.
-            while s.logger.get_snapshot_file(1).await.unwrap().is_none() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the snapshot was never written");
         let acquired = s.execute(s.acquire(OP, 1, LONG)).await.unwrap();
         assert_eq!(fence_outcome(&acquired), FenceOutcome::Applied);
 
         let r = Replication::new(&s).await;
-        let stream = r.service.snapshot(r.offset(1)).await.unwrap().into_inner();
+        let stream = open_snapshot_stream(&s, &r).await;
         assert_eq!(s.fence.read_lease_counts().replication, 1);
 
         let fenced = tokio::time::timeout(PROMPT, s.execute(read_fence(&s, 2, LONG)))
@@ -538,6 +531,41 @@ mod tests {
         let mut stream = stream;
         assert_read_fenced_status(&next_frame(&mut stream).await.unwrap().unwrap_err());
         assert!(next_frame(&mut stream).await.is_none());
+    }
+
+    /// Opens a `snapshot` stream from frame 1 once the compactor has written a snapshot.
+    ///
+    /// The snapshot is written, and possibly merged with the previous one, by the compactor's
+    /// own tasks, concurrently with this call. The server looks a snapshot up by listing the
+    /// snapshot directory and then opening the file it chose, so while the directory does not
+    /// exist yet, or while a merge removes the files it replaced, the call can fail with
+    /// "snapshot not found" or with the `NotFound` of the vanished file. Those two failures,
+    /// and only those, mean "not yet": any other status (a fence refusal in particular) fails
+    /// the test. A stream that was opened holds its file open, so a later merge cannot affect it.
+    async fn open_snapshot_stream(
+        s: &Source,
+        r: &Replication,
+    ) -> BoxStream<'static, Result<Frame, tonic::Status>> {
+        tokio::time::timeout(PROMPT, async {
+            loop {
+                match r.service.snapshot(r.offset(1)).await {
+                    Ok(stream) => break stream.into_inner(),
+                    Err(status) => {
+                        let not_yet = match status.code() {
+                            tonic::Code::Unavailable => status.message() == "snapshot not found",
+                            tonic::Code::Internal => status.message().contains("os error 2"),
+                            _ => false,
+                        };
+                        assert!(not_yet, "unexpected snapshot status: {status:?}");
+                        assert_eq!(s.fence.read_lease_counts().total(), 0);
+                        // A polling interval, not evidence: the loop ends on the condition.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the snapshot was never written")
     }
 
     /// While reads are fenced every replication call is refused at its start with the typed
