@@ -29,9 +29,9 @@ use super::fence::import::{self, ImportSession};
 use super::fence::outcome::FenceOutcome;
 use super::fence::record::ServerIdentity;
 use super::fence::registry::FenceRegistry;
-use super::fence::state::Role;
+use super::fence::state::{FenceState, Role};
 use super::fence::store::StoredFence;
-use super::fence::target::{self, CreateTargetRequest};
+use super::fence::target::{self, CreateTargetRequest, ValidationSession};
 use super::meta_store::{FenceCommit, FenceContext, MetaStore, MetaStoreHandle};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
@@ -573,13 +573,58 @@ impl NamespaceStore {
             }
             _ => self.inner.fences.controller(&request.namespace),
         };
-        controller
-            .execute(
-                &self.inner.metadata,
-                request,
-                FenceContext::now(server, None),
-            )
-            .await
+        let mut ctx = FenceContext::now(server, None);
+        // A new validation receipt records what this server observes of the sealed target. Do
+        // this only when the live gate exactly matches the request: an exact replay after the
+        // revision or state has advanced must reach the metastore's replay check without first
+        // trying to issue a now-invalid validation capability.
+        if matches!(
+            &request.command,
+            FenceCommand::RecordTargetValidation { .. }
+        ) {
+            let needs_snapshot = {
+                let gate = controller.gate();
+                gate.state() == FenceState::TargetValidating
+                    && gate.operation_id() == Some(request.operation_id)
+                    && gate.revision() == request.expected_revision
+            };
+            if needs_snapshot && !self.validation_command_recorded(&request).await? {
+                let snapshot = async {
+                    let mut session = self
+                        .open_validation_session(
+                            request.namespace.clone(),
+                            request.operation_id,
+                            request.expected_revision,
+                        )
+                        .await?;
+                    session.snapshot().await
+                }
+                .await;
+                match snapshot {
+                    Ok(snapshot) => ctx.validation_snapshot = Some(snapshot),
+                    // A concurrent copy of this command can commit between the gate check and
+                    // the capability call. Once its receipt exists, let execute take the
+                    // transition lock and perform the authoritative replay/fingerprint check.
+                    Err(_) if self.validation_command_recorded(&request).await? => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        controller.execute(&self.inner.metadata, request, ctx).await
+    }
+
+    async fn validation_command_recorded(&self, request: &FenceRequest) -> crate::Result<bool> {
+        let operation_id = request.operation_id.to_string();
+        let command_id = request.command_id.to_string();
+        let inspected = self
+            .inner
+            .metadata
+            .inspect_fence(request.namespace.clone())
+            .await?;
+        Ok(inspected
+            .receipts
+            .iter()
+            .any(|stored| stored.operation_id == operation_id && stored.command_id == command_id))
     }
 
     /// `CreateTargetQuarantined`, atomic with namespace creation (`docs/NAMESPACE_FENCE.md`
@@ -725,6 +770,36 @@ impl NamespaceStore {
                 Err(e)
             }
         }
+    }
+
+    /// Issue a read-only validation capability to `operation_id` and open a `query_only`
+    /// connection under it (`docs/NAMESPACE_FENCE.md` sections 10.3 and 11). Valid only while
+    /// the target is `TARGET_VALIDATING` or `TARGET_WRITE_FENCED`, owned by the operation at
+    /// `expected_revision`; the target is loaded if it is not.
+    pub async fn open_validation_session(
+        &self,
+        namespace: NamespaceName,
+        operation_id: uuid::Uuid,
+        expected_revision: u64,
+    ) -> crate::Result<ValidationSession> {
+        let (controller, maker) = self.primary_maker(&namespace).await?;
+        let capability = controller.issue_capability(
+            CapabilityPurpose::Validate,
+            operation_id,
+            expected_revision,
+        )?;
+        let conn = match maker
+            .inner()
+            .make_capability_connection(capability.clone())
+            .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                controller.revoke_capability(capability.id());
+                return Err(e);
+            }
+        };
+        ValidationSession::new(capability, controller, conn).await
     }
 
     /// The fence controller and connection maker of the primary `namespace`, loading it.
