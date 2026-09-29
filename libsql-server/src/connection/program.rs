@@ -7,6 +7,7 @@ use rusqlite::StatementStatus;
 use crate::auth::Permission;
 use crate::error::Error;
 use crate::metrics::{READ_QUERY_COUNT, WRITE_QUERY_COUNT};
+use crate::namespace::fence::controller::FenceConnState;
 use crate::namespace::{NamespaceName, ResolveNamespacePathFn};
 use crate::query::Query;
 use crate::query_analysis::StmtKind;
@@ -104,6 +105,7 @@ pub struct Vm<'a, B, F, S> {
     should_block: F,
     update_stats: S,
     resolve_attach_path: ResolveNamespacePathFn,
+    fence: Option<Arc<FenceConnState>>,
 }
 
 impl<'a, B, F, S> Vm<'a, B, F, S>
@@ -127,7 +129,17 @@ where
             should_block,
             update_stats,
             resolve_attach_path,
+            fence: None,
         }
+    }
+
+    /// Check the namespace fence on this connection: a statement that can write is refused
+    /// before it runs while the live gate denies the connection's class, and a refusal by the
+    /// WAL gate is reported as the fence error rather than as `SQLITE_AUTH`
+    /// (`docs/NAMESPACE_FENCE.md` section 8.1).
+    pub fn with_fence(mut self, fence: Arc<FenceConnState>) -> Self {
+        self.fence = Some(fence);
+        self
     }
 
     #[inline]
@@ -164,7 +176,9 @@ where
                 // builder error interrupt the execution of query. we should exit immediately.
                 Err(e @ Error::BuilderError(_)) => return Err(e),
                 Err(mut e) => {
-                    if let Error::RusqliteError(err) = e {
+                    if let Some(denial) = self.take_fence_denial(&e) {
+                        e = Error::NamespaceFence(denial);
+                    } else if let Error::RusqliteError(err) = e {
                         let extended_code =
                             unsafe { rusqlite::ffi::sqlite3_extended_errcode(conn.handle()) };
 
@@ -200,12 +214,39 @@ where
         Ok(query)
     }
 
+    /// The fence denial behind `e`, when `e` is the `SQLITE_AUTH` the WAL gate returns. A plain
+    /// `SQLITE_AUTH` (from an authorizer) is left alone, and so is an empty denial slot.
+    fn take_fence_denial(&self, e: &Error) -> Option<crate::namespace::fence::outcome::FenceError> {
+        let fence = self.fence.as_ref()?;
+        match e {
+            Error::RusqliteError(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::AuthorizationForStatementDenied,
+                    ..
+                },
+                _,
+            )) => fence.take_denial(),
+            _ => None,
+        }
+    }
+
     fn execute_query(&mut self, conn: &rusqlite::Connection) -> crate::Result<(u64, Option<i64>)> {
         tracing::debug!("executing query: {}", self.current_step().query.stmt.stmt);
 
         increment_counter!("libsql_server_libsql_query_execute");
 
         let start = Instant::now();
+        // Early fence admission for statements that can write. The WAL gate is authoritative
+        // and catches everything this misses (a misclassified statement, a read-to-write
+        // upgrade, a gate change while the statement runs).
+        if let Some(fence) = &self.fence {
+            if matches!(
+                self.current_step().query.stmt.kind,
+                StmtKind::Write | StmtKind::DDL
+            ) {
+                fence.controller().permits(fence.class())?;
+            }
+        }
         let (blocked, reason) = (self.should_block)(&self.current_step().query.stmt.kind);
         if blocked {
             return Err(Error::Blocked(reason));
