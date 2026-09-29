@@ -15,6 +15,7 @@ use rusqlite::ErrorCode;
 use super::connection_core::CoreConnection;
 use super::TXN_TIMEOUT;
 use crate::namespace::fence::controller::FenceConnState;
+use crate::namespace::fence::state::OperationClass;
 
 pub type ConnId = u64;
 pub type InnerWalManager = Sqlite3WalManager;
@@ -25,9 +26,15 @@ pub type ManagedConnectionWal = WrappedWal<ManagedConnectionWalWrapper, InnerWal
 #[derive(Copy, Clone, Debug)]
 struct Slot {
     id: ConnId,
+    /// The operation class the slot was requested for (`docs/NAMESPACE_FENCE.md` section 8.2).
+    class: OperationClass,
     started_at: Instant,
     state: SlotState,
 }
+
+/// An entry of the write queue: the waiting connection, the class it is waiting for, and how to
+/// wake it.
+type QueueEntry = (ConnId, OperationClass, Unparker);
 
 #[derive(Clone)]
 struct Abort(Arc<dyn Fn() + Send + Sync + 'static>);
@@ -36,10 +43,13 @@ impl Abort {
     fn from_conn<T: Wal + Send + 'static>(conn: &Arc<Mutex<CoreConnection<T>>>) -> Self {
         let conn = Arc::downgrade(conn);
         Self(Arc::new(move || {
-            conn.upgrade()
-                .expect("connection still owns the slot, so it must exist")
-                .lock()
-                .force_rollback();
+            // The connection can be closing concurrently: a drain aborting the active writer
+            // races with the client going away. A connection that is gone has already released
+            // its slot (or is about to, from `close`), so there is nothing left to roll back.
+            match conn.upgrade() {
+                Some(conn) => conn.lock().force_rollback(),
+                None => tracing::debug!("connection closed before it could be rolled back"),
+            }
         }))
     }
 
@@ -61,6 +71,89 @@ impl ConnectionManager {
     ) {
         let abort = Abort::from_conn(conn);
         self.inner.abort_handle.lock().insert(id, abort);
+    }
+
+    /// The connection holding the write slot, and the class it holds it for. A slot that has
+    /// been handed to a queued connection that has not taken it yet counts as held.
+    // Used by the positive source write drain (section 8.3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn active_writer(&self) -> Option<(ConnId, OperationClass)> {
+        self.inner.current.lock().map(|slot| (slot.id, slot.class))
+    }
+
+    /// Notified (with `notify_waiters`) every time the write slot is released or handed on. A
+    /// waiter registers interest (`Notified::enable`) before it checks
+    /// [`active_writer`](Self::active_writer), so a release in between is not missed.
+    // Used by the positive source write drain (section 8.3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn released(&self) -> &tokio::sync::Notify {
+        &self.inner.released
+    }
+
+    /// Roll back the transaction of the connection holding the write slot, using the rollback
+    /// handle it registered. Returns the connection that was asked to roll back, if any. The
+    /// slot is released by the rollback itself (`end_read_txn`/`end_write_txn`), which notifies
+    /// [`released`](Self::released); a connection closing at the same time is tolerated.
+    // Used by the positive source write drain (section 8.3).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn abort_active(&self) -> Option<ConnId> {
+        let id = self.active_writer()?.0;
+        let handle = self.inner.abort_handle.lock().get(&id).cloned();
+        match handle {
+            Some(handle) => {
+                tracing::debug!("aborting the active writer {id}");
+                handle.abort();
+                Some(id)
+            }
+            None => {
+                tracing::debug!("the active writer {id} is closing; nothing to abort");
+                None
+            }
+        }
+    }
+
+    /// A waker for the fence controller, which calls it after every change of the write
+    /// generation (`docs/NAMESPACE_FENCE.md` section 8.2): every connection waiting in the write
+    /// queue is woken and re-checks the fence. One the gate denies returns the typed denial
+    /// instead of waiting for the slot; one it admits (a checkpoint) queues again. The waker
+    /// holds the manager weakly and reports `false` once it is gone, so the controller can
+    /// forget it.
+    pub(crate) fn fence_waker(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
+        let inner = Arc::downgrade(&self.inner);
+        Box::new(move || match inner.upgrade() {
+            Some(inner) => {
+                wake_queue_for_fence(&inner);
+                true
+            }
+            None => false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_writers(&self) -> usize {
+        self.inner.write_queue.len()
+    }
+}
+
+fn wake_queue_for_fence(inner: &ConnectionManagerInner) {
+    // Under the `current` lock, so that a waiter either queued before this (and is stolen and
+    // woken here) or observes the new token when it takes the lock.
+    let _current = inner.current.lock();
+    inner.fence_token.fetch_add(1, Ordering::SeqCst);
+    let mut woken = 0;
+    loop {
+        match inner.write_queue.steal() {
+            Steal::Empty => break,
+            Steal::Success((id, _, unparker)) => {
+                tracing::debug!("fence changed, waking queued connection id={id}");
+                unparker.unpark();
+                woken += 1;
+            }
+            Steal::Retry => (),
+        }
+    }
+    if woken > 0 {
+        tracing::debug!("fence changed, woke {woken} queued connections");
     }
 }
 
@@ -92,12 +185,17 @@ pub struct ConnectionManagerInner {
     abort_handle: Mutex<HashMap<ConnId, Abort>>,
     /// threads waiting to acquire the lock
     /// todo: limit how many can be push
-    write_queue: crossbeam::deque::Injector<(ConnId, Unparker)>,
+    write_queue: crossbeam::deque::Injector<QueueEntry>,
     txn_timeout_duration: Duration,
     /// the time we are given to acquire a transaction after we were given a slot
     acquire_timeout_duration: Duration,
     next_conn_id: AtomicU64,
     sync_token: AtomicU64,
+    /// Incremented, under the `current` lock, every time the queue is woken for a fence change.
+    /// A waiter that sees it move knows it was taken off the queue.
+    fence_token: AtomicU64,
+    /// Notified whenever the write slot is released or handed on.
+    released: tokio::sync::Notify,
 }
 
 impl Default for ConnectionManagerInner {
@@ -110,6 +208,8 @@ impl Default for ConnectionManagerInner {
             acquire_timeout_duration: Duration::from_millis(15),
             next_conn_id: Default::default(),
             sync_token: AtomicU64::new(0),
+            fence_token: AtomicU64::new(0),
+            released: Default::default(),
         }
     }
 }
@@ -133,13 +233,37 @@ impl ManagedConnectionWalWrapper {
         self.id
     }
 
-    fn acquire(&self) -> libsql_sys::wal::Result<()> {
+    /// Wait for the write slot on behalf of work of `class`. `Maintenance` (checkpoints) is never
+    /// refused by the fence; every other class re-checks the connection's write admission each
+    /// time it takes the `current` lock, so a waiter queued before a fence change leaves the
+    /// queue with the typed denial (`docs/NAMESPACE_FENCE.md` section 8.2).
+    fn acquire(&self, class: OperationClass) -> libsql_sys::wal::Result<()> {
         let parker = Parker::new();
         let mut enqueued = false;
         let enqueued_at = Instant::now();
         let sync_token = self.manager.sync_token.load(Ordering::SeqCst);
+        let mut fence_token = self.manager.fence_token.load(Ordering::SeqCst);
         loop {
             let mut current = self.manager.current.lock();
+            let ours = current.as_ref().map_or(false, |slot| slot.id == self.id);
+            if class != OperationClass::Maintenance && self.fence.admit_write().is_err() {
+                // The denial is in the connection's fence state. If the slot had already been
+                // handed to us, pass it on: we are not going to use it.
+                if ours {
+                    self.hand_off(&mut current);
+                }
+                tracing::debug!("write slot request refused by the namespace fence");
+                return Err(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_AUTH));
+            }
+            let observed = self.manager.fence_token.load(Ordering::SeqCst);
+            if observed != fence_token {
+                fence_token = observed;
+                // A fence change emptied the queue. Unless the slot was handed to us before
+                // that, we are no longer queued and must queue again.
+                if enqueued && !ours {
+                    enqueued = false;
+                }
+            }
             // if current is not currently us, and we havent enqueued yet, then enqueue
             // current can be us in two cases:
             // - in previous iteration, the queue was empty, and we popped ourselves
@@ -194,7 +318,7 @@ impl ManagedConnectionWalWrapper {
             if current.as_mut().map_or(true, |slot| slot.id != self.id) && !enqueued {
                 self.manager
                     .write_queue
-                    .push((self.id, parker.unparker().clone()));
+                    .push((self.id, class, parker.unparker().clone()));
                 enqueued = true;
                 tracing::debug!("enqueued");
             }
@@ -284,6 +408,7 @@ impl ManagedConnectionWalWrapper {
                                         None => {
                                             *current = Some(Slot {
                                                 id: self.id,
+                                                class,
                                                 started_at: Instant::now(),
                                                 state: SlotState::Acquiring,
                                             });
@@ -321,6 +446,7 @@ impl ManagedConnectionWalWrapper {
                     None => {
                         *current = Some(Slot {
                             id: self.id,
+                            class,
                             started_at: Instant::now(),
                             state: SlotState::Acquiring,
                         })
@@ -344,10 +470,11 @@ impl ManagedConnectionWalWrapper {
         };
 
         match next {
-            Some((id, unpaker)) => {
+            Some((id, class, unpaker)) => {
                 tracing::debug!(line = line!(), "unparking id={id}");
                 **current = Some(Slot {
                     id,
+                    class,
                     started_at: Instant::now(),
                     state: SlotState::Notified,
                 });
@@ -369,12 +496,15 @@ impl ManagedConnectionWalWrapper {
         assert_eq!(slot.id, self.id);
 
         tracing::debug!("transaction finished after {:?}", slot.started_at.elapsed());
-        match self.schedule_next(&mut current) {
-            Some(_) => (),
-            None => {
-                *current = None;
-            }
-        }
+        self.hand_off(&mut current);
+    }
+
+    /// Give the (already vacated or ours) slot to the next queued connection, or leave it free,
+    /// and tell drain waiters.
+    fn hand_off(&self, current: &mut MutexGuard<Option<Slot>>) {
+        **current = None;
+        self.schedule_next(current);
+        self.manager.released.notify_waiters();
     }
 }
 
@@ -421,7 +551,7 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
         if self.fence.admit_write().is_err() {
             return Err(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_AUTH));
         }
-        self.acquire()?;
+        self.acquire(self.fence.class())?;
         match wrapped.begin_write_txn() {
             Ok(_) => {
                 tracing::debug!("transaction acquired");
@@ -460,7 +590,7 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
         backfilled: Option<&mut i32>,
     ) -> libsql_sys::wal::Result<()> {
         let before = Instant::now();
-        self.acquire()?;
+        self.acquire(OperationClass::Maintenance)?;
         self.manager.current.lock().as_mut().unwrap().state =
             SlotState::Acquired(SlotType::Checkpoint);
 
@@ -473,11 +603,19 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
         if mode as i32 >= CheckpointMode::Restart as i32 {
             tracing::debug!("forcing queue sync");
             self.manager.sync_token.fetch_add(1, Ordering::SeqCst);
-            let queue_len = self.manager.write_queue.len();
-            for _ in 0..queue_len {
-                let (id, unparker) = self.manager.write_queue.steal().success().unwrap();
-                tracing::debug!("forcing queue sync for id={id}");
-                unparker.unpark();
+            // A fence change can empty the queue concurrently (`wake_queue_for_fence`), so an
+            // entry counted here may already be gone.
+            let mut queue_len = self.manager.write_queue.len();
+            while queue_len > 0 {
+                match self.manager.write_queue.steal() {
+                    Steal::Success((id, _, unparker)) => {
+                        tracing::debug!("forcing queue sync for id={id}");
+                        unparker.unpark();
+                        queue_len -= 1;
+                    }
+                    Steal::Empty => break,
+                    Steal::Retry => (),
+                }
             }
         }
 
@@ -577,6 +715,7 @@ impl WrapWal<InnerWal> for ManagedConnectionWalWrapper {
 mod fence_tests {
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use libsql_sys::wal::wrapper::PassthroughWalWrapper;
     use libsql_sys::wal::Sqlite3WalManager;
@@ -585,6 +724,7 @@ mod fence_tests {
     use tempfile::tempdir;
 
     use crate::connection::connection_core::CoreConnection;
+    use crate::connection::connection_core::VacuumOutcome;
     use crate::connection::legacy::{LegacyConnection, MakeLegacyConnection};
     use crate::connection::program::Program;
     use crate::connection::Connection as _;
@@ -594,7 +734,7 @@ mod fence_tests {
     };
     use crate::namespace::fence::controller::FenceController;
     use crate::namespace::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
-    use crate::namespace::fence::state::FenceState;
+    use crate::namespace::fence::state::{FenceState, OperationClass};
     use crate::namespace::meta_store::{MetaStore, MetaStoreHandle};
     use crate::query_result_builder::test::{StepResult, TestBuilder};
     use crate::query_result_builder::QueryResultBuilder as _;
@@ -611,6 +751,13 @@ mod fence_tests {
 
     impl Harness {
         async fn new() -> Self {
+            Self::with_txn_timeout(None).await
+        }
+
+        /// A harness whose connections steal the write slot from a transaction only after
+        /// `txn_timeout` (the test default is 100 ms). Queue tests hold a writer open far longer
+        /// than that and must not have it stolen.
+        async fn with_txn_timeout(txn_timeout: Option<Duration>) -> Self {
             let dir = tempdir().unwrap();
             let meta_dir = dir.path().join("meta");
             let db_dir = dir.path().join("db");
@@ -619,7 +766,13 @@ mod fence_tests {
             let meta = open_metastore(&meta_dir).await;
             create_namespace(&meta, "ns").await;
             let controller = FenceController::unfenced("ns".into());
-            let maker = make_connections(&db_dir, controller.clone()).await;
+            let config = MetaStoreHandle::load(&db_dir).unwrap();
+            if txn_timeout.is_some() {
+                let mut c = (*config.get()).clone();
+                c.txn_timeout = txn_timeout;
+                config.store(c).await.unwrap();
+            }
+            let maker = make_connections(&db_dir, config, controller.clone()).await;
             let this = Self {
                 _dir: dir,
                 meta,
@@ -657,6 +810,7 @@ mod fence_tests {
 
     async fn make_connections(
         path: &Path,
+        config: MetaStoreHandle,
         fence: Arc<FenceController>,
     ) -> MakeLegacyConnection<PassthroughWalWrapper> {
         MakeLegacyConnection::new(
@@ -664,7 +818,7 @@ mod fence_tests {
             PassthroughWalWrapper,
             Default::default(),
             Default::default(),
-            MetaStoreHandle::load(path).unwrap(),
+            config,
             Arc::new([]),
             100000000,
             100000000,
@@ -938,5 +1092,228 @@ mod fence_tests {
             other => panic!("expected the authorizer's error, got {other:?}"),
         }
         assert!(conn.fence.take_denial().is_none());
+    }
+
+    /// Long enough that no test transaction is ever stolen by the manager's own timeout.
+    const LONG_TXN: Option<Duration> = Some(Duration::from_secs(600));
+    /// Upper bound for a test waiting on something that happens promptly; reaching it is a
+    /// failure, never the expected path.
+    const PROMPT: Duration = Duration::from_secs(30);
+
+    /// Wait until `n` connections are parked in the write queue. This polls a condition; it
+    /// does not use elapsed time as evidence of anything.
+    async fn until_queued(h: &Harness, n: usize) {
+        tokio::time::timeout(PROMPT, async {
+            while h.maker.connection_manager().queued_writers() != n {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{n} connections never queued for the write slot"));
+    }
+
+    fn freelist(conn: &Conn) -> i64 {
+        conn.with_raw(|c| c.query_row("pragma freelist_count", (), |r| r.get(0)))
+            .unwrap()
+    }
+
+    /// A writer parked in the write queue behind an open transaction leaves the queue with the
+    /// typed denial as soon as the fence changes the write generation: it neither waits for the
+    /// slot nor, once the holder commits, writes. The holder itself, admitted before the fence,
+    /// keeps the slot and commits, which is what the positive drain waits for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fence_rejects_queued_writer() {
+        let h = Harness::with_txn_timeout(LONG_TXN).await;
+        let manager = h.maker.connection_manager().clone();
+        let holder = h.conn().await;
+        assert_ok(&run(&holder, &["begin immediate", "insert into t values (1)"]).await);
+        let (_, class) = manager
+            .active_writer()
+            .expect("the holder has the write slot");
+        assert_eq!(class, OperationClass::NormalWrite);
+
+        let queued = h.conn().await;
+        let waiting = tokio::spawn({
+            let queued = queued.clone();
+            async move { run(&queued, &["insert into t values (2)"]).await }
+        });
+        until_queued(&h, 1).await;
+        assert!(!waiting.is_finished());
+
+        h.fence().await;
+        let steps = tokio::time::timeout(PROMPT, waiting)
+            .await
+            .expect("the queued writer was not woken by the fence")
+            .unwrap();
+        assert_eq!(
+            fence_error(&steps[0]).outcome(),
+            FenceOutcome::MigrationWriteFenced
+        );
+        assert_eq!(manager.queued_writers(), 0);
+        assert_eq!(
+            manager.active_writer().map(|(_, c)| c),
+            Some(OperationClass::NormalWrite)
+        );
+
+        assert_ok(&run(&holder, &["commit"]).await);
+        assert_eq!(manager.active_writer(), None);
+        assert_eq!(count(&holder).await, 1);
+        // The refused connection stays refused while the fence holds.
+        let steps = run(&queued, &["insert into t values (3)"]).await;
+        assert_eq!(
+            fence_error(&steps[0]).outcome(),
+            FenceOutcome::MigrationWriteFenced
+        );
+        assert_eq!(count(&holder).await, 1);
+    }
+
+    /// A checkpoint is maintenance: one queued behind an open transaction when the fence
+    /// changes queues again instead of being refused, and runs once the holder commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_checkpoint_survives_fence_wake() {
+        let h = Harness::with_txn_timeout(LONG_TXN).await;
+        let manager = h.maker.connection_manager().clone();
+        let holder = h.conn().await;
+        assert_ok(&run(&holder, &["begin immediate", "insert into t values (1)"]).await);
+
+        let checkpointer = h.conn().await;
+        let checkpoint = tokio::task::spawn_blocking({
+            let inner = checkpointer.inner.clone();
+            move || inner.lock().checkpoint()
+        });
+        until_queued(&h, 1).await;
+
+        h.fence().await;
+        // Woken by both transitions, it put itself back in the queue.
+        until_queued(&h, 1).await;
+        assert!(!checkpoint.is_finished());
+
+        assert_ok(&run(&holder, &["commit"]).await);
+        tokio::time::timeout(PROMPT, checkpoint)
+            .await
+            .expect("the checkpoint never got the slot")
+            .unwrap()
+            .unwrap();
+        assert_eq!(manager.active_writer(), None);
+        assert_eq!(count(&holder).await, 1);
+    }
+
+    /// `TRUNCATE` checkpoints run in every fence state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoint_allowed_while_fenced() {
+        let h = Harness::new().await;
+        let conn = h.conn().await;
+        assert_ok(
+            &run(
+                &conn,
+                &["insert into t values (1)", "insert into t values (2)"],
+            )
+            .await,
+        );
+        h.fence().await;
+
+        conn.checkpoint().await.unwrap();
+        let (busy, log, checkpointed): (i64, i64, i64) = conn
+            .with_raw(|c| {
+                c.query_row("pragma wal_checkpoint(truncate)", (), |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+            })
+            .unwrap();
+        assert_eq!((busy, log, checkpointed), (0, 0, 0));
+        assert_eq!(count(&conn).await, 2);
+    }
+
+    /// `VACUUM` is not maintenance. While normal writes are denied it is skipped, and reported as
+    /// skipped rather than failed; once writes are admitted again it runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vacuum_skipped_while_fenced() {
+        let h = Harness::new().await;
+        let conn = h.conn().await;
+        assert_ok(
+            &run(
+                &conn,
+                &[
+                    "insert into t select randomblob(4096) from \
+                     (with recursive n(i) as (select 1 union all select i + 1 from n where i < 200) \
+                     select i from n)",
+                    "delete from t",
+                ],
+            )
+            .await,
+        );
+        let free = freelist(&conn);
+        assert!(free > 100, "freelist {free}");
+
+        h.fence().await;
+        let outcome = conn.inner.lock().vacuum_if_needed_above(0).unwrap();
+        assert_eq!(outcome, VacuumOutcome::Fenced);
+        assert_eq!(freelist(&conn), free);
+        // The periodic path reports success, not a failed vacuum.
+        conn.vacuum_if_needed().await.unwrap();
+        assert_eq!(freelist(&conn), free);
+
+        h.release().await;
+        let outcome = conn.inner.lock().vacuum_if_needed_above(0).unwrap();
+        assert_eq!(outcome, VacuumOutcome::Vacuumed);
+        assert_eq!(freelist(&conn), 0);
+    }
+
+    /// `abort_active` rolls back the connection holding the write slot, which releases it and
+    /// notifies drain waiters; a rollback handle whose connection has already closed does
+    /// nothing instead of panicking, and there is nothing to abort without a writer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abort_active_tolerates_closed_connection() {
+        let h = Harness::with_txn_timeout(LONG_TXN).await;
+        let manager = h.maker.connection_manager().clone();
+        assert_eq!(manager.abort_active(), None);
+
+        let holder = h.conn().await;
+        assert_ok(&run(&holder, &["begin immediate", "insert into t values (1)"]).await);
+        let (id, _) = manager.active_writer().unwrap();
+        let released = manager.released().notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        assert_eq!(manager.abort_active(), Some(id));
+        tokio::time::timeout(PROMPT, released)
+            .await
+            .expect("the rollback did not notify drain waiters");
+        assert_eq!(manager.active_writer(), None);
+        assert_eq!(count(&h.conn().await).await, 0);
+
+        // A handle taken while its connection was open, used after the connection closed.
+        let closing = h.conn().await;
+        let closing_id = *manager.inner.abort_handle.lock().keys().max().unwrap();
+        let handle = manager.inner.abort_handle.lock()[&closing_id].clone();
+        drop(closing);
+        assert!(!manager.inner.abort_handle.lock().contains_key(&closing_id));
+        handle.abort();
+        assert_eq!(manager.abort_active(), None);
+    }
+
+    /// Committing releases the slot and wakes a waiter that registered before it looked at the
+    /// active writer, which is the drain's wait (section 8.3 step 5).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_notifies_drain_waiters() {
+        let h = Harness::with_txn_timeout(LONG_TXN).await;
+        let manager = h.maker.connection_manager().clone();
+        let holder = h.conn().await;
+        assert_ok(&run(&holder, &["begin immediate", "insert into t values (1)"]).await);
+        h.fence().await;
+
+        let released = manager.released().notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        assert!(manager.active_writer().is_some());
+        let commit = tokio::spawn({
+            let holder = holder.clone();
+            async move { run(&holder, &["commit"]).await }
+        });
+        tokio::time::timeout(PROMPT, released)
+            .await
+            .expect("the commit did not notify drain waiters");
+        assert_eq!(manager.active_writer(), None);
+        assert_ok(&commit.await.unwrap());
+        assert_eq!(count(&holder).await, 1);
     }
 }

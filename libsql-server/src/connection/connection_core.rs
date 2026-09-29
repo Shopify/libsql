@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::metrics::{PROGRAM_EXEC_COUNT, QUERY_CANCELED, VACUUM_COUNT, WAL_CHECKPOINT_COUNT};
 use crate::namespace::broadcasters::BroadcasterHandle;
 use crate::namespace::fence::controller::FenceConnState;
+use crate::namespace::fence::state::OperationClass;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::ResolveNamespacePathFn;
 use crate::query_analysis::StmtKind;
@@ -24,6 +25,15 @@ use super::config::DatabaseConfig;
 use super::program::{DescribeCol, DescribeParam, DescribeResponse, Program, Vm};
 
 pub type GetCurrentFrameNo = Arc<dyn Fn() -> Option<FrameNo> + Send + Sync + 'static>;
+
+/// What [`CoreConnection::vacuum_if_needed_above`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VacuumOutcome {
+    Vacuumed,
+    NotNeeded,
+    /// Skipped because the namespace fence denies normal writes.
+    Fenced,
+}
 
 /// The base connection type, shared between legacy and libsql-wal implementations
 pub(super) struct CoreConnection<W> {
@@ -306,22 +316,45 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
     }
 
     pub(super) fn vacuum_if_needed(&self) -> Result<()> {
+        // NOTICE: don't bother vacuuming if we don't have at least 256MiB of data
+        self.vacuum_if_needed_above(65536).map(|_| ())
+    }
+
+    /// `VACUUM` if the database has at least `min_pages` pages and more than half of them are
+    /// free. `VACUUM` is not maintenance: it takes a write transaction and produces replicated
+    /// frames, so it is skipped whenever the namespace fence denies normal writes
+    /// (`docs/NAMESPACE_FENCE.md` section 7.3), including when the fence closes between the
+    /// check and the `VACUUM` itself.
+    pub(super) fn vacuum_if_needed_above(&self, min_pages: i64) -> Result<VacuumOutcome> {
         self.fence.begin_program();
+        if let Err(e) = self.fence.controller().permits(OperationClass::Vacuum) {
+            tracing::debug!("skipping vacuum: {e}");
+            return Ok(VacuumOutcome::Fenced);
+        }
         let page_count = self
             .conn
             .query_row("PRAGMA page_count", (), |row| row.get::<_, i64>(0))?;
         let freelist_count = self
             .conn
             .query_row("PRAGMA freelist_count", (), |row| row.get::<_, i64>(0))?;
-        // NOTICE: don't bother vacuuming if we don't have at least 256MiB of data
-        if page_count >= 65536 && freelist_count * 2 > page_count {
+        let outcome = if page_count >= min_pages && freelist_count * 2 > page_count {
             tracing::info!("Vacuuming: pages={page_count} freelist={freelist_count}");
-            self.conn.execute("VACUUM", ())?;
+            if let Err(e) = self.conn.execute("VACUUM", ()) {
+                return match self.fence.take_denial() {
+                    Some(denial) => {
+                        tracing::debug!("skipping vacuum: {denial}");
+                        Ok(VacuumOutcome::Fenced)
+                    }
+                    None => Err(e.into()),
+                };
+            }
+            VacuumOutcome::Vacuumed
         } else {
             tracing::trace!("Not vacuuming: pages={page_count} freelist={freelist_count}");
-        }
+            VacuumOutcome::NotNeeded
+        };
         VACUUM_COUNT.increment(1);
-        Ok(())
+        Ok(outcome)
     }
 
     pub(super) fn describe(&self, sql: &str) -> crate::Result<DescribeResponse> {
