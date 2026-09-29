@@ -14,6 +14,7 @@ use crate::connection::Connection as _;
 use crate::database::Database;
 use crate::stats::Stats;
 
+use self::fence::controller::FenceController;
 use self::meta_store::MetaStoreHandle;
 pub use self::name::NamespaceName;
 pub use self::store::NamespaceStore;
@@ -66,6 +67,10 @@ pub struct Namespace {
     stats: Arc<Stats>,
     db_config_store: MetaStoreHandle,
     path: Arc<Path>,
+    /// The namespace's fence controller, from the store's registry. Every connection, and the
+    /// dump and replication services that reach the namespace through the store, read its
+    /// gate.
+    fence: Arc<FenceController>,
 }
 
 impl Namespace {
@@ -96,6 +101,13 @@ impl Namespace {
             tracing::error!("unable to remove .sentinel file: {}", e);
         }
         Ok(())
+    }
+
+    // Read by the protocol layers that consult the gate outside a connection (dump,
+    // replication, lifecycle), which land later in this series.
+    #[allow(dead_code)]
+    pub(crate) fn fence(&self) -> &Arc<FenceController> {
+        &self.fence
     }
 
     pub fn config(&self) -> Arc<DatabaseConfig> {

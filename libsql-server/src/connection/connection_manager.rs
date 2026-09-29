@@ -14,6 +14,7 @@ use rusqlite::ErrorCode;
 
 use super::connection_core::CoreConnection;
 use super::TXN_TIMEOUT;
+use crate::namespace::fence::controller::FenceConnState;
 
 pub type ConnId = u64;
 pub type InnerWalManager = Sqlite3WalManager;
@@ -117,12 +118,18 @@ impl Default for ConnectionManagerInner {
 pub struct ManagedConnectionWalWrapper {
     id: ConnId,
     manager: ConnectionManager,
+    /// The connection's fence state, which `begin_write_txn` checks against the namespace's
+    /// gate (`docs/NAMESPACE_FENCE.md` section 8.1).
+    // Installed here so that no connection exists without it; the check itself lands in the
+    // next commit of this series.
+    #[allow(dead_code)]
+    fence: Arc<FenceConnState>,
 }
 
 impl ManagedConnectionWalWrapper {
-    pub(crate) fn new(manager: ConnectionManager) -> Self {
+    pub(crate) fn new(manager: ConnectionManager, fence: Arc<FenceConnState>) -> Self {
         let id = manager.inner.next_conn_id.fetch_add(1, Ordering::SeqCst);
-        Self { id, manager }
+        Self { id, manager, fence }
     }
 
     pub fn id(&self) -> ConnId {

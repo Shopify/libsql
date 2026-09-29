@@ -13,6 +13,7 @@ use crate::connection::{Connection as _, MakeConnection};
 use crate::database::{Database, PrimaryDatabase};
 use crate::namespace::broadcasters::BroadcasterHandle;
 use crate::namespace::configurator::helpers::make_primary_connection_maker;
+use crate::namespace::fence::controller::FenceController;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{
     Namespace, NamespaceBottomlessDbIdInit, NamespaceName, NamespaceStore, ResetCb,
@@ -53,6 +54,7 @@ impl PrimaryConfigurator {
         db_path: Arc<Path>,
         broadcaster: BroadcasterHandle,
         encryption_config: Option<EncryptionConfig>,
+        fence: Arc<FenceController>,
     ) -> crate::Result<Namespace> {
         let mut join_set = JoinSet::new();
 
@@ -72,6 +74,7 @@ impl PrimaryConfigurator {
             broadcaster,
             self.make_wal_manager.clone(),
             encryption_config,
+            fence.clone(),
         )
         .await?;
 
@@ -112,6 +115,7 @@ impl PrimaryConfigurator {
             stats,
             db_config_store: meta_store_handle,
             path: db_path.into(),
+            fence,
         })
     }
 }
@@ -126,6 +130,7 @@ impl ConfigureNamespace for PrimaryConfigurator {
         resolve_attach_path: ResolveNamespacePathFn,
         _store: NamespaceStore,
         broadcaster: BroadcasterHandle,
+        fence: Arc<FenceController>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
         Box::pin(async move {
             let db_path: Arc<Path> = self.base.base_path.join("dbs").join(name.as_str()).into();
@@ -140,6 +145,7 @@ impl ConfigureNamespace for PrimaryConfigurator {
                     db_path.clone(),
                     broadcaster,
                     self.base.encryption_config.clone(),
+                    fence,
                 )
                 .await
             {

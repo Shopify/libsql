@@ -397,19 +397,22 @@ This is additive in proto3: older peers skip the unknown field; a newer replica 
 
 ### 7.1 Registry
 
-`FenceRegistry` (in `NamespaceStore`, outside the moka cache) maps `NamespaceName -> Arc<FenceController>`. It is loaded from the metastore (and markers) at startup, before any namespace is served, and changes only after a durable commit. Namespaces without a record get an `UNFENCED` controller lazily. Because the registry is not the cache value, cache eviction and lazy reload reinstall the same controller (section 8.5).
+`FenceRegistry` (in `NamespaceStore`, outside the moka cache) maps `NamespaceName -> Arc<FenceController>`. It is seeded from `MetaStore::load_fences()` (fence rows, markers, and the namespaces startup could not recover) in `NamespaceStore::new`, before any namespace is served. Namespaces without a record get an `UNFENCED` controller lazily, on first load. Because the registry is not the cache value, cache eviction and lazy reload reinstall the same controller (section 8.5). Deleting a namespace, which deletes its fence state in the same metastore transaction, removes its controller.
 
 ### 7.2 Controller state
 
 Per namespace:
 
-- `transition_lock`: a `tokio::sync::Mutex` serialising commands on this namespace.
-- `gate`: a `tokio::sync::watch` of `GateSnapshot { state, revision, write: Open | Closed(code), read: Open | Closed(code), write_generation, capabilities }`. The WAL wrapper, `CoreConnection`, dump, replication and lifecycle code read it without locks.
-- `write_generation: u64`, stored in the snapshot and **incremented on every transition that closes or opens write admission** (acquire, release, create, seal, publish, enable, abort, adopt).
+- `transition_lock`: a `tokio::sync::Mutex` serialising commands on this namespace. A command holds it from its first check to its response (`FenceController::begin_transition` returns a `Transition` that owns the guard).
+- `gate`: a `tokio::sync::watch` of `GateSnapshot { fence, write_generation, indeterminate }`, where `fence` is the durable fence as last published (a record, no record, or `UNKNOWN_UNAVAILABLE` with its detail). State, revision, owning operation and every admission (`permits(class)`, `write()`, `read()`) are derived from it through the permission matrix. The WAL wrapper, `CoreConnection`, dump, replication and lifecycle code read it without locks. Phase 5 adds the live capability set.
+- `write_generation: u64`, in the snapshot, **incremented on every publication that changes the fence state, the owning operation, or the indeterminate flag**. That covers every transition that closes or opens write admission (acquire, release, create, seal, publish, enable, abort, adopt), and is conservative for the others. A replay that publishes the same durable state does not move it.
+- `indeterminate: Option<(operation_id, command_id)>`: set when a command's `COMMIT` failed (or the task running it died) so that whether it applied is unknown. While set, every class except `Maintenance` and `Observability` is denied with `FENCE_STATE_UNAVAILABLE` / `indeterminate_commit`, and every other command is refused with `FENCE_COMMIT_INDETERMINATE`. A replay of the same command is answered by the metastore from the durable row (replayed if it had committed, applied if it had not) and clears it (section 8.4).
 - writer tracking, provided by the namespace's `ManagedConnectionWalManager` (section 8.2).
 - `read_leases`: counters and cancel handles per lease class (`sql`, `dump`, `replication`), with a `Notify` on every release.
 - `capabilities`: the live `MigrationCapability` set and an import-writer counter.
-- in `cfg(test)` builds only, an optional `FenceTestHooks` (section 16).
+- in `cfg(test)` builds only, a `FenceTestHooks` (section 16).
+
+`FenceController::apply_command` runs the command on its own task: a caller that goes away after the commit (a lost response) does not prevent the publication. The metastore maps a failed `COMMIT` to `FENCE_COMMIT_INDETERMINATE`; any other error (a refusal by the transition function, a busy metastore, a failure before `COMMIT`) proves nothing was written and leaves the gate exactly as it was.
 
 ### 7.3 Operation classes
 
@@ -473,8 +476,8 @@ This makes the WAL gate independent of statement classification: DDL, misclassif
 
 ### 8.5 Restart and eviction
 
-- At startup the registry is built from the metastore and markers before `NamespaceStore` serves anything. `make_namespace` takes the controller from the registry and passes it into the configurator's `setup()`, down to `MakeLegacyConnection::new` and every `LegacyConnection`, **before** the first connection (the maker's held `_db` connection) is created. The replication logger, dump and replication services get the same controller.
-- `NamespaceStore::with` checks the registry before `handle()` or `load_namespace`: `UNKNOWN_UNAVAILABLE` is refused before any setup work.
+- At startup the registry is built from the metastore and markers before `NamespaceStore` serves anything. `make_namespace` takes the controller from the registry and passes it into the configurator's `setup()` (primary, schema and replica), down to `MakeLegacyConnection::new`, which binds a `FenceConnState` to it for every `LegacyConnection` it opens, **starting with** the maker's held `_db` connection. The `Namespace` keeps the same controller (`Namespace::fence()`), which is how dump, replication and lifecycle code, all of which reach a namespace through `NamespaceStore::with`, read its gate.
+- `NamespaceStore::with` and `make_namespace` check the registry before `lookup()`, `handle()` or any setup: `UNKNOWN_UNAVAILABLE` is refused before any setup work.
 - Idle or capacity eviction shuts the namespace down but leaves the controller in the registry; a lazy reload reinstalls the identical gate, revision and generation. A drain waiter that holds the evicted manager sees its connections close and is notified.
 - Namespaces in `SOURCE_DRAINING` or `TARGET_IMPORT_DRAINING` after a restart stay closed until the same command is replayed. Nothing advances in the background.
 
@@ -674,7 +677,7 @@ Every transition emits one structured log event (target `libsql_server::fence::a
 
 ## 16. Test strategy (Design)
 
-- **No new dependency.** The crate has no failpoint library. Race tests use `#[cfg(test)]` hooks: `FenceTestHooks` holds named points (`AfterInstallingGate`, `BeforeMetastoreCommit`, `AfterMetastoreCommit`, `BeforeGatePublish`, `InBeginWriteTxnAfterCheck`, `AfterManagerRelease`, `BeforeBoundaryCapture`, `AfterTargetRowsCommitted`, `BeforeResponse`), each able to park the task on a `tokio::sync::Barrier` or `Notify` or to inject an error or an indeterminate commit. Hooks compile only in the library's own test build, so they cost nothing in release builds; integration tests under `tests/` cover protocol behaviour and do not rely on hooks.
+- **No new dependency.** The crate has no failpoint library. Race tests use `#[cfg(test)]` hooks: `FenceTestHooks` holds named points (`AfterInstallingGate`, `BeforeMetastoreCommit`, `AfterMetastoreCommit`, `BeforeGatePublish`, `InBeginWriteTxnAfterCheck`, `AfterManagerRelease`, `BeforeBoundaryCapture`, `AfterTargetRowsCommitted`, `BeforeResponse`), each able to park the task on a pair of `Notify`s (`pause_at` returns handles to wait until the task arrives and to release it) or to inject an error or an indeterminate commit. An armed point fires once. `BeforeMetastoreCommit` is reached immediately before the metastore transaction is started (an injected error there is a failure before commit); an injected indeterminate outcome at `AfterMetastoreCommit` is a commit that happened but was not acknowledged. Hooks compile only in the library's own test build, so they cost nothing in release builds; integration tests under `tests/` cover protocol behaviour and do not rely on hooks.
 - **Restart** at a boundary: reopen `MetaStore` and rebuild the registry on the same temporary directory, the way existing metastore tests do; integration tests stop and start a `TestServer` on the same path.
 - **Response loss**: the test drops the command future after `AfterMetastoreCommit` and then replays or inspects.
 - **Representative schemas**: synthetic multi-table schemas with indexes, triggers, views and an FTS5 table (FTS5 is compiled in).
@@ -692,8 +695,8 @@ Planned test names; the table is updated as tests land.
 | 4 | Program that captured config before the fence is rejected at the WAL | `connection_core::tests::wal_gate_rejects_program_admitted_before_fence` |
 | 5 | Pre-fence transactions cannot write after release or publication | `fence::tests::stale_generation_cannot_write_after_release`, `stale_generation_cannot_write_after_enable_writes` |
 | 6 | Acquisition timeout returns `DRAINING`, admission stays closed | `fence::drain::tests::deadline_returns_draining_and_stays_closed` |
-| 7 | Restart at every persistence boundary; indeterminate persistence keeps the gate closed until same-command reconciliation | `fence::tests::restart_at_each_boundary` (parameterised over hook points), `indeterminate_commit_keeps_gate_closed` |
-| 8 | Evict and lazily reload a fenced namespace; identical admission | `tests::fence::lifecycle::evicted_namespace_reloads_same_gate` |
+| 7 | Restart at every persistence boundary; indeterminate persistence keeps the gate closed until same-command reconciliation | `fence::tests::restart_at_each_boundary` (parameterised over hook points), `indeterminate_commit_keeps_gate_closed`; landed: `fence::controller::tests::{indeterminate_commit_keeps_writes_closed_until_replayed, indeterminate_commit_that_did_not_apply_is_retried_by_replay, failed_before_commit_leaves_gate_unchanged, publication_happens_before_the_response, committed_command_is_published_when_the_caller_goes_away}`, `namespace::store::fence_tests::restart_installs_the_durable_gate_before_serving` |
+| 8 | Evict and lazily reload a fenced namespace; identical admission | `tests::fence::lifecycle::evicted_namespace_reloads_same_gate`; landed at unit level: `namespace::store::fence_tests::evicted_namespace_reloads_with_the_same_controller`, `fence::registry::tests::seeded_from_load_fences_including_recovered_names` |
 | 9 | Filesystem recovery, `destroy_on_error`, undecodable records, missing target quarantine, metastore backup rollback fail closed with provenance | `meta_store::fence_tests::recovery::{fs_recovery_with_marker_unavailable, destroy_on_error_keeps_fenced_unavailable, undecodable_row_unavailable, incomplete_target_unavailable, metastore_rollback_detected_by_marker, lookup_never_creates, undecodable_name_with_fence_fails_startup, marker_in_invalid_directory_fails_startup}`; legacy behaviour kept: `destroy_on_error_without_fences_is_unchanged`, `undecodable_row_without_fences_is_skipped_as_before`; `meta_store::fence_tests::corrupt_fence_row_fails_closed` |
 | 10 | Wrong owner, stale revision, invalid role/state, replay, command-id reuse; replay before revision check | `fence::transition::tests::*` (exhaustive over states × commands) |
 | 11 | Target creation raced with SQL, dump, replication, lifecycle never observable as writable or readable | `fence::target::tests::create_race_never_observable` |
