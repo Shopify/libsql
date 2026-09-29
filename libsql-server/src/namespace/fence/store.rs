@@ -215,6 +215,32 @@ pub fn remove_marker(dbs_path: &Path, namespace: &NamespaceName) -> io::Result<(
     }
 }
 
+/// The namespace directories under `dbs_path` that hold a marker, in no particular order. A
+/// directory whose name is not a valid namespace name is returned as its raw name, so the
+/// caller can refuse to start rather than ignore it.
+pub fn scan_markers(dbs_path: &Path) -> io::Result<Vec<Result<NamespaceName, String>>> {
+    let entries = match fs::read_dir(dbs_path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || !entry.path().join(MARKER_FILE_NAME).try_exists()? {
+            continue;
+        }
+        let raw = entry.file_name();
+        out.push(match raw.to_str() {
+            Some(name) => {
+                NamespaceName::from_string(name.to_string()).map_err(|_| name.to_string())
+            }
+            None => Err(raw.to_string_lossy().into_owned()),
+        });
+    }
+    Ok(out)
+}
+
 /// Whether the marker agrees with what the metastore says. Returned by [`read_fence`] so a
 /// loader can repair a marker that fell behind (a crash between commit and marker write).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +285,19 @@ pub fn stored_revision(
     conn.query_row(
         "SELECT revision FROM namespace_fences WHERE namespace = ?1",
         [namespace.as_str()],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Like [`stored_revision`], for a namespace name that is not a valid [`NamespaceName`].
+pub fn stored_revision_raw(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT revision FROM namespace_fences WHERE namespace = ?1",
+        [namespace],
         |row| row.get(0),
     )
     .optional()

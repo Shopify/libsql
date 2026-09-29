@@ -210,6 +210,7 @@ mod test {
         store
             .handle(ns("known"))
             .await
+            .unwrap()
             .store(Arc::new(DatabaseConfig::default()))
             .await
             .unwrap();

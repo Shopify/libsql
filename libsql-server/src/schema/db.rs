@@ -486,6 +486,7 @@ mod test {
         meta_store
             .handle(schema.into())
             .await
+            .unwrap()
             .store(DatabaseConfig {
                 is_shared_schema: true,
                 ..Default::default()
@@ -502,6 +503,7 @@ mod test {
         meta_store
             .handle(name.into())
             .await
+            .unwrap()
             .store(DatabaseConfig {
                 shared_schema_name: Some(schema.into()),
                 ..Default::default()
@@ -579,6 +581,7 @@ mod test {
         assert!(meta_store
             .handle("ns1".into())
             .await
+            .unwrap()
             .store(DatabaseConfig {
                 shared_schema_name: Some("schema1".into()),
                 ..Default::default()

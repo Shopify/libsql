@@ -370,7 +370,13 @@ pub async fn check_program_auth(
             }
             StmtKind::Attach(ref ns) => {
                 ctx.auth.has_right(ns, Permission::AttachRead)?;
-                if !ctx.meta_store.handle(ns.clone()).await.get().allow_attach {
+                // A non-creating lookup: a missing namespace does not allow attach, and one
+                // whose fence state is not established is refused with its fence error.
+                let allow_attach = match ctx.meta_store.lookup(ns).await? {
+                    Some(handle) => handle.get().allow_attach,
+                    None => false,
+                };
+                if !allow_attach {
                     return Err(Error::Forbidden(format!(
                         "Namespace `{ns}` doesn't allow attach"
                     )));

@@ -403,7 +403,7 @@ impl NamespaceStore {
             ns.destroy().await?;
         }
 
-        let db_config = self.inner.metadata.handle(namespace.clone()).await;
+        let db_config = self.inner.metadata.handle(namespace.clone()).await?;
         // destroy on-disk database
         self.cleanup(
             &namespace,
@@ -479,7 +479,7 @@ impl NamespaceStore {
         timestamp: Option<NaiveDateTime>,
     ) -> crate::Result<Namespace> {
         // FIXME: we could potentially delete the namespace while trying to fork it
-        let Some(from_config) = self.inner.metadata.existing_handle(from.clone()).await else {
+        let Some(from_config) = self.inner.metadata.lookup(from).await? else {
             return Err(crate::Error::NamespaceDoesntExist(from.to_string()));
         };
         let from_entry = self.load_namespace(from, from_config.clone()).await?;
@@ -488,7 +488,7 @@ impl NamespaceStore {
             return Err(crate::error::Error::NamespaceDoesntExist(from.to_string()));
         };
 
-        let handle = self.inner.metadata.handle(to.clone()).await;
+        let handle = self.inner.metadata.handle(to.clone()).await?;
         // In memory only: the fork reads it; nothing is persisted until it succeeded.
         handle.store_and_maybe_flush(Some(to_config), false).await?;
         let to_ns = self
@@ -549,21 +549,6 @@ impl NamespaceStore {
     where
         Fun: FnOnce(&Namespace) -> R,
     {
-        // `handle` registers the name in the metastore's in-memory map as a side effect, which
-        // is what `exists` reads: a namespace that must already exist is looked up with the
-        // side-effect-free `existing_handle`, so that a lookup racing with the end of a failed
-        // creation cannot bring the name back to life.
-        let lazily_created =
-            namespace == NamespaceName::default() || self.inner.allow_lazy_creation;
-        let handle = if lazily_created {
-            self.inner.metadata.handle(namespace.clone()).await
-        } else {
-            match self.inner.metadata.existing_handle(namespace.clone()).await {
-                Some(handle) => handle,
-                None => return Err(Error::NamespaceDoesntExist(namespace.to_string())),
-            }
-        };
-
         let f = {
             let name = namespace.clone();
             move |ns: NamespaceEntry| async move {
@@ -576,6 +561,15 @@ impl NamespaceStore {
             }
         };
 
+        // A lookup that cannot create: only the default namespace and lazy creation create a
+        // namespace here, and those refuse a name whose fence state is not established.
+        let handle = match self.inner.metadata.lookup(&namespace).await? {
+            Some(handle) => handle,
+            None if namespace == NamespaceName::default() || self.inner.allow_lazy_creation => {
+                self.inner.metadata.handle(namespace.clone()).await?
+            }
+            None => return Err(Error::NamespaceDoesntExist(namespace.to_string())),
+        };
         f(self.load_namespace(&namespace, handle).await?).await
     }
 
@@ -771,7 +765,7 @@ impl NamespaceStore {
             && matches!(restore_option, RestoreOption::Latest)
         {
             tracing::trace!("auto-creating the namespace");
-            let handle = self.inner.metadata.handle(namespace.clone()).await;
+            let handle = self.inner.metadata.handle(namespace.clone()).await?;
             handle.store(Arc::new(db_config)).await?;
             self.load_namespace(&namespace, handle).await?;
             return Ok(());
@@ -813,7 +807,7 @@ impl NamespaceStore {
         db_config: Arc<DatabaseConfig>,
         restore_option: RestoreOption,
     ) -> crate::Result<Namespace> {
-        let handle = self.inner.metadata.handle(namespace.clone()).await;
+        let handle = self.inner.metadata.handle(namespace.clone()).await?;
         // In memory only: setup reads it; nothing is persisted until setup succeeded.
         handle.store_and_maybe_flush(Some(db_config), false).await?;
         // whatever a creation of this name that never completed left behind
@@ -1248,7 +1242,7 @@ mod test {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path()).await;
         let linked = NamespaceName::from_string("linked".into()).unwrap();
-        let handle = store.inner.metadata.handle(linked.clone()).await;
+        let handle = store.inner.metadata.handle(linked.clone()).await.unwrap();
         handle
             .store_and_maybe_flush(
                 Some(Arc::new(DatabaseConfig {
