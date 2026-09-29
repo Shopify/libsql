@@ -21,8 +21,10 @@ use crate::stats::Stats;
 
 use super::broadcasters::{BroadcasterHandle, BroadcasterRegistry};
 use super::configurator::{DynConfigurator, NamespaceConfigurators};
+use super::fence::command::{FenceCommand, FenceRequest};
+use super::fence::record::ServerIdentity;
 use super::fence::registry::FenceRegistry;
-use super::meta_store::{MetaStore, MetaStoreHandle};
+use super::meta_store::{FenceCommit, FenceContext, MetaStore, MetaStoreHandle};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
@@ -531,6 +533,33 @@ impl NamespaceStore {
         &self.inner.metadata
     }
 
+    /// Run one fence command on its namespace, including the drain it starts
+    /// (`docs/NAMESPACE_FENCE.md` sections 5.3 and 8). `AcquireSourceWriteFence` loads the
+    /// namespace first, so that its connection manager and replication log are registered with
+    /// the namespace's controller before the drain needs them.
+    // The admin routes that call this are not part of the server yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn execute_fence_command(
+        &self,
+        request: FenceRequest,
+        server: ServerIdentity,
+    ) -> crate::Result<FenceCommit> {
+        let controller = match request.command {
+            FenceCommand::AcquireSourceWriteFence { .. } => {
+                self.with(request.namespace.clone(), |ns| ns.fence().clone())
+                    .await?
+            }
+            _ => self.inner.fences.controller(&request.namespace),
+        };
+        controller
+            .execute(
+                &self.inner.metadata,
+                request,
+                FenceContext::now(server, None),
+            )
+            .await
+    }
+
     pub(crate) fn schema_locks(&self) -> &SchemaLocksRegistry {
         &self.inner.schema_locks
     }
@@ -559,7 +588,7 @@ impl NamespaceStore {
 }
 
 #[cfg(test)]
-mod fence_tests {
+pub(crate) mod fence_tests {
     use std::path::Path;
 
     use libsql_sys::wal::Sqlite3WalManager;
@@ -580,7 +609,7 @@ mod fence_tests {
     const LOG: Uuid = Uuid::from_u128(0x10);
     const OP: Uuid = Uuid::from_u128(0xa);
 
-    async fn open_store(dir: &Path) -> NamespaceStore {
+    pub(crate) async fn open_store(dir: &Path) -> NamespaceStore {
         let (maker, manager) = metastore_connection_maker(None, dir).await.unwrap();
         let meta = MetaStore::new(
             MetaStoreConfig {
