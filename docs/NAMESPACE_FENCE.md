@@ -324,11 +324,15 @@ All namespace-config writes already pass through the metastore's single `MetaSto
 
 Ordinary config writes (`try_process`) and `remove` read the fence row inside their own transaction and refuse when the state denies lifecycle operations. Because both take `BEGIN IMMEDIATE` on the same database, a config write cannot interleave with a fence transition.
 
+While a record is in force, the stored config row carries the legacy mirror (section 13.2) and the in-memory config is the namespace's own configuration: a transition overlays the mirror on the config row *as read inside its transaction*, so a config change committed by another metastore connection is preserved underneath it, and loading the metastore puts the saved `block_*` values back into the in-memory config. A namespace whose fence cannot be established keeps its stored row, mirror included, in memory.
+
+A fence command that returns an error writes nothing. The store answers a replay or a resumed drain without writing; otherwise it commits the record (when it changed), the receipt and the mirror together, writes the marker, and only then returns. `CreateTargetQuarantined` returns the created namespace config without publishing it; the caller publishes it after installing the target's gate (section 10.1).
+
 `try_process` today publishes the new config to the in-memory watch even when persisting failed. That is fixed for all config writes: the watch is updated only after commit, and the error is returned.
 
 ### 5.5 Receipt retention (Contract)
 
-Receipts of the operation that currently owns a record are never pruned. Receipts of finished operations (`RELEASED`, `TARGET_WRITABLE`, or superseded by adoption) are kept for at least `--namespace-fence-receipt-retention` (default 30 days) and are pruned only inside a later transition on the same namespace. Delete of a namespace in `UNFENCED`, `RELEASED` or `TARGET_WRITABLE` removes its fence row and receipts in the same transaction and logs them.
+Receipts of the operation that currently owns a record are never pruned. Receipts of finished operations (`RELEASED`, `TARGET_WRITABLE`, or superseded by adoption) are kept for at least `--namespace-fence-receipt-retention-s` (default 30 days) and are pruned only inside a later transition on the same namespace. Delete of a namespace in `UNFENCED`, `RELEASED` or `TARGET_WRITABLE` removes its fence row and receipts in the same transaction and logs them; its marker is removed before that transaction commits, so a crash in between leaves a record without a marker (repaired on load) rather than a marker without a record.
 
 ### 5.6 On-disk marker
 
@@ -595,7 +599,7 @@ The server cannot verify who the approvers are: the admin API has one shared key
 - Off, but fence tables or markers exist (the flag was turned off after use): fences are still loaded and enforced; mutating routes are disabled.
 - On: tables are created, routes are served, and the fail-closed recovery rules of section 13.3 apply.
 
-Related flags: `--namespace-fence-receipt-retention`, `--namespace-fence-adoption-key`, `--namespace-fence-keepalive-interval`, and default drain deadlines `--namespace-fence-default-write-drain-ms` and `--namespace-fence-default-read-drain-ms` (used when a request has no `drain_policy`).
+Related flags: `--namespace-fence-receipt-retention-s`, `--namespace-fence-adoption-key`, `--namespace-fence-keepalive-interval`, and default drain deadlines `--namespace-fence-default-write-drain-ms` and `--namespace-fence-default-read-drain-ms` (used when a request has no `drain_policy`).
 
 Upgrade order: deploy a binary with capability discovery and proxy `stable_code` support on every primary and replica; confirm with `GET /v1/fence/capabilities`; then enable the flag; then use fences. Rollback to a binary without fence support is refused by deployment tooling while `active_fences > 0`.
 

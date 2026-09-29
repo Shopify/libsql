@@ -258,6 +258,16 @@ struct Cli {
     #[clap(long, env = "SQLD_ALLOW_METASTORE_RECOVERY")]
     allow_metastore_recovery: bool,
 
+    /// Allow namespace fences to be used (see `docs/NAMESPACE_FENCE.md`). Off by default.
+    /// Fences that already exist in the metastore are enforced either way.
+    #[clap(long, env = "SQLD_ENABLE_NAMESPACE_FENCE")]
+    enable_namespace_fence: bool,
+
+    /// How long, in seconds, receipts of finished namespace-fence operations are kept.
+    /// Defaults to 30 days.
+    #[clap(long, env = "SQLD_NAMESPACE_FENCE_RECEIPT_RETENTION_S")]
+    namespace_fence_receipt_retention_s: Option<u64>,
+
     /// Shutdown timeout duration in seconds, defaults to 30 seconds.
     #[clap(long, env = "SQLD_SHUTDOWN_TIMEOUT")]
     shutdown_timeout: Option<u64>,
@@ -650,6 +660,10 @@ fn make_meta_store_config(config: &Cli) -> anyhow::Result<MetaStoreConfig> {
         bottomless,
         allow_recover_from_fs: config.allow_metastore_recovery,
         destroy_on_error: config.meta_store_destroy_on_error,
+        namespace_fence: config.enable_namespace_fence,
+        namespace_fence_receipt_retention: config
+            .namespace_fence_receipt_retention_s
+            .map(Duration::from_secs),
     })
 }
 
