@@ -21,6 +21,7 @@ use crate::stats::Stats;
 
 use super::broadcasters::{BroadcasterHandle, BroadcasterRegistry};
 use super::configurator::{DynConfigurator, NamespaceConfigurators};
+use super::fence::registry::FenceRegistry;
 use super::meta_store::{MetaStore, MetaStoreHandle};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
@@ -50,6 +51,9 @@ pub struct NamespaceStoreInner {
     broadcasters: BroadcasterRegistry,
     configurators: NamespaceConfigurators,
     db_kind: DatabaseKind,
+    /// Fence controllers, outside the cache: a namespace that is evicted and reloaded gets the
+    /// controller it had.
+    fences: FenceRegistry,
 }
 
 impl NamespaceStore {
@@ -84,6 +88,13 @@ impl NamespaceStore {
             .time_to_idle(Duration::from_secs(86400))
             .build();
 
+        // Every namespace with fence state gets its controller before anything is served
+        // (section 8.5).
+        let fences = FenceRegistry::seeded(metadata.load_fences().await?);
+        if fences.len() > 0 {
+            tracing::info!("loaded {} namespace fence controllers", fences.len());
+        }
+
         Ok(Self {
             inner: Arc::new(NamespaceStoreInner {
                 store,
@@ -95,6 +106,7 @@ impl NamespaceStore {
                 broadcasters: Default::default(),
                 configurators,
                 db_kind,
+                fences,
             }),
         })
     }
@@ -120,6 +132,8 @@ impl NamespaceStore {
             }
         })
         .await??;
+        // The namespace's fence state went with it.
+        self.inner.fences.remove(&namespace);
 
         let mut bottomless_db_id_init = NamespaceBottomlessDbIdInit::FetchFromConfig;
         if let Some(ns) = self.inner.store.remove(&namespace).await {
@@ -336,6 +350,9 @@ impl NamespaceStore {
             }
         };
 
+        // A namespace whose fence state is unavailable is refused before any setup work.
+        self.inner.fences.check_available(&namespace)?;
+
         // A lookup that cannot create: only the default namespace and lazy creation create a
         // namespace here, and those refuse a name whose fence state is not established.
         let handle = match self.inner.metadata.lookup(&namespace).await? {
@@ -371,6 +388,10 @@ impl NamespaceStore {
         config: MetaStoreHandle,
         restore_option: RestoreOption,
     ) -> crate::Result<Namespace> {
+        // The controller is handed to the namespace before its first connection exists, so no
+        // connection is ever opened without a gate (section 8.5).
+        self.inner.fences.check_available(namespace)?;
+        let fence = self.inner.fences.controller(namespace);
         let ns = self
             .get_configurator(&config.get())
             .setup(
@@ -381,6 +402,7 @@ impl NamespaceStore {
                 self.resolve_attach_fn(),
                 self.clone(),
                 self.broadcaster(namespace.clone()),
+                fence,
             )
             .await?;
 
@@ -533,5 +555,212 @@ impl NamespaceStore {
         self.get_configurator(db_config)
             .cleanup(namespace, db_config, prune_all, bottomless_db_id_init)
             .await
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use std::path::Path;
+
+    use libsql_sys::wal::Sqlite3WalManager;
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::config::MetaStoreConfig;
+    use crate::namespace::configurator::{BaseNamespaceConfig, PrimaryConfig, PrimaryConfigurator};
+    use crate::namespace::fence::command::{FenceCommand, FenceRequest};
+    use crate::namespace::fence::outcome::{FenceDetail, FenceOutcome};
+    use crate::namespace::fence::record::ServerIdentity;
+    use crate::namespace::fence::state::{FenceState, OperationClass};
+    use crate::namespace::fence::store as fence_store;
+    use crate::namespace::meta_store::{metastore_connection_maker, FenceContext};
+
+    const LOG: Uuid = Uuid::from_u128(0x10);
+    const OP: Uuid = Uuid::from_u128(0xa);
+
+    async fn open_store(dir: &Path) -> NamespaceStore {
+        let (maker, manager) = metastore_connection_maker(None, dir).await.unwrap();
+        let meta = MetaStore::new(
+            MetaStoreConfig {
+                namespace_fence: true,
+                ..Default::default()
+            },
+            dir,
+            maker().unwrap(),
+            manager,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        let mut configurators = NamespaceConfigurators::empty();
+        configurators.with_primary(PrimaryConfigurator::new(
+            BaseNamespaceConfig {
+                base_path: dir.to_path_buf().into(),
+                extensions: Arc::new([]),
+                stats_sender: tokio::sync::mpsc::channel(1).0,
+                max_response_size: 100_000_000,
+                max_total_response_size: 100_000_000,
+                max_concurrent_connections: Arc::new(Semaphore::new(10)),
+                max_concurrent_requests: 10_000,
+                encryption_config: None,
+                connection_creation_timeout: None,
+                disable_intelligent_throttling: false,
+            },
+            PrimaryConfig {
+                max_log_size: 1_000_000_000,
+                max_log_duration: None,
+                bottomless_replication: None,
+                scripted_backup: None,
+                checkpoint_interval: None,
+            },
+            Arc::new(|| Sqlite3WalManager::default()),
+        ));
+        NamespaceStore::new(false, false, 10, meta, configurators, DatabaseKind::Primary)
+            .await
+            .unwrap()
+    }
+
+    fn acquire(ns: &'static str) -> FenceRequest {
+        FenceRequest {
+            namespace: ns.into(),
+            operation_id: OP,
+            command_id: Uuid::from_u128(1),
+            expected_state: FenceState::Unfenced,
+            expected_revision: 0,
+            command: FenceCommand::AcquireSourceWriteFence {
+                expected_log_id: LOG,
+                drain_policy: None,
+            },
+        }
+    }
+
+    fn ctx() -> FenceContext {
+        FenceContext::now(
+            ServerIdentity {
+                build: "test".into(),
+                instance_id: Uuid::from_u128(0x99),
+            },
+            Some(LOG),
+        )
+    }
+
+    #[tokio::test]
+    async fn evicted_namespace_reloads_with_the_same_controller() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        store
+            .create("ns".into(), RestoreOption::Latest, Default::default())
+            .await
+            .unwrap();
+        let (fence, stats) = store
+            .with("ns".into(), |ns| (ns.fence().clone(), ns.stats()))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &fence,
+            &store.inner.fences.get(&"ns".into()).unwrap()
+        ));
+        fence
+            .apply_command(store.meta_store(), acquire("ns"), ctx())
+            .await
+            .unwrap();
+        let gate = fence.gate();
+        assert_eq!(gate.state(), FenceState::SourceDraining);
+
+        // Evict the namespace, as idle or capacity eviction does, and let it shut down.
+        store
+            .inner
+            .store
+            .invalidate(&NamespaceName::from("ns"))
+            .await;
+        store.inner.store.run_pending_tasks().await;
+        assert!(store
+            .inner
+            .store
+            .get(&NamespaceName::from("ns"))
+            .await
+            .is_none());
+
+        let (reloaded, reloaded_stats) = store
+            .with("ns".into(), |ns| (ns.fence().clone(), ns.stats()))
+            .await
+            .unwrap();
+        // A new namespace instance, the same controller and gate.
+        assert!(!Arc::ptr_eq(&stats, &reloaded_stats));
+        assert!(Arc::ptr_eq(&fence, &reloaded));
+        assert_eq!(reloaded.gate(), gate);
+        assert!(reloaded.permits(OperationClass::NormalWrite).is_err());
+    }
+
+    #[tokio::test]
+    async fn restart_installs_the_durable_gate_before_serving() {
+        let tmp = tempdir().unwrap();
+        {
+            let store = open_store(tmp.path()).await;
+            store
+                .create("ns".into(), RestoreOption::Latest, Default::default())
+                .await
+                .unwrap();
+            let fence = store.inner.fences.controller(&"ns".into());
+            fence
+                .apply_command(store.meta_store(), acquire("ns"), ctx())
+                .await
+                .unwrap();
+            store.shutdown().await.unwrap();
+        }
+
+        let store = open_store(tmp.path()).await;
+        // The registry holds the durable gate before the namespace is loaded.
+        let fence = store.inner.fences.get(&"ns".into()).unwrap();
+        assert_eq!(fence.gate().state(), FenceState::SourceDraining);
+        assert_eq!(fence.gate().revision(), 1);
+        let loaded = store
+            .with("ns".into(), |ns| ns.fence().clone())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&fence, &loaded));
+    }
+
+    #[tokio::test]
+    async fn unavailable_namespace_is_refused_before_setup() {
+        let tmp = tempdir().unwrap();
+        // An unreadable marker in a directory with no config: the fence state cannot be
+        // established.
+        let dir = tmp.path().join("dbs").join("lost");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fence_store::MARKER_FILE_NAME), b"garbage").unwrap();
+
+        let store = open_store(tmp.path()).await;
+        let r = store.with("lost".into(), |_| ()).await;
+        match r {
+            Err(Error::NamespaceFence(e)) => {
+                assert_eq!(e.outcome(), FenceOutcome::FenceStateUnavailable);
+                assert_eq!(e.detail(), Some(FenceDetail::CorruptRecord));
+            }
+            other => panic!("expected a fence error, got {other:?}"),
+        }
+        // Nothing was set up: no database file, and the namespace is not cached.
+        assert!(!dir.join("data").exists());
+        assert!(store
+            .inner
+            .store
+            .get(&NamespaceName::from("lost"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn destroy_forgets_the_controller() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        store
+            .create("ns".into(), RestoreOption::Latest, Default::default())
+            .await
+            .unwrap();
+        assert!(store.inner.fences.get(&"ns".into()).is_some());
+        store.destroy("ns".into(), false).await.unwrap();
+        assert!(store.inner.fences.get(&"ns".into()).is_none());
     }
 }
