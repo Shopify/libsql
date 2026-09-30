@@ -1054,6 +1054,9 @@ mod directory_tests {
         // detached cleanup, even after it has had another scheduling turn.
         std::fs::create_dir(tmp.path().join("dbs/failed")).unwrap();
         std::fs::write(tmp.path().join("dbs/failed/sentinel"), b"new owner").unwrap();
+        // The real create path rotates the revoked generation only after a
+        // fresh directory is reserved under this name's operation lock.
+        metadata.activate_for_create(&namespace);
         metadata
             .handle(namespace.clone())
             .await
