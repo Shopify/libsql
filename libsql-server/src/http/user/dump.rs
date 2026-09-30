@@ -131,8 +131,13 @@ pub(crate) async fn dump_stream(
     conn_maker: Arc<dyn MakeConnection<Connection = Connection>>,
     preserve_row_ids: bool,
 ) -> crate::Result<impl futures::Stream<Item = Result<bytes::Bytes, Error>>> {
-    let (lease, cancel) =
-        acquire_stream_lease(fence, LeaseKind::Dump).map_err(Error::NamespaceFence)?;
+    let (lease, cancel) = acquire_stream_lease(fence, LeaseKind::Dump).map_err(|e| {
+        crate::namespace::fence::audit::denied(
+            &e,
+            crate::namespace::fence::audit::DenialSurface::Dump,
+        );
+        Error::NamespaceFence(e)
+    })?;
 
     let conn = conn_maker.create().await?;
 
@@ -151,9 +156,14 @@ pub(crate) async fn dump_stream(
         });
         match result {
             Ok(()) => Ok(()),
-            Err(_) if cancel.is_cancelled() => Err(Error::NamespaceFence(cancelled_by_read_fence(
-                LeaseKind::Dump,
-            ))),
+            Err(_) if cancel.is_cancelled() => {
+                let e = cancelled_by_read_fence(LeaseKind::Dump);
+                crate::namespace::fence::audit::denied(
+                    &e,
+                    crate::namespace::fence::audit::DenialSurface::Dump,
+                );
+                Err(Error::NamespaceFence(e))
+            }
             Err(e) => Err(e.into()),
         }
     });

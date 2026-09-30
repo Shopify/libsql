@@ -28,6 +28,7 @@ use crate::namespace::configurator::{load_dump_sql, read_dump};
 use crate::namespace::meta_store::{FenceCommit, FenceCommitKind, FenceContext, MetaStore};
 use crate::namespace::replication_wal::ReplicationWalWrapper;
 
+use super::audit::{CommandReport, DrainKind, ForcedKind};
 use super::capability::MigrationCapability;
 use super::command::{DrainPolicy, FenceCommand, FenceRequest, OnDeadline};
 use super::controller::{FenceController, LiveWriteDrain, Transition};
@@ -174,10 +175,14 @@ pub async fn seal_target_import(
     let resumed = commit.kind == FenceCommitKind::Resumed;
     let drain_key = (commit.receipt.operation_id, commit.receipt.command_id);
 
-    if !drain_import_writers(&controller, policy).await {
+    let started = Instant::now();
+    if !drain_import_writers(&controller, policy, &mut transition.report).await {
         return Ok(commit);
     }
 
+    transition
+        .report
+        .drained(DrainKind::Import, started.elapsed());
     ctx.now_ms = now_ms();
     let mut completed = transition
         .complete_drain(meta, drain_key, DrainCompletion::TargetImport, ctx)
@@ -193,7 +198,11 @@ pub async fn seal_target_import(
 /// still holding the slot (an idle session's open transaction; a running call ends its own)
 /// and waits again for the same deadline, but at least [`FORCED_ROLLBACK_GRACE`]. `false` when
 /// the drain could not be proven within the policy.
-async fn drain_import_writers(controller: &FenceController, policy: DrainPolicy) -> bool {
+async fn drain_import_writers(
+    controller: &FenceController,
+    policy: DrainPolicy,
+    report: &mut CommandReport,
+) -> bool {
     let namespace = controller.namespace().clone();
     let deadline_after = Duration::from_millis(policy.deadline_ms);
     let mut deadline = Instant::now() + deadline_after;
@@ -212,7 +221,12 @@ async fn drain_import_writers(controller: &FenceController, policy: DrainPolicy)
         match policy.on_deadline {
             OnDeadline::ForceRollback if !forced => {
                 forced = true;
-                for source in controller.live_write_drains() {
+                let sources = controller.live_write_drains();
+                report.forced(
+                    ForcedKind::Rollback,
+                    sources.iter().filter(|s| s.manager.has_writer()).count(),
+                );
+                for source in sources {
                     let manager = source.manager.clone();
                     // The rollback takes the connection's lock, which a running import call
                     // holds; the release it causes is what the drain keeps waiting for.

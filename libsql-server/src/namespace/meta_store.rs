@@ -653,6 +653,17 @@ fn unavailable_error(stored: &StoredFence) -> FenceError {
         })
 }
 
+/// A config write or a delete under the stored fence: refused (and counted as a lifecycle
+/// denial) unless its state permits lifecycle operations.
+fn lifecycle_permitted(stored: &StoredFence) -> std::result::Result<(), FenceError> {
+    stored.permits(OperationClass::Lifecycle).inspect_err(|e| {
+        crate::namespace::fence::audit::denied(
+            e,
+            crate::namespace::fence::audit::DenialSurface::Lifecycle,
+        )
+    })
+}
+
 /// Why a name that has no config must not be created: its directory holds a marker, so it is a
 /// target being created or a namespace the metastore lost (section 13.3).
 fn marker_denial(dbs_path: &Path, namespace: &NamespaceName) -> Result<Option<FenceError>> {
@@ -745,7 +756,7 @@ fn try_process(
     if inner.fence.tables {
         let (stored, _) =
             fence_store::read_fence(&tx, &inner.dbs_path, namespace).map_err(fence_store_error)?;
-        stored.permits(OperationClass::Lifecycle)?;
+        lifecycle_permitted(&stored)?;
     }
     if let Some(schema) = config.shared_schema_name.as_ref() {
         if inner.db_kind.is_primary() {
@@ -1347,7 +1358,7 @@ impl MetaStore {
             if self.inner.fence.tables {
                 let (stored, _) = fence_store::read_fence(&tx, &self.inner.dbs_path, &namespace)
                     .map_err(fence_store_error)?;
-                stored.permits(OperationClass::Lifecycle)?;
+                lifecycle_permitted(&stored)?;
                 if !matches!(stored, StoredFence::None { .. }) {
                     // The marker goes before the commit: a crash in between leaves a record
                     // without a marker, which is repaired on load, rather than a marker

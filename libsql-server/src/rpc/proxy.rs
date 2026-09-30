@@ -46,6 +46,12 @@ pub mod rpc {
             let stable_code = other
                 .fence_error()
                 .and_then(|e| e.outcome().proxy_stable_code());
+            if let Some(fence) = other.fence_error().filter(|_| stable_code.is_some()) {
+                crate::namespace::fence::audit::denied(
+                    fence,
+                    crate::namespace::fence::audit::DenialSurface::Rpc,
+                );
+            }
             let code = match other {
                 _ if stable_code.is_some() => ErrorCode::SqlError,
                 SqldError::LibSqlInvalidQueryParams(_) => ErrorCode::SqlError,
@@ -326,11 +332,12 @@ impl ProxyService {
                 crate::error::Error::NamespaceDoesntExist(_) => None,
                 // A namespace the fence refuses is refused with the typed status, never
                 // retried by the write proxy (`docs/NAMESPACE_FENCE.md` section 6.1).
-                e if fence_status(e).is_some() => Err(fence_status(e).unwrap())?,
-                _ => Err(tonic::Status::internal(format!(
-                    "Error fetching jwt key for a namespace: {}",
-                    e
-                )))?,
+                e => Err(fence_status(e).unwrap_or_else(|| {
+                    tonic::Status::internal(format!(
+                        "Error fetching jwt key for a namespace: {}",
+                        e
+                    ))
+                }))?,
             },
             Ok(Err(e)) => Err(tonic::Status::internal(format!(
                 "Error fetching jwt key for a namespace: {}",
@@ -582,8 +589,15 @@ pub async fn garbage_collect(clients: &mut HashMap<Uuid, Arc<TimeoutConnection>>
 /// The typed status of a fence denial on the proxy service (`docs/NAMESPACE_FENCE.md` section
 /// 6.1): `FAILED_PRECONDITION` with the stable code, never `UNAVAILABLE`, which the write
 /// proxy retries without bound.
+/// Counted as a denial on the `rpc` surface when it is one.
 fn fence_status(e: &crate::error::Error) -> Option<tonic::Status> {
-    e.fence_error()?.to_grpc_status()
+    let fence = e.fence_error()?;
+    let status = fence.to_grpc_status()?;
+    crate::namespace::fence::audit::denied(
+        fence,
+        crate::namespace::fence::audit::DenialSurface::Rpc,
+    );
+    Some(status)
 }
 
 /// The status for an error looking up the namespace a proxy request names.

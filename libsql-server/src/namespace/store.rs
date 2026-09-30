@@ -21,6 +21,7 @@ use crate::stats::Stats;
 
 use super::broadcasters::{BroadcasterHandle, BroadcasterRegistry};
 use super::configurator::{DynConfigurator, NamespaceConfigurators};
+use super::fence::audit::CommandAudit;
 use super::fence::capability::CapabilityPurpose;
 use super::fence::command::{FenceCommand, FenceRequest};
 use super::fence::controller::{FenceController, Transition};
@@ -32,9 +33,7 @@ use super::fence::registry::FenceRegistry;
 use super::fence::state::{FenceState, Role};
 use super::fence::store::StoredFence;
 use super::fence::target::{self, CreateTargetRequest, ValidationSession};
-use super::meta_store::{
-    FenceCommit, FenceCommitKind, FenceContext, FenceInspection, MetaStore, MetaStoreHandle,
-};
+use super::meta_store::{FenceCommit, FenceContext, FenceInspection, MetaStore, MetaStoreHandle};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
@@ -102,6 +101,7 @@ impl NamespaceStore {
 
         // Every namespace with fence state gets its controller before anything is served
         // (section 8.5).
+        super::fence::audit::describe_metrics();
         let fences = FenceRegistry::seeded(metadata.load_fences().await?);
         if fences.len() > 0 {
             tracing::info!("loaded {} namespace fence controllers", fences.len());
@@ -641,8 +641,9 @@ impl NamespaceStore {
 
     /// [`execute_fence_command`](Self::execute_fence_command) for a request that may carry
     /// the adoption key: `adoption_authorised` says whether it did (section 12). Only
-    /// `AdoptFence` looks at it. A committed adoption is written to the audit log (target
-    /// `libsql_server::fence::audit`) with its approvers, incident reference and reason.
+    /// `AdoptFence` looks at it. Like every command, a committed adoption is written to the
+    /// audit log (target `libsql_server::fence::audit`), with its approvers, incident reference
+    /// and reason.
     pub(crate) async fn execute_fence_command_authorised(
         &self,
         request: FenceRequest,
@@ -654,13 +655,7 @@ impl NamespaceStore {
             let controller = self.inner.fences.controller(&namespace);
             let mut ctx = FenceContext::now(server, None);
             ctx.adoption_authorised = adoption_authorised;
-            let commit = controller
-                .execute(&self.inner.metadata, request, ctx)
-                .await?;
-            if commit.kind == FenceCommitKind::Committed {
-                super::fence::audit::adoption(&namespace, &commit);
-            }
-            return Ok(commit);
+            return controller.execute(&self.inner.metadata, request, ctx).await;
         }
         let controller = match request.command {
             FenceCommand::CreateTargetQuarantined { .. } => {
@@ -755,9 +750,13 @@ impl NamespaceStore {
         let this = self.clone();
         tokio::spawn(async move {
             let mut transition = controller.begin_transition().await;
+            let audit = CommandAudit::new(&request, controller.gate().state());
             let ctx = FenceContext::now(server, None);
-            this.create_target_under(&mut transition, request, ctx)
-                .await
+            let result = this
+                .create_target_under(&mut transition, request, ctx)
+                .await;
+            super::fence::audit::command_finished(&audit, &result, &transition.report);
+            result
         })
         .await?
     }
@@ -1008,6 +1007,12 @@ impl NamespaceStore {
     /// How many namespaces on this server have an active fence (capability discovery).
     pub(crate) fn active_fences(&self) -> usize {
         self.inner.fences.active_count()
+    }
+
+    /// Set the fence gauges (`docs/NAMESPACE_FENCE.md` section 15) from the registry, before
+    /// `/metrics` is rendered.
+    pub(crate) fn update_fence_gauges(&self) {
+        super::fence::audit::update_gauges(&self.inner.fences, super::fence::drain::now_ms());
     }
 
     pub(crate) fn schema_locks(&self) -> &SchemaLocksRegistry {
