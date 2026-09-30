@@ -23,7 +23,7 @@ use tokio::sync::{
 };
 use uuid::Uuid;
 
-use crate::config::BottomlessConfig;
+use crate::config::{BottomlessConfig, FenceAdoptionKey};
 use crate::connection::config::DatabaseConfig;
 use crate::database::DatabaseKind;
 use crate::schema::{MigrationDetails, MigrationSummary};
@@ -100,6 +100,8 @@ struct MetaStoreInner {
     /// Where this metastore's contents came from at startup, recorded once the server has
     /// opened it (section 13.3).
     restore_provenance: std::sync::OnceLock<MetastoreProvenance>,
+    /// The secret that authorises `AdoptFence` (section 12); `None` disables adoption.
+    fence_adoption_key: Option<FenceAdoptionKey>,
 }
 
 /// Whether the metastore was restored from its bottomless backup when the server started
@@ -304,6 +306,7 @@ impl MetaStoreInner {
             fence,
             recovered: Default::default(),
             restore_provenance: Default::default(),
+            fence_adoption_key: config.namespace_fence_adoption_key.clone(),
         };
 
         if config.allow_recover_from_fs {
@@ -967,6 +970,19 @@ fn apply_fence_command(
             created_config = Some(Arc::new(logical));
         } else {
             let Some(config) = &config else {
+                if let FenceCommand::AdoptFence(_) = &request.command {
+                    // Section 12: adoption changes the owner and nothing else. The marker holds
+                    // the fence record, not the namespace's configuration (its JWT key, size
+                    // limit, durability, backup id), so re-establishing the record would mean
+                    // inventing a configuration. The namespace stays unavailable.
+                    return Err(FenceError::new(
+                        FenceOutcome::FencePreconditionFailed,
+                        "the metastore holds no configuration for this namespace; adoption \
+                         re-establishes a fence, not a namespace configuration",
+                    )
+                    .with_detail(FenceDetail::NamespaceConfigMissing)
+                    .into());
+                }
                 return Err(FenceError::new(
                     FenceOutcome::FenceStateUnavailable,
                     "the fenced namespace has no config row",
@@ -992,6 +1008,13 @@ fn apply_fence_command(
     // The command established the fence from the durable state; whatever startup could not
     // recover about this name is settled.
     inner.recovered.lock().remove(ns);
+    if let (StoredFence::Unavailable { .. }, Some(next)) = (&stored, &record) {
+        // An adoption re-established the record the marker held (section 12). While the name
+        // was unavailable its in-memory config kept whatever the stale config row held; from
+        // now on it carries the namespace's own values, as `restore_fences` gives every
+        // established record at startup.
+        restore_own_blocks(inner, ns, next);
+    }
 
     let current = record.or_else(|| stored.record().cloned());
     after_fence_commit(
@@ -1007,6 +1030,18 @@ fn apply_fence_command(
         record: current,
         created_config,
     })
+}
+
+/// Put the namespace's own `block_*` values (the record's saved values) into its in-memory
+/// config, if it has one. The caller holds the connection lock, which is taken before the
+/// config map's everywhere.
+fn restore_own_blocks(inner: &MetaStoreInner, ns: &NamespaceName, record: &NamespaceFenceRecord) {
+    let configs = inner.configs.blocking_lock();
+    if let Some(sender) = configs.get(ns) {
+        let config = sender.borrow().config.clone();
+        let config = fence_store::with_legacy_blocks(&config, &record.legacy_blocks);
+        sender.send_modify(|c| c.config = Arc::new(config));
+    }
 }
 
 /// Whether the marker has to be written after a commit: the record changed, or it had fallen
@@ -1398,6 +1433,16 @@ impl MetaStore {
     /// Whether namespace fences may be used on this server.
     pub fn fence_enabled(&self) -> bool {
         self.inner.fence.enabled
+    }
+
+    /// Whether `presented`, the value of a request's `x-libsql-fence-adoption-key` header,
+    /// authorises `AdoptFence` (section 12): an adoption key is configured and `presented` is
+    /// that key. Compared in constant time.
+    pub fn fence_adoption_authorised(&self, presented: Option<&[u8]>) -> bool {
+        match (&self.inner.fence_adoption_key, presented) {
+            (Some(key), Some(presented)) => key.matches(presented),
+            _ => false,
+        }
     }
 
     /// Records where this metastore's contents came from at startup, as reported by

@@ -219,7 +219,7 @@ pub(crate) mod tests {
         tokio::spawn(async move { store.create_target_quarantined(req, server()).await })
     }
 
-    fn target_command(
+    pub(crate) fn target_command(
         command_id: u128,
         expected_state: FenceState,
         expected_revision: u64,
@@ -235,7 +235,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn execute(
+    pub(crate) fn execute(
         store: &NamespaceStore,
         request: FenceRequest,
     ) -> tokio::task::JoinHandle<crate::Result<FenceCommit>> {
@@ -303,7 +303,7 @@ pub(crate) mod tests {
     }
 
     /// A target with successful validation, published readable and write-fenced at revision 5.
-    async fn write_fenced_target() -> (TempDir, NamespaceStore, Arc<FenceController>) {
+    pub(crate) async fn write_fenced_target() -> (TempDir, NamespaceStore, Arc<FenceController>) {
         let (dir, store, fence) = validating_target().await;
         record_validation(&store, 20, 3, ValidationResult::Ok).await;
         let publish = target_command(
@@ -320,7 +320,7 @@ pub(crate) mod tests {
         (dir, store, fence)
     }
 
-    fn enable_request(command_id: u128) -> FenceRequest {
+    pub(crate) fn enable_request(command_id: u128) -> FenceRequest {
         target_command(
             command_id,
             FenceState::TargetWriteFenced,

@@ -936,3 +936,612 @@ fn acquire_response_loss_resolved_by_replay_and_inspect() {
         server.crash();
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Incident adoption (section 12; section 17 row 22)
+
+mod adoption {
+    use super::*;
+    use crate::config::FenceAdoptionKey;
+    use crate::namespace::fence::command::AdoptArgs;
+    use crate::namespace::fence::target::tests::{
+        create, create_request, enable_request, execute as execute_target, target_command,
+        write_fenced_target,
+    };
+    use crate::namespace::meta_store::metastore_connection_maker;
+
+    fn adopt_args(approvers: &[&str]) -> AdoptArgs {
+        AdoptArgs {
+            current_operation_id: OP,
+            approvers: approvers.iter().map(|a| a.to_string()).collect(),
+            incident_ref: "INC-1".into(),
+            reason: "the operation's control record was lost".into(),
+        }
+    }
+
+    fn adopt(
+        ns: &'static str,
+        command_id: u128,
+        expected_state: FenceState,
+        expected_revision: u64,
+        args: AdoptArgs,
+    ) -> FenceRequest {
+        FenceRequest {
+            namespace: ns.into(),
+            operation_id: OTHER_OP,
+            command_id: Uuid::from_u128(command_id),
+            expected_state,
+            expected_revision,
+            command: FenceCommand::AdoptFence(args),
+        }
+    }
+
+    async fn run_adopt(
+        store: &NamespaceStore,
+        request: FenceRequest,
+        authorised: bool,
+    ) -> crate::Result<FenceCommit> {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .execute_fence_command_authorised(request, server_identity(), authorised)
+                .await
+        })
+        .await
+        .unwrap()
+    }
+
+    fn release_by(operation_id: Uuid, command_id: u128, revision: u64) -> FenceRequest {
+        FenceRequest {
+            operation_id,
+            ..release(command_id, revision)
+        }
+    }
+
+    /// The adoption key is kept as a digest and compared whole; an empty key authorises
+    /// nothing; `Debug` does not print it; a metastore without a key refuses every presented
+    /// value.
+    #[test]
+    fn adoption_key_matching() {
+        let key = FenceAdoptionKey::new("s3cret").unwrap();
+        assert!(key.matches(b"s3cret"));
+        for wrong in [&b""[..], b"s3cre", b"s3cret ", b"S3CRET"] {
+            assert!(!key.matches(wrong));
+        }
+        assert!(FenceAdoptionKey::new("").is_none());
+        assert!(!format!("{key:?}").contains("s3cret"));
+
+        let dir = tempdir().unwrap();
+        let server = Server::boot(dir.path());
+        let meta = server.store.meta_store();
+        assert!(!meta.fence_adoption_authorised(None));
+        assert!(!meta.fence_adoption_authorised(Some(b"s3cret")));
+        server.crash();
+    }
+
+    /// Adoption without the key, with one approver, with the same approver twice (also after
+    /// trimming) or without an incident reference or reason is refused with
+    /// `adoption_not_authorised`, and changes nothing.
+    #[test]
+    fn adopt_requires_key_and_two_approvers() {
+        let dir = tempdir().unwrap();
+        let server = Server::boot(dir.path());
+        server.create_source();
+        let fenced = server.fence_source();
+        let revision = fenced.record.as_ref().unwrap().revision;
+        server.run(async {
+            let state = FenceState::SourceWriteFenced;
+            let refusals = [
+                (adopt_args(&["alice", "bob"]), false),
+                (adopt_args(&["alice"]), true),
+                (adopt_args(&["alice", "alice"]), true),
+                (adopt_args(&["alice", " alice "]), true),
+                (adopt_args(&["alice", ""]), true),
+                (adopt_args(&["alice", "bob", "carol"]), true),
+                (
+                    AdoptArgs {
+                        incident_ref: " ".into(),
+                        ..adopt_args(&["alice", "bob"])
+                    },
+                    true,
+                ),
+                (
+                    AdoptArgs {
+                        reason: String::new(),
+                        ..adopt_args(&["alice", "bob"])
+                    },
+                    true,
+                ),
+            ];
+            for (i, (args, authorised)) in refusals.into_iter().enumerate() {
+                let request = adopt("ns", 10 + i as u128, state, revision, args.clone());
+                let result = run_adopt(&server.store, request, authorised).await;
+                let e = fence_error(&result);
+                assert_eq!(
+                    e.outcome(),
+                    FenceOutcome::FencePreconditionFailed,
+                    "{args:?}"
+                );
+                assert_eq!(
+                    e.detail(),
+                    Some(FenceDetail::AdoptionNotAuthorised),
+                    "{args:?}"
+                );
+            }
+            // Nothing changed: owner, revision, receipts.
+            let inspection = server.inspect().await;
+            let record = inspection.fence.record().unwrap();
+            assert_eq!((record.operation_id, record.revision), (OP, revision));
+            assert!(record.adoptions.is_empty());
+            assert!(inspection
+                .receipts
+                .iter()
+                .all(|r| r.operation_id == OP.to_string()));
+        });
+        server.crash();
+    }
+
+    /// Adopting a write-fenced source changes the owner and the revision and nothing else: the
+    /// state and every admission stay as they were (the write generation moves, as on every
+    /// change of owner, section 7.2), SQL writes are still refused, the old owner is refused
+    /// and the new owner finishes the operation. A replay returns the stored receipt.
+    #[test]
+    fn adopt_keeps_gates_closed() {
+        let dir = tempdir().unwrap();
+        let server = Server::boot(dir.path());
+        server.create_source();
+        let fenced = server.fence_source();
+        let before = fenced.record.clone().unwrap();
+        server.run(async {
+            let fence = server.fence().await;
+            let generation = fence.write_generation();
+            let request = adopt(
+                "ns",
+                10,
+                FenceState::SourceWriteFenced,
+                before.revision,
+                adopt_args(&["alice", "bob"]),
+            );
+            let commit = run_adopt(&server.store, request.clone(), true)
+                .await
+                .unwrap();
+            assert_eq!(commit.kind, FenceCommitKind::Committed);
+            assert_eq!(commit.receipt.outcome, FenceOutcome::Applied);
+            let after = commit.record.clone().unwrap();
+            assert_eq!(after.operation_id, OTHER_OP);
+            assert_eq!(after.revision, before.revision + 1);
+            assert_eq!(after.state, before.state);
+            assert_eq!(after.frozen_boundary, before.frozen_boundary);
+            assert_eq!(after.identity, before.identity);
+            assert_eq!(after.legacy_blocks, before.legacy_blocks);
+            assert_eq!(after.adoptions.len(), 1);
+            let adoption = commit.receipt.adoption.as_ref().unwrap();
+            assert_eq!(adoption.previous_operation_id, OP);
+            assert_eq!(adoption.approvers, vec!["alice", "bob"]);
+            assert_eq!(&after.adoptions[0], adoption);
+
+            // The gate: same state and admissions, the new owner and revision.
+            let gate = fence.gate();
+            assert_eq!(gate.state(), FenceState::SourceWriteFenced);
+            assert_eq!(gate.operation_id(), Some(OTHER_OP));
+            assert_eq!(gate.revision(), before.revision + 1);
+            assert!(!gate.write().is_open());
+            assert!(gate.read().is_open());
+            assert_eq!(fence.write_generation(), generation + 1);
+            assert!(!server.writes_admitted().await);
+            assert_eq!(server.count().await, ROWS);
+            // The marker follows the record.
+            let marker = fence_store::read_marker(&dir.path().join("dbs"), &"ns".into())
+                .unwrap()
+                .unwrap();
+            assert_eq!(marker.unwrap().record, after);
+
+            // Replay, with or without the key: the stored receipt, nothing moves.
+            for authorised in [true, false] {
+                let replay = run_adopt(&server.store, request.clone(), authorised)
+                    .await
+                    .unwrap();
+                assert_eq!(replay.kind, FenceCommitKind::Replayed);
+                assert_eq!(replay.receipt, commit.receipt);
+            }
+            assert_eq!(fence.write_generation(), generation + 1);
+
+            // The old owner is refused.
+            let e = server
+                .execute(release(20, after.revision))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                fence_error(&Err(e)).outcome(),
+                FenceOutcome::FenceOwnedByAnotherOperation
+            );
+            assert!(!server.writes_admitted().await);
+            // The new owner finishes the operation.
+            let released = server
+                .execute(release_by(OTHER_OP, 21, after.revision))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(released.receipt.outcome, FenceOutcome::Applied);
+            assert_eq!(fence.gate().state(), FenceState::Released);
+            assert!(server.writes_admitted().await);
+        });
+        server.crash();
+    }
+
+    /// Adopting a quarantined target moves its import capability to the new owner: the old
+    /// owner can no longer open an import session, the new owner can and imports, and normal
+    /// SQL is still refused with `MIGRATION_TARGET_QUARANTINED`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adopt_quarantined_target() {
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path()).await;
+        create(&store, create_request("tgt", 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let fence = store.fence_controller(&"tgt".into());
+        let request = adopt(
+            "tgt",
+            10,
+            FenceState::TargetQuarantined,
+            1,
+            adopt_args(&["alice", "bob"]),
+        );
+        let commit = run_adopt(&store, request, true).await.unwrap();
+        let after = commit.record.unwrap();
+        assert_eq!(
+            (after.state, after.revision, after.operation_id),
+            (FenceState::TargetQuarantined, 2, OTHER_OP)
+        );
+        assert_eq!(fence.gate().state(), FenceState::TargetQuarantined);
+        for class in [OperationClass::NormalRead, OperationClass::NormalWrite] {
+            assert_eq!(
+                fence.permits(class).unwrap_err().outcome(),
+                FenceOutcome::MigrationTargetQuarantined
+            );
+        }
+
+        let e = store
+            .open_import_session("tgt".into(), OP, 2)
+            .await
+            .err()
+            .expect("the old owner has no import capability");
+        assert_eq!(
+            fence_error(&Err(e)).outcome(),
+            FenceOutcome::FenceOwnedByAnotherOperation
+        );
+        let mut session = store
+            .open_import_session("tgt".into(), OTHER_OP, 2)
+            .await
+            .unwrap();
+        session
+            .with_raw(|conn| conn.execute_batch("create table t (x); insert into t values (1)"))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Finished operations cannot be adopted: `TARGET_WRITABLE`, `TARGET_ABORTED` and a
+    /// `RELEASED` source are refused with `operation_finished`, and nothing changes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adopt_cannot_touch_writable() {
+        // TARGET_WRITABLE.
+        let (_dir, store, fence) = write_fenced_target().await;
+        execute_target(&store, enable_request(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fence.gate().state(), FenceState::TargetWritable);
+        let revision = fence.gate().revision();
+        let request = adopt(
+            "tgt",
+            40,
+            FenceState::TargetWritable,
+            revision,
+            adopt_args(&["alice", "bob"]),
+        );
+        let e = fence_error(&run_adopt(&store, request, true).await).clone();
+        assert_eq!(e.outcome(), FenceOutcome::InvalidFenceTransition);
+        assert_eq!(e.detail(), Some(FenceDetail::OperationFinished));
+        assert_eq!(fence.gate().operation_id(), Some(OP));
+        assert_eq!(fence.gate().revision(), revision);
+
+        // TARGET_ABORTED.
+        let dir = tempdir().unwrap();
+        let store = open_store(dir.path()).await;
+        create(&store, create_request("tgt", 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let abort = target_command(
+            2,
+            FenceState::TargetQuarantined,
+            1,
+            FenceCommand::AbortQuarantinedTarget,
+        );
+        execute_target(&store, abort).await.unwrap().unwrap();
+        let fence = store.fence_controller(&"tgt".into());
+        assert_eq!(fence.gate().state(), FenceState::TargetAborted);
+        let request = adopt(
+            "tgt",
+            3,
+            FenceState::TargetAborted,
+            2,
+            adopt_args(&["alice", "bob"]),
+        );
+        let e = fence_error(&run_adopt(&store, request, true).await).clone();
+        assert_eq!(e.outcome(), FenceOutcome::InvalidFenceTransition);
+        assert_eq!(e.detail(), Some(FenceDetail::OperationFinished));
+        assert_eq!(fence.gate().revision(), 2);
+    }
+
+    /// A released source cannot be adopted either.
+    #[test]
+    fn adopt_cannot_touch_released() {
+        let dir = tempdir().unwrap();
+        let server = Server::boot(dir.path());
+        server.create_source();
+        let revision = server.fence_source().record.unwrap().revision;
+        server.run(async {
+            server.execute(release(2, revision)).await.unwrap().unwrap();
+            let request = adopt(
+                "ns",
+                3,
+                FenceState::Released,
+                revision + 1,
+                adopt_args(&["alice", "bob"]),
+            );
+            let e = fence_error(&run_adopt(&server.store, request, true).await).clone();
+            assert_eq!(e.detail(), Some(FenceDetail::OperationFinished));
+        });
+        server.crash();
+    }
+
+    async fn raw_meta(dir: &Path) -> crate::namespace::meta_store::MetaStoreConnection {
+        let (maker, _) = metastore_connection_maker(None, dir).await.unwrap();
+        maker().unwrap()
+    }
+
+    fn unavailable_detail(result: crate::Result<()>) -> FenceDetail {
+        match result {
+            Err(Error::NamespaceFence(e)) => {
+                assert_eq!(e.outcome(), FenceOutcome::FenceStateUnavailable, "{e}");
+                e.detail().unwrap()
+            }
+            other => panic!("expected FENCE_STATE_UNAVAILABLE, got {other:?}"),
+        }
+    }
+
+    /// After a metastore rollback (a restore from a backup older than the fence), the
+    /// namespace is `UNKNOWN_UNAVAILABLE` with `metastore_behind_marker`. Adoption re-establishes
+    /// the record the marker holds, under the adopting operation, at the marker's revision + 1,
+    /// both when the fence row is gone (the backup predates the fence) and when it is at an
+    /// older revision (the backup predates the last transition). The namespace is then served
+    /// again behind the same gate, with its own `block_*` values in memory, and the new owner
+    /// finishes the operation.
+    #[test]
+    fn adopt_recovers_metastore_rollback() {
+        for row_behind in [false, true] {
+            let dir = tempdir().unwrap();
+            let server = Server::boot(dir.path());
+            server.create_source();
+            let fenced = server.fence_source().record.unwrap();
+            let saved_row: (i64, i64, Vec<u8>) = server.run(async {
+                raw_meta(dir.path())
+                    .await
+                    .query_row(
+                        "SELECT format_version, revision, record FROM namespace_fences",
+                        (),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .unwrap()
+            });
+            // With the row kept behind, one more transition moves the marker on.
+            let marker_record = if row_behind {
+                let read = FenceRequest {
+                    namespace: "ns".into(),
+                    operation_id: OP,
+                    command_id: Uuid::from_u128(2),
+                    expected_state: FenceState::SourceWriteFenced,
+                    expected_revision: fenced.revision,
+                    command: FenceCommand::SetSourceReadFence {
+                        drain_policy: Some(LONG),
+                    },
+                };
+                let commit = server.run(async { server.execute(read).await.unwrap().unwrap() });
+                assert_eq!(commit.receipt.outcome, FenceOutcome::Applied);
+                commit.record.unwrap()
+            } else {
+                fenced.clone()
+            };
+            server.crash();
+
+            // What restoring the metastore from an older backup leaves: no receipts, and the
+            // fence row gone or at the older revision. The config row keeps the legacy
+            // mirror the acquisition wrote into it (block_writes on).
+            server_run_blocking(|| async {
+                let conn = raw_meta(dir.path()).await;
+                conn.execute("DELETE FROM namespace_fence_receipts", ())
+                    .unwrap();
+                if row_behind {
+                    conn.execute(
+                        "UPDATE namespace_fences SET format_version = ?1, revision = ?2, \
+                         record = ?3",
+                        (saved_row.0, saved_row.1, &saved_row.2),
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute("DELETE FROM namespace_fences", ()).unwrap();
+                }
+            });
+
+            let server = Server::boot(dir.path());
+            server.run(async {
+                let store = &server.store;
+                assert_eq!(
+                    unavailable_detail(store.with("ns".into(), |_| ()).await),
+                    FenceDetail::MetastoreBehindMarker
+                );
+                assert!(store.meta_store().lookup(&"ns".into()).await.is_err());
+
+                // The adoption has to name the marker's state, revision and owner.
+                let wrong_revision = adopt(
+                    "ns",
+                    10,
+                    marker_record.state,
+                    saved_row.1 as u64,
+                    adopt_args(&["alice", "bob"]),
+                );
+                if row_behind {
+                    let e = fence_error(&run_adopt(store, wrong_revision, true).await).clone();
+                    assert_eq!(e.outcome(), FenceOutcome::FenceRevisionMismatch);
+                }
+                let request = adopt(
+                    "ns",
+                    11,
+                    marker_record.state,
+                    marker_record.revision,
+                    adopt_args(&["alice", "bob"]),
+                );
+                let e = fence_error(&run_adopt(store, request.clone(), false).await).clone();
+                assert_eq!(e.detail(), Some(FenceDetail::AdoptionNotAuthorised));
+
+                let commit = run_adopt(store, request, true).await.unwrap();
+                assert_eq!(commit.receipt.outcome, FenceOutcome::Applied);
+                let adopted = commit.record.unwrap();
+                assert_eq!(adopted.operation_id, OTHER_OP);
+                assert_eq!(adopted.revision, marker_record.revision + 1);
+                assert_eq!(adopted.state, marker_record.state);
+                assert_eq!(adopted.frozen_boundary, marker_record.frozen_boundary);
+                assert_eq!(adopted.adoptions.len(), 1);
+
+                // Established again: durable, served, and behind the same gate.
+                let inspection = server.inspect().await;
+                assert_eq!(inspection.fence.record(), Some(&adopted));
+                let fence = server.fence().await;
+                assert_eq!(fence.gate().state(), marker_record.state);
+                assert_eq!(fence.gate().operation_id(), Some(OTHER_OP));
+                assert!(!server.writes_admitted().await);
+                let config = store.meta_store().lookup(&"ns".into()).await.unwrap();
+                let config = config.unwrap().get();
+                assert!(!config.block_writes, "the namespace's own values are back");
+                assert!(!config.block_reads);
+                let marker = fence_store::read_marker(&dir.path().join("dbs"), &"ns".into())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(marker.unwrap().record, adopted);
+
+                // The new owner finishes the operation.
+                let mut revision = adopted.revision;
+                if row_behind {
+                    let clear = FenceRequest {
+                        namespace: "ns".into(),
+                        operation_id: OTHER_OP,
+                        command_id: Uuid::from_u128(20),
+                        expected_state: FenceState::SourceReadFenced,
+                        expected_revision: revision,
+                        command: FenceCommand::ClearSourceReadFence,
+                    };
+                    revision = server
+                        .execute(clear)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .record
+                        .unwrap()
+                        .revision;
+                }
+                server
+                    .execute(release_by(OTHER_OP, 21, revision))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(server.writes_admitted().await);
+                assert_eq!(server.count().await, ROWS);
+            });
+            server.crash();
+        }
+    }
+
+    /// Run `f` on a throwaway runtime (between two server lifetimes).
+    fn server_run_blocking<F, Fut>(f: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f());
+    }
+
+    /// A metastore restored from a backup that predates the namespace itself holds neither a
+    /// fence row nor a config row for it. Adoption is refused with
+    /// `FENCE_PRECONDITION_FAILED` / `namespace_config_missing` (after the authorisation
+    /// checks): the marker holds the fence record, not the namespace's configuration, and
+    /// adoption does not invent one. Nothing is written and the name stays unavailable.
+    #[test]
+    fn adopt_recovered_name_without_config_row() {
+        let dir = tempdir().unwrap();
+        let server = Server::boot(dir.path());
+        server.create_source();
+        let fenced = server.fence_source().record.unwrap();
+        server.crash();
+        let marker_before = read_marker_bytes(&dir.path().join("dbs"));
+        server_run_blocking(|| async {
+            let conn = raw_meta(dir.path()).await;
+            for sql in [
+                "DELETE FROM namespace_fence_receipts",
+                "DELETE FROM namespace_fences",
+                "DELETE FROM namespace_configs",
+            ] {
+                conn.execute(sql, ()).unwrap();
+            }
+        });
+
+        let server = Server::boot(dir.path());
+        server.run(async {
+            let store = &server.store;
+            assert_eq!(
+                unavailable_detail(store.with("ns".into(), |_| ()).await),
+                FenceDetail::MetastoreBehindMarker
+            );
+            let request = adopt(
+                "ns",
+                10,
+                fenced.state,
+                fenced.revision,
+                adopt_args(&["alice", "bob"]),
+            );
+            let e = fence_error(&run_adopt(store, request.clone(), false).await).clone();
+            assert_eq!(e.detail(), Some(FenceDetail::AdoptionNotAuthorised));
+            let e = fence_error(&run_adopt(store, request, true).await).clone();
+            assert_eq!(e.outcome(), FenceOutcome::FencePreconditionFailed);
+            assert_eq!(e.detail(), Some(FenceDetail::NamespaceConfigMissing));
+
+            // Nothing was written, and the name is still unavailable.
+            let conn = raw_meta(dir.path()).await;
+            for table in [
+                "namespace_fences",
+                "namespace_fence_receipts",
+                "namespace_configs",
+            ] {
+                let n: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), (), |r| r.get(0))
+                    .unwrap();
+                assert_eq!(n, 0, "{table}");
+            }
+            assert_eq!(read_marker_bytes(&dir.path().join("dbs")), marker_before);
+            assert_eq!(
+                unavailable_detail(store.with("ns".into(), |_| ()).await),
+                FenceDetail::MetastoreBehindMarker
+            );
+            assert!(store.meta_store().handle("ns".into()).await.is_err());
+            assert!(store.fence_controller(&"ns".into()).gate().is_unavailable());
+        });
+        server.crash();
+    }
+}

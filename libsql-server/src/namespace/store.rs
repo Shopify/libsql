@@ -32,7 +32,9 @@ use super::fence::registry::FenceRegistry;
 use super::fence::state::{FenceState, Role};
 use super::fence::store::StoredFence;
 use super::fence::target::{self, CreateTargetRequest, ValidationSession};
-use super::meta_store::{FenceCommit, FenceContext, FenceInspection, MetaStore, MetaStoreHandle};
+use super::meta_store::{
+    FenceCommit, FenceCommitKind, FenceContext, FenceInspection, MetaStore, MetaStoreHandle,
+};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
@@ -633,6 +635,33 @@ impl NamespaceStore {
         request: FenceRequest,
         server: ServerIdentity,
     ) -> crate::Result<FenceCommit> {
+        self.execute_fence_command_authorised(request, server, false)
+            .await
+    }
+
+    /// [`execute_fence_command`](Self::execute_fence_command) for a request that may carry
+    /// the adoption key: `adoption_authorised` says whether it did (section 12). Only
+    /// `AdoptFence` looks at it. A committed adoption is written to the audit log (target
+    /// `libsql_server::fence::audit`) with its approvers, incident reference and reason.
+    pub(crate) async fn execute_fence_command_authorised(
+        &self,
+        request: FenceRequest,
+        server: ServerIdentity,
+        adoption_authorised: bool,
+    ) -> crate::Result<FenceCommit> {
+        if let FenceCommand::AdoptFence(_) = &request.command {
+            let namespace = request.namespace.clone();
+            let controller = self.inner.fences.controller(&namespace);
+            let mut ctx = FenceContext::now(server, None);
+            ctx.adoption_authorised = adoption_authorised;
+            let commit = controller
+                .execute(&self.inner.metadata, request, ctx)
+                .await?;
+            if commit.kind == FenceCommitKind::Committed {
+                super::fence::audit::adoption(&namespace, &commit);
+            }
+            return Ok(commit);
+        }
         let controller = match request.command {
             FenceCommand::CreateTargetQuarantined { .. } => {
                 return self.run_create_target(request, server).await
