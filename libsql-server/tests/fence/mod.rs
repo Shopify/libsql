@@ -13,7 +13,8 @@ use hyper::StatusCode;
 use libsql_server::auth::user_auth_strategies::http_basic::HttpBasic;
 use libsql_server::auth::Auth;
 use libsql_server::config::{
-    AdminApiConfig, MetaStoreConfig, RpcClientConfig, RpcServerConfig, UserApiConfig,
+    AdminApiConfig, FenceAdoptionKey, MetaStoreConfig, RpcClientConfig, RpcServerConfig,
+    UserApiConfig,
 };
 use s3s::header::AUTHORIZATION;
 use serde_json::{json, Value};
@@ -33,6 +34,8 @@ pub struct Primary {
     pub fence_enabled: bool,
     /// A basic-auth credential the user API requires; `None` leaves it unauthenticated.
     pub user_credential: Option<&'static str>,
+    /// The fence adoption key; `None` leaves adoption disabled.
+    pub adoption_key: Option<&'static str>,
 }
 
 impl Default for Primary {
@@ -41,6 +44,7 @@ impl Default for Primary {
             admin_key: Some(ADMIN_KEY),
             fence_enabled: true,
             user_credential: None,
+            adoption_key: None,
         }
     }
 }
@@ -58,6 +62,7 @@ pub fn make_primary(sim: &mut Sim, path: PathBuf, primary: Primary) {
         admin_key,
         fence_enabled,
         user_credential,
+        adoption_key,
     } = primary;
     sim.host("primary", move || {
         let path = path.clone();
@@ -83,6 +88,7 @@ pub fn make_primary(sim: &mut Sim, path: PathBuf, primary: Primary) {
                 }),
                 meta_store_config: MetaStoreConfig {
                     namespace_fence: fence_enabled,
+                    namespace_fence_adoption_key: adoption_key.and_then(FenceAdoptionKey::new),
                     ..Default::default()
                 },
                 disable_namespaces: false,
@@ -193,6 +199,22 @@ impl Admin {
 
     pub async fn inspect(&self, ns: &str) -> anyhow::Result<(StatusCode, Value)> {
         self.get(&format!("/v1/namespaces/{ns}/fence")).await
+    }
+
+    /// `AdoptFence`, presenting `adoption_key` (if any) in the adoption key header.
+    pub async fn adopt(
+        &self,
+        ns: &str,
+        body: Value,
+        adoption_key: Option<&str>,
+    ) -> anyhow::Result<(StatusCode, Value)> {
+        let url = format!("http://primary:9090/v1/namespaces/{ns}/fence/adopt");
+        let mut headers = self.headers();
+        let name = hyper::header::HeaderName::from_static("x-libsql-fence-adoption-key");
+        if let Some(key) = adoption_key {
+            headers.push((name, key));
+        }
+        Self::json(self.client.post_with_headers(&url, &headers, body).await?).await
     }
 
     /// A fence command: `route` is the part after `/fence/`.
