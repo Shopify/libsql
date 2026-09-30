@@ -32,7 +32,7 @@ use super::fence::registry::FenceRegistry;
 use super::fence::state::{FenceState, Role};
 use super::fence::store::StoredFence;
 use super::fence::target::{self, CreateTargetRequest, ValidationSession};
-use super::meta_store::{FenceCommit, FenceContext, MetaStore, MetaStoreHandle};
+use super::meta_store::{FenceCommit, FenceContext, FenceInspection, MetaStore, MetaStoreHandle};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
@@ -556,8 +556,6 @@ impl NamespaceStore {
     /// (`docs/NAMESPACE_FENCE.md` sections 5.3 and 8). `AcquireSourceWriteFence` loads the
     /// namespace first, so that its connection manager and replication log are registered with
     /// the namespace's controller before the drain needs them.
-    // The admin routes that call this are not part of the server yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn execute_fence_command(
         &self,
         request: FenceRequest,
@@ -879,6 +877,36 @@ impl NamespaceStore {
             return Ok(Some(self.inner.fences.controller(namespace)));
         }
         Ok(None)
+    }
+
+    /// Whether this store serves primary namespaces. Fences live on the primary that owns the
+    /// WAL; a replica-kind server refuses every fence route (`docs/NAMESPACE_FENCE.md` 4.1).
+    pub(crate) fn is_primary(&self) -> bool {
+        !self.inner.db_kind.is_replica()
+    }
+
+    /// The fence controller `namespace` already has, without creating one.
+    pub(crate) fn existing_fence_controller(
+        &self,
+        namespace: &NamespaceName,
+    ) -> Option<Arc<FenceController>> {
+        self.inner.fences.get(namespace)
+    }
+
+    /// `InspectFence`: the durable fence and receipts of `namespace` as the metastore holds
+    /// them, and the namespace's controller if it has one (for the live gate and drain
+    /// counters). Read-only: it neither loads the namespace nor creates a controller.
+    pub(crate) async fn inspect_fence(
+        &self,
+        namespace: &NamespaceName,
+    ) -> crate::Result<(FenceInspection, Option<Arc<FenceController>>)> {
+        let inspection = self.inner.metadata.inspect_fence(namespace.clone()).await?;
+        Ok((inspection, self.inner.fences.get(namespace)))
+    }
+
+    /// How many namespaces on this server have an active fence (capability discovery).
+    pub(crate) fn active_fences(&self) -> usize {
+        self.inner.fences.active_count()
     }
 
     pub(crate) fn schema_locks(&self) -> &SchemaLocksRegistry {
