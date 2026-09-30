@@ -235,7 +235,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn execute(
+    pub(crate) fn execute(
         store: &NamespaceStore,
         request: FenceRequest,
     ) -> tokio::task::JoinHandle<crate::Result<FenceCommit>> {
@@ -303,7 +303,7 @@ pub(crate) mod tests {
     }
 
     /// A target with successful validation, published readable and write-fenced at revision 5.
-    async fn write_fenced_target() -> (TempDir, NamespaceStore, Arc<FenceController>) {
+    pub(crate) async fn write_fenced_target() -> (TempDir, NamespaceStore, Arc<FenceController>) {
         let (dir, store, fence) = validating_target().await;
         record_validation(&store, 20, 3, ValidationResult::Ok).await;
         let publish = target_command(

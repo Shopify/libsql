@@ -17,7 +17,8 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 
 use libsql_server::config::{
     AdminApiConfig, BottomlessConfig, DbConfig, DumpImportConfig, DumpImporterKind,
-    HeartbeatConfig, MetaStoreConfig, RpcClientConfig, RpcServerConfig, TlsConfig, UserApiConfig,
+    FenceAdoptionKey, HeartbeatConfig, MetaStoreConfig, RpcClientConfig, RpcServerConfig,
+    TlsConfig, UserApiConfig,
 };
 use libsql_server::net::AddrIncoming;
 use libsql_server::version::Version;
@@ -308,6 +309,17 @@ struct Cli {
     /// seconds; ignored unless `--enable-namespace-fence` is set.
     #[clap(long, env = "SQLD_NAMESPACE_FENCE_KEEPALIVE_INTERVAL_S")]
     namespace_fence_keepalive_interval_s: Option<u64>,
+
+    /// The separate secret that authorises namespace fence adoption (incident recovery of an
+    /// unfinished operation whose owner was lost), presented in the
+    /// `x-libsql-fence-adoption-key` header beside the admin credential. Adoption is disabled
+    /// when this is not set.
+    #[clap(
+        long,
+        env = "SQLD_NAMESPACE_FENCE_ADOPTION_KEY",
+        hide_env_values = true
+    )]
+    namespace_fence_adoption_key: Option<String>,
 
     /// Shutdown timeout duration in seconds, defaults to 30 seconds.
     #[clap(long, env = "SQLD_SHUTDOWN_TIMEOUT")]
@@ -721,6 +733,13 @@ fn make_meta_store_config(config: &Cli) -> anyhow::Result<MetaStoreConfig> {
         namespace_fence_default_read_drain: config
             .namespace_fence_default_read_drain_ms
             .map(Duration::from_millis),
+        namespace_fence_adoption_key: match config.namespace_fence_adoption_key.as_deref() {
+            None => None,
+            Some(key) => Some(
+                FenceAdoptionKey::new(key)
+                    .context("--namespace-fence-adoption-key must not be empty")?,
+            ),
+        },
     })
 }
 

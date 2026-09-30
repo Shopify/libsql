@@ -4,7 +4,8 @@
 //! server was started with `--enable-namespace-fence`, except `InspectFence`, which is also
 //! served while fence state exists in the metastore with the flag off (fences are enforced
 //! either way, section 13.1). Every mutating route runs through
-//! [`NamespaceStore::execute_fence_command`], which owns replay, the drains and target creation.
+//! [`NamespaceStore::execute_fence_command`], which owns replay, the drains and target creation
+//! (`AdoptFence` through `execute_fence_command_authorised`, with the adoption key check).
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use bytes::Bytes;
-use hyper::StatusCode;
+use hyper::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -23,12 +24,14 @@ use crate::auth::parse_jwt_keys;
 use crate::error::Error;
 use crate::hrana::proto;
 use crate::namespace::fence::command::{
-    CommandKind, DrainPolicy, FenceCommand, FenceRequest, OnDeadline, TargetConfig,
+    AdoptArgs, CommandKind, DrainPolicy, FenceCommand, FenceRequest, OnDeadline, TargetConfig,
     ValidationResult,
 };
 use crate::namespace::fence::controller::{DrainCounters, FenceController};
 use crate::namespace::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
-use crate::namespace::fence::record::{CommandReceipt, NamespaceFenceRecord, ServerIdentity};
+use crate::namespace::fence::record::{
+    Adoption, CommandReceipt, NamespaceFenceRecord, ServerIdentity,
+};
 use crate::namespace::fence::state::FenceState;
 use crate::namespace::fence::store::{StoredFence, StoredReceipt};
 use crate::namespace::fence::{server_identity, FENCE_PROTOCOL_VERSION, PROXY_STABLE_CODE};
@@ -43,9 +46,11 @@ use super::AppState;
 /// looks at part of a result.
 pub const MAX_VALIDATION_QUERY_ROWS: usize = 10_000;
 
+/// The header that carries the adoption key (section 12).
+pub const ADOPTION_KEY_HEADER: &str = "x-libsql-fence-adoption-key";
+
 /// The commands this server serves over the admin API, reported by capability discovery.
-/// Adoption is served once its route exists.
-const SERVED_COMMANDS: [&str; 11] = [
+const SERVED_COMMANDS: [&str; 12] = [
     "InspectFence",
     CommandKind::AcquireSourceWriteFence.as_str(),
     CommandKind::SetSourceReadFence.as_str(),
@@ -57,6 +62,7 @@ const SERVED_COMMANDS: [&str; 11] = [
     CommandKind::PublishTargetReadableWriteFenced.as_str(),
     CommandKind::EnableTargetWrites.as_str(),
     CommandKind::AbortQuarantinedTarget.as_str(),
+    CommandKind::AdoptFence.as_str(),
 ];
 
 /// The fence routes, added to the admin router.
@@ -66,7 +72,7 @@ pub(super) fn routes<C: Connector>() -> axum::Router<Arc<AppState<C>>> {
             move |State(state): State<Arc<AppState<C>>>,
                   Path(namespace): Path<String>,
                   body: Bytes| async move {
-                handle_command(state, namespace, kind, body).await
+                handle_command(state, namespace, kind, body, false).await
             },
         )
     };
@@ -117,6 +123,7 @@ pub(super) fn routes<C: Connector>() -> axum::Router<Arc<AppState<C>>> {
             "/v1/namespaces/:namespace/fence/target/validation-query",
             post(handle_validation_query),
         )
+        .route("/v1/namespaces/:namespace/fence/adopt", post(handle_adopt))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -215,11 +222,30 @@ async fn handle_inspect<C>(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// `AdoptFence` (section 12): the admin credential (checked by the middleware) and the separate
+/// adoption key in [`ADOPTION_KEY_HEADER`]. Whether the key matched is handed to the transition,
+/// which refuses an unauthorised adoption with `adoption_not_authorised` after replay handling,
+/// like every other check.
+async fn handle_adopt<C>(
+    State(state): State<Arc<AppState<C>>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let presented = headers.get(ADOPTION_KEY_HEADER).map(|v| v.as_bytes());
+    let authorised = state
+        .namespaces
+        .meta_store()
+        .fence_adoption_authorised(presented);
+    handle_command(state, namespace, CommandKind::AdoptFence, body, authorised).await
+}
+
 async fn handle_command<C>(
     state: Arc<AppState<C>>,
     namespace: String,
     kind: CommandKind,
     body: Bytes,
+    adoption_authorised: bool,
 ) -> Response {
     if !state.namespaces.meta_store().fence_enabled() {
         return StatusCode::NOT_FOUND.into_response();
@@ -235,11 +261,18 @@ async fn handle_command<C>(
         Ok(request) => request,
         Err(e) => return error_reply(&state, &namespace, e).await,
     };
-    match state
-        .namespaces
-        .execute_fence_command(request, server_identity())
-        .await
-    {
+    let result = if kind == CommandKind::AdoptFence {
+        state
+            .namespaces
+            .execute_fence_command_authorised(request, server_identity(), adoption_authorised)
+            .await
+    } else {
+        state
+            .namespaces
+            .execute_fence_command(request, server_identity())
+            .await
+    };
+    match result {
         Ok(commit) => success_reply(&state, &namespace, commit),
         Err(e) => fence_or_error(&state, &namespace, e).await,
     }
@@ -650,9 +683,12 @@ fn parse_command(
         }
         CommandKind::EnableTargetWrites => FenceCommand::EnableTargetWrites,
         CommandKind::AbortQuarantinedTarget => FenceCommand::AbortQuarantinedTarget,
-        CommandKind::AdoptFence => {
-            return Err(invalid("adoption is not served by this route"));
-        }
+        CommandKind::AdoptFence => FenceCommand::AdoptFence(AdoptArgs {
+            current_operation_id: body.uuid("current_operation_id")?,
+            approvers: body.req("approvers")?,
+            incident_ref: body.req("incident_ref")?,
+            reason: body.req("reason")?,
+        }),
     };
     body.finish()?;
     Ok(FenceRequest {
@@ -907,24 +943,7 @@ fn record_fields(record: &NamespaceFenceRecord, out: &mut Map<String, Value>) {
     out.insert("written_by".into(), server_json(&record.written_by));
     out.insert(
         "adoptions".into(),
-        Value::Array(
-            record
-                .adoptions
-                .iter()
-                .map(|a| {
-                    json!({
-                        "previous_operation_id": a.previous_operation_id.to_string(),
-                        "new_operation_id": a.new_operation_id.to_string(),
-                        "command_id": a.command_id.to_string(),
-                        "approvers": a.approvers,
-                        "incident_ref": a.incident_ref,
-                        "reason": a.reason,
-                        "at": timestamp(a.at_ms),
-                        "revision": a.revision,
-                    })
-                })
-                .collect(),
-        ),
+        Value::Array(record.adoptions.iter().map(adoption_json).collect()),
     );
 }
 
@@ -1022,6 +1041,19 @@ fn metastore_provenance_json(provenance: &MetastoreProvenance) -> Value {
     })
 }
 
+fn adoption_json(a: &Adoption) -> Value {
+    json!({
+        "previous_operation_id": a.previous_operation_id.to_string(),
+        "new_operation_id": a.new_operation_id.to_string(),
+        "command_id": a.command_id.to_string(),
+        "approvers": a.approvers,
+        "incident_ref": a.incident_ref,
+        "reason": a.reason,
+        "at": timestamp(a.at_ms),
+        "revision": a.revision,
+    })
+}
+
 fn receipt_json(receipt: &CommandReceipt) -> Value {
     json!({
         "operation_id": receipt.operation_id.to_string(),
@@ -1034,6 +1066,7 @@ fn receipt_json(receipt: &CommandReceipt) -> Value {
         "state_after": receipt.state_after.as_str(),
         "applied_at": timestamp(receipt.applied_at_ms),
         "instance_id": receipt.instance_id.to_string(),
+        "adoption": receipt.adoption.as_ref().map(adoption_json),
     })
 }
 

@@ -191,6 +191,9 @@ pub enum FenceDetail {
     ValidationReceiptRequired,
     RestoreNotAllowed,
     AdoptionNotAuthorised,
+    /// Adoption would have to re-establish a record for a namespace the metastore holds no
+    /// configuration for (section 12).
+    NamespaceConfigMissing,
     InvalidArgument,
     // INVALID_FENCE_TRANSITION
     RoleMismatch,
@@ -217,6 +220,7 @@ impl FenceDetail {
             FenceDetail::ValidationReceiptRequired => "validation_receipt_required",
             FenceDetail::RestoreNotAllowed => "restore_not_allowed",
             FenceDetail::AdoptionNotAuthorised => "adoption_not_authorised",
+            FenceDetail::NamespaceConfigMissing => "namespace_config_missing",
             FenceDetail::InvalidArgument => "invalid_argument",
             FenceDetail::RoleMismatch => "role_mismatch",
             FenceDetail::OperationFinished => "operation_finished",
