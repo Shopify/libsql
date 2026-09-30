@@ -118,12 +118,24 @@ impl NamespaceFenceRecord {
         self.state.read_admission()
     }
 
+    /// Whether the stored config's `block_*` fields hold the fence's mirror (section 13.2)
+    /// rather than the namespace's own values. They stop holding it when the operation releases
+    /// the namespace or enables target writes: that transition puts the saved values back, and
+    /// from then on config writes store the namespace's own values in the row again, so the row
+    /// is authoritative and `legacy_blocks` may be out of date.
+    pub fn mirrors_legacy_blocks(&self) -> bool {
+        !matches!(
+            self.state,
+            FenceState::Released | FenceState::TargetWritable
+        )
+    }
+
     /// Values of the legacy `block_*` configuration fields while this record is in force: the
     /// fence state mirrored for an older binary, or the pre-fence values once the operation
     /// has released the namespace.
     pub fn legacy_mirror(&self) -> LegacyBlocks {
         match self.state {
-            FenceState::Released | FenceState::TargetWritable => self.legacy_blocks.clone(),
+            _ if !self.mirrors_legacy_blocks() => self.legacy_blocks.clone(),
             state => LegacyBlocks {
                 block_reads: !state.read_admission().is_open(),
                 block_writes: !state.write_admission().is_open(),

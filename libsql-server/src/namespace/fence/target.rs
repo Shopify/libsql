@@ -219,7 +219,7 @@ pub(crate) mod tests {
         tokio::spawn(async move { store.create_target_quarantined(req, server()).await })
     }
 
-    fn target_command(
+    pub(crate) fn target_command(
         command_id: u128,
         expected_state: FenceState,
         expected_revision: u64,
@@ -320,7 +320,7 @@ pub(crate) mod tests {
         (dir, store, fence)
     }
 
-    fn enable_request(command_id: u128) -> FenceRequest {
+    pub(crate) fn enable_request(command_id: u128) -> FenceRequest {
         target_command(
             command_id,
             FenceState::TargetWriteFenced,

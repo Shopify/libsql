@@ -675,6 +675,18 @@ pub fn with_legacy_blocks(config: &DatabaseConfig, blocks: &LegacyBlocks) -> Dat
     }
 }
 
+/// The namespace's own config, given its stored config row `stored` and its fence record: the
+/// row with the record's saved `block_*` values in place of the mirror while the record
+/// mirrors them, and the row itself once the operation has finished (section 13.2), since
+/// config writes after a release or a write enable store the namespace's own values.
+pub fn own_config(stored: &DatabaseConfig, record: &NamespaceFenceRecord) -> DatabaseConfig {
+    if record.mirrors_legacy_blocks() {
+        with_legacy_blocks(stored, &record.legacy_blocks)
+    } else {
+        stored.clone()
+    }
+}
+
 /// The `block_*` fields of `config`.
 pub fn legacy_blocks_of(config: &DatabaseConfig) -> LegacyBlocks {
     LegacyBlocks {
