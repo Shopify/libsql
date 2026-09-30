@@ -328,10 +328,11 @@ async fn handle_post_config<C>(
         // Check that the jwt keys are correct
         parse_jwt_keys(jwt_key)?;
     }
-    let store = app_state
-        .namespaces
-        .config_store(NamespaceName::from_string(namespace.clone())?)
-        .await?;
+    let namespace_name = NamespaceName::from_string(namespace.clone())?;
+    // Config mutation is lifecycle work: refused while a fence denies it, before the namespace
+    // is loaded (and again in the metastore transaction that would store it).
+    app_state.namespaces.check_lifecycle(&namespace_name)?;
+    let store = app_state.namespaces.config_store(namespace_name).await?;
     let original = (*store.get()).clone();
     let mut updated = original.clone();
     updated.block_reads = req.block_reads;
@@ -397,6 +398,10 @@ async fn handle_create_namespace<C: Connector>(
     Json(req): Json<CreateNamespaceReq>,
 ) -> crate::Result<()> {
     let mut config = DatabaseConfig::default();
+
+    // Creating over a name whose fence denies lifecycle work is refused before a dump is
+    // fetched or anything is stored.
+    app_state.namespaces.check_lifecycle(&namespace)?;
 
     if let Some(jwt_key) = req.jwt_key {
         // Check that the jwt keys are correct

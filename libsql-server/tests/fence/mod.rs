@@ -3,6 +3,7 @@
 //! Namespace fence integration tests (`docs/NAMESPACE_FENCE.md`), driven over the admin API.
 
 mod admin;
+mod lifecycle;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -126,6 +127,16 @@ impl Admin {
         .await
     }
 
+    pub async fn delete(&self, path: &str) -> anyhow::Result<(StatusCode, Value)> {
+        let url = format!("http://primary:9090{path}");
+        Self::json(
+            self.client
+                .delete_with_headers(&url, &self.headers(), json!({}))
+                .await?,
+        )
+        .await
+    }
+
     pub async fn create_namespace(&self, ns: &str) -> anyhow::Result<()> {
         let (status, body) = self
             .post(&format!("/v1/namespaces/{ns}/create"), json!({}))
@@ -185,4 +196,33 @@ pub fn connect(ns: &str) -> anyhow::Result<libsql::Connection> {
         TurmoilConnector,
     )?;
     Ok(db.connect()?)
+}
+
+/// Load `ns` on the server with one write, and return the replication log id the server
+/// reports for it.
+pub async fn load_and_log_id(admin: &Admin, ns: &str) -> anyhow::Result<String> {
+    let conn = connect(ns)?;
+    conn.execute("create table if not exists t (x)", ()).await?;
+    conn.execute("insert into t values (1)", ()).await?;
+    let (status, body) = admin.inspect(ns).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(state_of(&body), ("UNFENCED", 0), "{body}");
+    Ok(body["fence"]["incarnation"]["current_log_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no current_log_id: {body}"))
+        .to_string())
+}
+
+/// An `AcquireSourceWriteFence` body for a namespace in `UNFENCED` at revision 0.
+pub fn acquire_body(op: Uuid, cmd: Uuid, log_id: &str) -> Value {
+    command_body(
+        op,
+        cmd,
+        "UNFENCED",
+        0,
+        json!({
+            "expected_namespace_identity": { "log_id": log_id },
+            "drain_policy": { "deadline_ms": 5000, "on_deadline": "fail" },
+        }),
+    )
 }

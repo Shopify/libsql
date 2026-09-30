@@ -91,11 +91,25 @@ impl Client {
         url: &str,
         body: T,
     ) -> anyhow::Result<Response> {
+        self.delete_with_headers(url, &[], body).await
+    }
+
+    pub(crate) async fn delete_with_headers<T: Serialize>(
+        &self,
+        url: &str,
+        headers: &[(HeaderName, &str)],
+        body: T,
+    ) -> anyhow::Result<Response> {
         let bytes: Bytes = serde_json::to_vec(&body)?.into();
         let body = Body::from(bytes);
-        let request = hyper::Request::delete(url)
+        let mut request = hyper::Request::delete(url)
             .header("Content-Type", "application/json")
             .body(body)?;
+        for (key, val) in headers {
+            request
+                .headers_mut()
+                .insert(key.clone(), val.parse().unwrap());
+        }
         let resp = self.0.request(request).await?;
 
         Ok(Response(resp))
