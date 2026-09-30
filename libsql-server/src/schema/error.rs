@@ -60,7 +60,7 @@ impl IntoResponse for &Error {
                 self.format_err(StatusCode::BAD_REQUEST)
             }
             Error::MigrationExecuteError(e) => e.as_ref().into_response(),
-            Error::NamespaceFence(e) => self.format_err(e.outcome().admin_http_status()),
+            Error::NamespaceFence(e) => crate::error::fence_error_response(e),
             _ => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }

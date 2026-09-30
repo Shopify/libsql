@@ -145,6 +145,7 @@ fn lifecycle_rejected_while_fenced() {
                     message.starts_with(code),
                     "{what} on {ns}: expected {code}, got {body}"
                 );
+                assert_eq!(body["code"], code, "{what} on {ns}: {body}");
             }
             // Nothing moved: same state and revision, and no copy was created.
             let (status, body) = admin.inspect(ns).await?;

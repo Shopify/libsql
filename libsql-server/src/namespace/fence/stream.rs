@@ -326,6 +326,48 @@ mod tests {
         assert!(!String::from_utf8_lossy(&body).contains("COMMIT;"));
     }
 
+    /// The same cancellation seen through the HTTP response `/dump` returns: the body fails
+    /// instead of ending, which hyper sends as an aborted response (no final chunk), so a
+    /// client can never take the bytes it received for a complete dump.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dump_response_aborted_on_cancel() {
+        use axum::response::IntoResponse as _;
+        use hyper::body::HttpBody as _;
+
+        let s = large_fenced_source().await;
+        let stream = dump(&s).await.unwrap();
+        let response = axum::body::StreamBody::new(stream).into_response();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        let mut body = response.into_body();
+        let mut head = Vec::new();
+        while !String::from_utf8_lossy(&head).contains("INSERT INTO") {
+            head.extend_from_slice(&body.data().await.unwrap().unwrap());
+        }
+
+        let fenced = tokio::time::timeout(PROMPT, s.execute(read_fence(&s, 2, NOW)))
+            .await
+            .expect("the dump's lease was never released")
+            .unwrap();
+        assert_eq!(fence_outcome(&fenced), FenceOutcome::Applied);
+
+        let mut failed = false;
+        while let Some(chunk) = tokio::time::timeout(PROMPT, body.data())
+            .await
+            .expect("the dump body stalled")
+        {
+            match chunk {
+                Ok(bytes) => head.extend_from_slice(&bytes),
+                Err(e) => {
+                    assert!(e.to_string().contains("MIGRATION_READ_FENCED"), "{e}");
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "the response body ended cleanly");
+        assert!(!String::from_utf8_lossy(&head).contains("COMMIT;"));
+    }
+
     /// The read drain waits for a running dump rather than for time: the fence is acknowledged
     /// only once the dump has completed and released its lease.
     #[tokio::test(flavor = "multi_thread")]
