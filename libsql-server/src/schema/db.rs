@@ -125,9 +125,14 @@ pub(super) fn register_schema_migration_job(
     let Some(row) = rows.next()? else {
         return Err(Error::SchemaDoesntExist(schema.clone()));
     };
-    let config_bytes = row.get_ref(1)?.as_blob().unwrap();
-    // TODO: handle corrupted meta
-    let config = DatabaseConfig::from(&metadata::DatabaseConfig::decode(config_bytes).unwrap());
+    let config_bytes = row
+        .get_ref(1)?
+        .as_blob()
+        .map_err(|e| Error::Registration(Box::new(e)))?;
+    let metadata = metadata::DatabaseConfig::decode(config_bytes)
+        .map_err(|e| Error::Registration(Box::new(e)))?;
+    let config =
+        DatabaseConfig::try_from(&metadata).map_err(|e| Error::Registration(Box::new(e)))?;
     if !config.is_shared_schema {
         return Err(Error::NotASchema(schema.clone()));
     }
@@ -184,27 +189,16 @@ pub(super) fn get_next_pending_migration_tasks_batch(
     limit: usize,
 ) -> Result<Vec<MigrationTask>, Error> {
     let txn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let tasks = txn
-        .prepare(
-            "SELECT task_id, target_namespace, status, job_id 
-            FROM pending_tasks 
+    let tasks = {
+        let mut stmt = txn.prepare(
+            "SELECT task_id, target_namespace, status, job_id
+            FROM pending_tasks
             WHERE job_id = ? AND status = ? AND task_id NOT IN (select * from enqueued_tasks)
             LIMIT ?",
-        )?
-        .query_map((job_id, status as u64, limit), |row| {
-            let task_id = row.get::<_, i64>(0)?;
-            let namespace = NamespaceName::from_string(row.get::<_, String>(1)?).unwrap();
-            let status = MigrationTaskStatus::from_int(row.get::<_, u64>(2)?);
-            let job_id = row.get::<_, i64>(3)?;
-            Ok(MigrationTask {
-                namespace,
-                status,
-                job_id,
-                task_id,
-            })
-        })?
-        .map(|r| r.map_err(Into::into))
-        .collect::<Result<Vec<_>, Error>>()?;
+        )?;
+        let mut rows = stmt.query((job_id, status as u64, limit))?;
+        read_migration_tasks(&mut rows)?
+    };
 
     for task in tasks.iter() {
         txn.execute("INSERT INTO enqueued_tasks VALUES (?)", [task.task_id])?;
@@ -221,33 +215,46 @@ pub(super) fn get_unfinished_task_batch(
     limit: usize,
 ) -> Result<Vec<MigrationTask>, Error> {
     let txn = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let tasks = txn
-        .prepare(
-            "SELECT task_id, target_namespace, status, job_id 
-            FROM pending_tasks 
+    let tasks = {
+        let mut stmt = txn.prepare(
+            "SELECT task_id, target_namespace, status, job_id
+            FROM pending_tasks
             WHERE job_id = ? AND finished = false AND task_id NOT IN (select * from enqueued_tasks)
             LIMIT ?",
-        )?
-        .query_map((job_id, limit), |row| {
-            let task_id = row.get::<_, i64>(0)?;
-            let namespace = NamespaceName::from_string(row.get::<_, String>(1)?).unwrap();
-            let status = MigrationTaskStatus::from_int(row.get::<_, u64>(2)?);
-            let job_id = row.get::<_, i64>(3)?;
-            Ok(MigrationTask {
-                namespace,
-                status,
-                job_id,
-                task_id,
-            })
-        })?
-        .map(|r| r.map_err(Into::into))
-        .collect::<Result<Vec<_>, Error>>()?;
+        )?;
+        let mut rows = stmt.query((job_id, limit))?;
+        read_migration_tasks(&mut rows)?
+    };
 
     for task in tasks.iter() {
         txn.execute("INSERT INTO enqueued_tasks VALUES (?)", [task.task_id])?;
     }
 
     txn.commit()?;
+    Ok(tasks)
+}
+
+// Reject corrupt persisted names before enqueuing any tasks from the batch. An error
+// rolls back the transaction, so the scheduler cannot silently lose unfinished work.
+fn read_migration_tasks(rows: &mut rusqlite::Rows<'_>) -> Result<Vec<MigrationTask>, Error> {
+    let mut tasks = Vec::new();
+    while let Some(row) = rows.next()? {
+        let task_id = row.get::<_, i64>(0)?;
+        let name = row.get::<_, String>(1)?;
+        let namespace = NamespaceName::from_string(name.clone()).map_err(|_| {
+            Error::InvalidPersistedNamespace {
+                kind: "task",
+                id: task_id,
+                name,
+            }
+        })?;
+        tasks.push(MigrationTask {
+            namespace,
+            status: MigrationTaskStatus::from_int(row.get::<_, u64>(2)?),
+            job_id: row.get::<_, i64>(3)?,
+            task_id,
+        });
+    }
     Ok(tasks)
 }
 
@@ -316,7 +323,7 @@ pub(super) fn get_next_pending_migration_job(
     conn: &mut rusqlite::Connection,
 ) -> Result<Option<MigrationJob>, Error> {
     let txn = conn.transaction()?;
-    let mut job = txn
+    let row = txn
         .query_row(
             "SELECT job_id, status, migration, schema
             FROM jobs
@@ -327,23 +334,37 @@ pub(super) fn get_next_pending_migration_job(
                 MigrationJobStatus::RunFailure as u64,
             ),
             |row| {
-                let job_id = row.get::<_, i64>(0)?;
-                let status = MigrationJobStatus::from_int(row.get::<_, u64>(1)?);
-                let mut migration = serde_json::from_str(row.get_ref(2)?.as_str()?).unwrap();
-                let schema = NamespaceName::from_string(row.get::<_, String>(3)?).unwrap();
-                let disable_foreign_key = validate_migration(&mut migration).unwrap();
-                Ok(MigrationJob {
-                    schema,
-                    job_id,
-                    status,
-                    progress: Default::default(),
-                    task_error: None,
-                    disable_foreign_key,
-                    migration: migration.into(),
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             },
         )
         .optional()?;
+    let mut job = if let Some((job_id, status, migration, name)) = row {
+        let schema = NamespaceName::from_string(name.clone()).map_err(|_| {
+            Error::InvalidPersistedNamespace {
+                kind: "job",
+                id: job_id,
+                name,
+            }
+        })?;
+        let mut migration = serde_json::from_str(&migration).unwrap();
+        let disable_foreign_key = validate_migration(&mut migration).unwrap();
+        Some(MigrationJob {
+            schema,
+            job_id,
+            status: MigrationJobStatus::from_int(status),
+            progress: Default::default(),
+            task_error: None,
+            disable_foreign_key,
+            migration: migration.into(),
+        })
+    } else {
+        None
+    };
 
     if let Some(ref mut job) = job {
         txn.prepare(
@@ -481,6 +502,106 @@ mod test {
     use crate::namespace::meta_store::{metastore_connection_maker, MetaStore};
 
     use super::*;
+
+    #[test]
+    fn invalid_persisted_job_schema_can_be_repaired() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        setup_schema(&mut conn).unwrap();
+        let migration = serde_json::to_string(&Program::seq(&["select 1"])).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (schema, migration, status) VALUES (?1, ?2, ?3)",
+            (
+                "../schema",
+                migration,
+                MigrationJobStatus::WaitingDryRun as u64,
+            ),
+        )
+        .unwrap();
+        let job_id = conn.last_insert_rowid();
+
+        assert!(matches!(
+            get_next_pending_migration_job(&mut conn),
+            Err(Error::InvalidPersistedNamespace { kind: "job", id, .. }) if id == job_id
+        ));
+        conn.execute(
+            "UPDATE jobs SET schema = 'schema' WHERE job_id = ?",
+            [job_id],
+        )
+        .unwrap();
+        assert_eq!(
+            get_next_pending_migration_job(&mut conn)
+                .unwrap()
+                .unwrap()
+                .job_id(),
+            job_id
+        );
+    }
+
+    #[test]
+    fn invalid_persisted_task_namespace_does_not_enqueue_partial_batch() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        setup_schema(&mut conn).unwrap();
+        let migration = serde_json::to_string(&Program::seq(&["select 1"])).unwrap();
+        conn.execute(
+            "INSERT INTO jobs (schema, migration, status) VALUES (?1, ?2, ?3)",
+            (
+                "schema",
+                migration,
+                MigrationJobStatus::WaitingDryRun as u64,
+            ),
+        )
+        .unwrap();
+        let job_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO pending_tasks (job_id, target_namespace, status) VALUES (?1, 'valid', ?2)",
+            (job_id, MigrationTaskStatus::Enqueued as u64),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_tasks (job_id, target_namespace, status) VALUES (?1, '../escape', ?2)",
+            (job_id, MigrationTaskStatus::Enqueued as u64),
+        )
+        .unwrap();
+        let bad_task_id = conn.last_insert_rowid();
+
+        for fetch in [false, true] {
+            let result = if fetch {
+                get_unfinished_task_batch(&mut conn, job_id, 10)
+            } else {
+                get_next_pending_migration_tasks_batch(
+                    &mut conn,
+                    job_id,
+                    MigrationTaskStatus::Enqueued,
+                    10,
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(Error::InvalidPersistedNamespace { kind: "task", id, .. }) if id == bad_task_id
+            ));
+            let queued: i64 = conn
+                .query_row("SELECT count(*) FROM enqueued_tasks", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(queued, 0);
+        }
+
+        conn.execute(
+            "UPDATE pending_tasks SET target_namespace = 'repaired' WHERE task_id = ?",
+            [bad_task_id],
+        )
+        .unwrap();
+        assert_eq!(
+            get_next_pending_migration_tasks_batch(
+                &mut conn,
+                job_id,
+                MigrationTaskStatus::Enqueued,
+                10,
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+    }
 
     async fn register_schema(meta_store: &MetaStore, schema: &'static str) {
         meta_store

@@ -70,6 +70,8 @@ pub enum Error {
     NamespaceAlreadyExist(String),
     #[error("Invalid namespace")]
     InvalidNamespace,
+    #[error("Invalid persisted namespace config for `{namespace}`: {reason}. Repair the persisted config before restarting; no data was removed")]
+    InvalidPersistedNamespaceConfig { namespace: String, reason: String },
     #[error("Invalid namespace bytes: `{0}`")]
     InvalidNamespaceBytes(Box<dyn std::error::Error + Sync + Send + 'static>),
     #[error("Replica meta error: {0}")]
@@ -192,6 +194,9 @@ impl IntoResponse for &Error {
             PrimaryConnectionTimeout => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             NamespaceAlreadyExist(_) => self.format_err(StatusCode::BAD_REQUEST),
             InvalidNamespace => self.format_err(StatusCode::BAD_REQUEST),
+            InvalidPersistedNamespaceConfig { .. } => {
+                self.format_err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
             InvalidNamespaceBytes(_) => self.format_err(StatusCode::BAD_REQUEST),
             LoadDumpError(e) => e.into_response(),
             InvalidMetadataBytes(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),

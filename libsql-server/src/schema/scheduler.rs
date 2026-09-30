@@ -81,6 +81,13 @@ impl Scheduler {
                     tracing::info!("all scheduler handles dropped: exiting.");
                     break;
                 }
+                Err(e @ Error::InvalidPersistedNamespace { .. }) => {
+                    // Keep unfinished work intact for explicit operator repair.
+                    tracing::error!(
+                        "migration scheduler stopped on invalid persisted namespace: {e}"
+                    );
+                    break;
+                }
                 Err(e) => {
                     if tries >= MAX_ERROR_RETRIES {
                         tracing::error!("scheduler could not make progress after {MAX_ERROR_RETRIES}, exiting: {e}");
