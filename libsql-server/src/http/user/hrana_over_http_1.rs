@@ -13,6 +13,9 @@ use super::db_factory::MakeConnectionExtractor;
 enum ResponseError {
     #[error(transparent)]
     Stmt(hrana::stmt::StmtError),
+    /// A whole batch refused by the namespace fence.
+    #[error(transparent)]
+    Fence(crate::namespace::fence::outcome::FenceError),
 }
 
 pub async fn handle_index() -> hyper::Response<hyper::Body> {
@@ -81,6 +84,7 @@ pub(crate) async fn handle_batch(
         hrana::batch::execute_batch(&db, ctx, pgm, req_body.batch.replication_index)
             .await
             .map(|result| RespBody { result })
+            .map_err(catch_batch_fence_error)
             .context("Could not execute batch")
     })
     .await?;
@@ -131,6 +135,7 @@ where
 fn response_error_response(err: ResponseError) -> hyper::Response<hyper::Body> {
     use hrana::stmt::StmtError;
     let status = match &err {
+        ResponseError::Fence(err) => err.http_status(),
         ResponseError::Stmt(err) => match err {
             StmtError::SqlParse { .. }
             | StmtError::SqlNoStmt
@@ -145,6 +150,7 @@ fn response_error_response(err: ResponseError) -> hyper::Response<hyper::Body> {
                 hyper::StatusCode::SERVICE_UNAVAILABLE
             }
             StmtError::SqliteError { .. } => hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            StmtError::Fence(err) => err.http_status(),
         },
     };
 
@@ -184,10 +190,21 @@ fn catch_stmt_error(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// A batch the fence refused as a whole is answered like a refused statement, with the fence's
+/// status and code, rather than as an internal error.
+fn catch_batch_fence_error(err: anyhow::Error) -> anyhow::Error {
+    match err.downcast::<hrana::batch::BatchError>() {
+        Ok(hrana::batch::BatchError::Fence(e)) => anyhow!(ResponseError::Fence(e)),
+        Ok(batch_err) => anyhow!(batch_err),
+        Err(err) => err,
+    }
+}
+
 impl ResponseError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Stmt(err) => err.code(),
+            Self::Fence(err) => err.outcome().as_str(),
         }
     }
 }
