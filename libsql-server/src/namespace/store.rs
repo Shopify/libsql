@@ -349,6 +349,118 @@ mod directory_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cache_miss_does_not_resurrect_primary_after_concurrent_destroy() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.evict_cached_namespace(&name).await;
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let read = tokio::spawn({
+            let store = store.clone();
+            let name = name.clone();
+            let entered = entered.clone();
+            let resume = resume.clone();
+            async move {
+                store
+                    .with_after_initial_check(name, |ns| ns.path.clone(), async move {
+                        entered.notify_one();
+                        resume.notified().await;
+                    })
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        store.destroy(name.clone(), false).await.unwrap();
+        resume.notify_one();
+        assert!(matches!(
+            timeout(Duration::from_secs(5), read)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        assert!(!store.exists(&name).await);
+        assert!(!tmp.path().join("dbs/victim").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_fences_delayed_config_handle_and_new_create_gets_new_generation() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("tenant");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let stale = store.config_store(name.clone()).await.unwrap();
+        store.destroy(name.clone(), false).await.unwrap();
+        assert!(!tmp.path().join("dbs/tenant").exists());
+        assert!(!store.exists(&name).await);
+        assert!(matches!(
+            stale.store(DatabaseConfig::default()).await,
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            stale.store(DatabaseConfig::default()).await,
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        assert!(store.exists(&name).await);
+        assert!(tmp.path().join("dbs/tenant").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_rotates_config_generation_without_dropping_new_writes() {
+        let (_tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("tenant");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let stale = store.config_store(name.clone()).await.unwrap();
+        store
+            .reset(name.clone(), RestoreOption::Latest)
+            .await
+            .unwrap();
+        assert!(matches!(
+            stale.store(DatabaseConfig::default()).await,
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        store
+            .config_store(name.clone())
+            .await
+            .unwrap()
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        assert!(store.exists(&name).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn teardown_refuses_replaced_directory_and_preserves_both_inodes() {
         let (tmp, store) = primary_fixture().await;
         let name = NamespaceName::from("victim");
@@ -531,6 +643,7 @@ mod directory_tests {
             std::fs::read(path.join("sentinel")).unwrap(),
             b"not backed up"
         );
+        assert!(store.exists(&name).await);
         assert!(store
             .create(name, RestoreOption::Latest, DatabaseConfig::default())
             .await
@@ -608,10 +721,123 @@ mod directory_tests {
             std::fs::read(path.join("sentinel")).unwrap(),
             b"not confirmed"
         );
+        assert!(store.exists(&name).await);
         assert!(store
             .create(name, RestoreOption::Latest, DatabaseConfig::default())
             .await
             .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_waiter_after_backup_confirmation_drains_owned_teardown() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let held_connection = store.inner.metadata.hold_connection_for_test().await;
+        let ready = Arc::new(Notify::new());
+        let destroy = tokio::spawn({
+            let store = store.clone();
+            let name = name.clone();
+            let ready = ready.clone();
+            async move {
+                store
+                    .destroy_with_commit_signal(name, false, Some(ready))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), ready.notified())
+            .await
+            .unwrap();
+        destroy.abort();
+        assert!(destroy.await.unwrap_err().is_cancelled());
+        // The worker retains the name lock even after the caller exits.
+        let operation = store
+            .inner
+            .name_operations
+            .lock()
+            .unwrap()
+            .get(&name)
+            .and_then(Weak::upgrade)
+            .unwrap();
+        assert!(timeout(Duration::from_millis(20), operation.lock())
+            .await
+            .is_err());
+        drop(held_connection);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !store.exists(&name).await && !tmp.path().join("dbs/victim").exists() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        timeout(
+            Duration::from_secs(5),
+            store.create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(store.exists(&name).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirmed_destroy_rejects_replaced_inode_without_losing_metadata() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (tmp, store) =
+            primary_fixture_with_cleanup_gate(Some((entered.clone(), release.clone(), false)))
+                .await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let path = tmp.path().join("dbs/victim");
+        std::fs::write(path.join("sentinel"), b"old inode").unwrap();
+        let destroy = tokio::spawn({
+            let store = store.clone();
+            let name = name.clone();
+            async move { store.destroy(name, false).await }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        std::fs::rename(&path, tmp.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"replacement").unwrap();
+        release.notify_one();
+        assert!(timeout(Duration::from_secs(5), destroy)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(store.exists(&name).await);
+        assert_eq!(
+            std::fs::read(path.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("original/sentinel")).unwrap(),
+            b"old inode"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1280,27 +1506,31 @@ impl NamespaceStore {
     }
 
     pub async fn destroy(&self, namespace: NamespaceName, prune_all: bool) -> crate::Result<()> {
-        let _name_operation = self.lock_names(&[namespace.clone()]).await?;
-        // Do not remove metadata before proving this name owns its directory.
-        // Retain this expected inode through slow teardown and revalidate it
-        // under the global lock before touching the filesystem again.
-        let expected = self.cleanup_directory_identity(&namespace).await?;
-        // destroy on-disk database and backups
-        let db_config = tokio::task::spawn_blocking({
-            let inner = self.inner.clone();
-            let namespace = namespace.clone();
-            move || {
-                inner
-                    .metadata
-                    .remove(namespace.clone())?
-                    .ok_or_else(|| crate::Error::NamespaceDoesntExist(namespace.to_string()))
-            }
-        })
-        .await??;
+        self.destroy_with_commit_signal(namespace, prune_all, None)
+            .await
+    }
 
+    async fn destroy_with_commit_signal(
+        &self,
+        namespace: NamespaceName,
+        prune_all: bool,
+        after_commit_started: Option<Arc<tokio::sync::Notify>>,
+    ) -> crate::Result<()> {
+        let operation = self.lock_names(&[namespace.clone()]).await?;
+        // Until remote backup confirmation, metadata and the old inode remain
+        // available. Cancellation here cannot strand a metadata-less orphan.
+        if !self.inner.metadata.exists(&namespace).await {
+            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+        }
+        let expected = self.cleanup_directory_identity(&namespace).await?;
+        let db_config = self.inner.metadata.handle(namespace.clone()).await;
+        let generation = self
+            .inner
+            .metadata
+            .generation(&namespace)
+            .expect("persisted namespace has a generation");
         let mut bottomless_db_id_init = NamespaceBottomlessDbIdInit::FetchFromConfig;
         if let Some(ns) = self.inner.store.remove(&namespace).await {
-            // deallocate in-memory resources
             if let Some(ns) = ns.write().await.take() {
                 bottomless_db_id_init = NamespaceBottomlessDbIdInit::Provided(
                     NamespaceBottomlessDbId::from_config(&ns.db_config_store.get()),
@@ -1309,16 +1539,46 @@ impl NamespaceStore {
             }
         }
 
-        self.prepare_cleanup(&namespace, &db_config, prune_all, bottomless_db_id_init)
-            .await?;
-        let (detached, _) = self
-            .detach_owned_directory(&namespace, expected, false)
-            .await?;
-        Self::remove_detached_directory(detached).await?;
+        self.prepare_cleanup(
+            &namespace,
+            &db_config.get(),
+            prune_all,
+            bottomless_db_id_init,
+        )
+        .await?;
 
-        tracing::info!("destroyed namespace: {namespace}");
-
-        Ok(())
+        // From this point on, cancellation of the request must not interrupt
+        // the metadata+directory teardown. Transfer the name lock to a worker
+        // BEFORE the next await; shutdown and a new create wait for this lock.
+        let store = self.clone();
+        let task = tokio::spawn(async move {
+            let _operation = operation;
+            // If the directory changed during backup, preserve its row and
+            // files for operator repair instead of deleting a replacement.
+            if store.cleanup_directory_identity(&namespace).await? != expected {
+                return Err(Error::InvalidPath(format!(
+                    "namespace `{namespace}` directory changed before confirmed teardown"
+                )));
+            }
+            let metadata = store.inner.metadata.clone();
+            let name = namespace.clone();
+            tokio::task::spawn_blocking(move || {
+                metadata
+                    .remove_if_generation(name.clone(), Some(&generation))?
+                    .ok_or_else(|| Error::NamespaceDoesntExist(name.to_string()))
+            })
+            .await??;
+            let (detached, _) = store
+                .detach_owned_directory(&namespace, expected, false)
+                .await?;
+            Self::remove_detached_directory(detached).await?;
+            tracing::info!("destroyed namespace: {namespace}");
+            Ok(())
+        });
+        if let Some(ready) = after_commit_started {
+            ready.notify_one();
+        }
+        task.await?
     }
 
     pub async fn checkpoint(&self, namespace: NamespaceName) -> crate::Result<()> {
@@ -1370,6 +1630,10 @@ impl NamespaceStore {
             .await?;
         let mut reservation = reservation.expect("reset reserves a replacement directory");
         Self::remove_detached_directory(detached).await?;
+        // Reset keeps the same stored row but owns a new on-disk incarnation.
+        // Old handles/handshakes must not overwrite its config after reset.
+        self.inner.metadata.activate_for_create(&namespace);
+        let db_config = self.inner.metadata.handle(namespace.clone()).await;
         // Replica handshake may load an uncached shared schema. Never retain
         // the global identity lock over setup or a callback into this store.
         let mut shutdown = self.inner.shutdown_signal.subscribe();
@@ -1463,6 +1727,7 @@ impl NamespaceStore {
             }
             self.reserve_directory(&to).await?
         };
+        self.inner.metadata.activate_for_create(&to);
         let mut cleanup = pending_cleanup(
             self.inner.metadata.clone(),
             to.clone(),
@@ -1545,6 +1810,23 @@ impl NamespaceStore {
     where
         Fun: FnOnce(&Namespace) -> R,
     {
+        self.with_after_initial_check(namespace, f, std::future::ready(()))
+            .await
+    }
+
+    // The hook permits deterministic regression coverage of a delete racing
+    // the first metadata read. Production callers pass an immediately ready
+    // future and add no scheduling point.
+    async fn with_after_initial_check<Fun, R, Hook>(
+        &self,
+        namespace: NamespaceName,
+        f: Fun,
+        after_check: Hook,
+    ) -> crate::Result<R>
+    where
+        Fun: FnOnce(&Namespace) -> R,
+        Hook: std::future::Future<Output = ()>,
+    {
         if namespace != NamespaceName::default()
             && !self.inner.metadata.exists(&namespace).await
             && !self.inner.allow_lazy_creation
@@ -1552,6 +1834,7 @@ impl NamespaceStore {
             return Err(Error::NamespaceDoesntExist(namespace.to_string()));
         }
 
+        after_check.await;
         let f = {
             let name = namespace.clone();
             move |ns: NamespaceEntry| async move {
@@ -1590,6 +1873,16 @@ impl NamespaceStore {
         }
         let _name_operation = self.lock_names(&[namespace.clone()]).await?;
         let is_new = !self.inner.metadata.exists(&namespace).await;
+        // The initial check above preceded this lock. A concurrent destroy
+        // may have removed the persisted row in between; never resurrect a
+        // primary cache miss using the default config without its metadata.
+        if is_new
+            && self.inner.db_kind.is_primary()
+            && namespace != NamespaceName::default()
+            && !self.inner.allow_lazy_creation
+        {
+            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+        }
         // Replicas can have an exact, previously replicated directory without
         // local metadata. Reserve/check it before handle() registers a name.
         let mut reservation = if is_new && self.inner.db_kind.is_replica() {
@@ -1605,6 +1898,9 @@ impl NamespaceStore {
         } else {
             None
         };
+        if is_new && self.inner.db_kind.is_replica() {
+            self.inner.metadata.activate_for_create(&namespace);
+        }
         let handle = self.inner.metadata.handle(namespace.to_owned()).await;
         let entry = self
             .load_namespace(&namespace, handle, RestoreOption::Latest)
@@ -1775,6 +2071,7 @@ impl NamespaceStore {
             }
             self.reserve_directory(&namespace).await?
         };
+        self.inner.metadata.activate_for_create(&namespace);
         let mut cleanup = pending_cleanup(
             self.inner.metadata.clone(),
             namespace.clone(),

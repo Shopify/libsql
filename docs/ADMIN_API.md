@@ -47,8 +47,14 @@ an incompatible log moves its old files to `replica-log-quarantine/` outside
 `dbs/`, retaining the namespace directory identity, then retries once. Inspect
 quarantined files before removal. Destroy/reset confirms remote backups before
 moving a directory to `namespace-teardown-quarantine/` for local removal;
-backup failure/cancellation before confirmation leaves the old directory in
-place. Inspect remaining quarantine files after interrupted teardown.
+backup failure/cancellation before confirmation leaves the old directory and
+metastore row in place; after confirmation an independently draining worker
+owns the name lock through metadata removal and identity-checked teardown even
+if the HTTP request is cancelled. Stale config/replication handles from a
+prior incarnation cannot reinsert rows or links after deletion; a fresh
+create/reset uses a new generation. Unexpected identity changes are preserved
+for explicit operator repair. Inspect remaining quarantine files after
+interrupted teardown.
 
 ## Routes
 

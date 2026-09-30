@@ -1,5 +1,6 @@
 #![allow(clippy::mutable_key_type)]
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{collections::HashMap, fs::read_dir};
 
@@ -34,7 +35,8 @@ type ChangeMsg = (
     NamespaceName,
     Option<Arc<DatabaseConfig>>,
     oneshot::Sender<Result<()>>,
-    bool, // flush
+    bool,            // flush
+    Arc<AtomicBool>, // one namespace incarnation; revoked before deletion
 );
 type MetaStoreWalManager = WalWrapper<Option<BottomlessWalWrapper>, Sqlite3WalManager>;
 pub type MetaStoreConnection =
@@ -55,7 +57,11 @@ pub struct MetaStoreHandle {
 #[derive(Debug, Clone)]
 enum HandleState {
     Internal(Arc<Mutex<Arc<DatabaseConfig>>>),
-    External(mpsc::Sender<ChangeMsg>, Receiver<InnerConfig>),
+    External(
+        mpsc::Sender<ChangeMsg>,
+        Receiver<InnerConfig>,
+        Arc<AtomicBool>,
+    ),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -72,6 +78,10 @@ struct MetaStoreInner {
     // when we are updating the config. The config si already synced via the watch
     // channel.
     configs: tokio::sync::Mutex<HashMap<NamespaceName, Sender<InnerConfig>>>,
+    // A deleted name remains tombstoned until explicit create/replica reserve
+    // installs a NEW token. Old handles and queued messages keep the revoked
+    // token, even if a later namespace reuses the same spelling.
+    generations: Mutex<HashMap<NamespaceName, Arc<AtomicBool>>>,
     conn: tokio::sync::Mutex<MetaStoreConnection>,
     wal_manager: MetaStoreWalManager,
     db_kind: DatabaseKind,
@@ -190,6 +200,7 @@ impl MetaStoreInner {
 
         let mut this = MetaStoreInner {
             configs: Default::default(),
+            generations: Default::default(),
             conn: conn.into(),
             wal_manager,
             db_kind,
@@ -303,6 +314,9 @@ impl MetaStoreInner {
                     // handshake again and get the latest config.
                     let (tx, _) = watch::channel(InnerConfig { version: 0, config });
 
+                    self.generations
+                        .get_mut()
+                        .insert(ns.clone(), Arc::new(AtomicBool::new(true)));
                     self.configs.get_mut().insert(ns, tx);
                 }
 
@@ -323,41 +337,52 @@ impl MetaStoreInner {
 /// Handles config change updates by inserting them into the database and in-memory
 /// cache of configs.
 fn process(msg: ChangeMsg, inner: Arc<MetaStoreInner>) {
-    let (namespace, config, ret_chan, flush) = msg;
+    let (namespace, config, ret_chan, flush, generation) = msg;
     if let Some(config) = config {
-        let ret = if flush {
-            try_process(&inner, &namespace, &config)
+        let result = if flush {
+            try_process(&inner, &namespace, &config, &generation)
         } else {
             Ok(())
         };
         let mut configs = inner.configs.blocking_lock();
-        if let Some(config_watch) = configs.get_mut(&namespace) {
-            let new_version = config_watch.borrow().version.wrapping_add(1);
-
-            config_watch.send_modify(|c| {
-                *c = InnerConfig {
-                    version: new_version,
-                    config,
-                };
-            });
-        } else {
-            let (tx, _) = watch::channel(InnerConfig { version: 0, config });
-            configs.insert(namespace, tx);
-        }
-        let _ = ret_chan.send(ret);
-    } else {
-        let ret = if flush {
-            let mut configs = inner.configs.blocking_lock();
-            if let Some(config_watch) = configs.get_mut(&namespace) {
-                let config = config_watch.subscribe().borrow().clone();
-                try_process(&inner, &namespace, &config.config)
-            } else {
-                Ok(())
+        // Removing a namespace takes the same lock before revoking this token.
+        // Do not resurrect watch state after a queued write or a failed flush.
+        let result = result.and_then(|()| {
+            if !generation.load(Ordering::Acquire) {
+                return Err(Error::NamespaceDoesntExist(namespace.to_string()));
             }
-        } else {
+            if let Some(config_watch) = configs.get_mut(&namespace) {
+                let new_version = config_watch.borrow().version.wrapping_add(1);
+                config_watch.send_modify(|c| {
+                    *c = InnerConfig {
+                        version: new_version,
+                        config,
+                    };
+                });
+            } else {
+                let (tx, _) = watch::channel(InnerConfig { version: 0, config });
+                configs.insert(namespace.clone(), tx);
+            }
             Ok(())
+        });
+        let _ = ret_chan.send(result);
+    } else {
+        // Do not hold configs while waiting for conn: remove locks conn first.
+        let config = if flush {
+            inner
+                .configs
+                .blocking_lock()
+                .get(&namespace)
+                .map(|watch| watch.subscribe().borrow().config.clone())
+        } else {
+            None
         };
-        let _ = ret_chan.send(ret);
+        let result = match config {
+            Some(config) => try_process(&inner, &namespace, &config, &generation),
+            None if generation.load(Ordering::Acquire) => Ok(()),
+            None => Err(Error::NamespaceDoesntExist(namespace.to_string())),
+        };
+        let _ = ret_chan.send(result);
     }
 }
 
@@ -365,10 +390,16 @@ fn try_process(
     inner: &MetaStoreInner,
     namespace: &NamespaceName,
     config: &DatabaseConfig,
+    generation: &AtomicBool,
 ) -> Result<()> {
-    let config_encoded = metadata::DatabaseConfig::from(&*config).encode_to_vec();
+    let config_encoded = metadata::DatabaseConfig::from(config).encode_to_vec();
 
     let mut conn = inner.conn.blocking_lock();
+    // This check is AFTER acquiring the DB lock. A pre-delete write either
+    // commits before remove (and is removed), or sees the revoked generation.
+    if !generation.load(Ordering::Acquire) {
+        return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+    }
     if let Some(schema) = config.shared_schema_name.as_ref() {
         let tx = conn.transaction()?;
         if inner.db_kind.is_primary() {
@@ -521,13 +552,34 @@ impl MetaStore {
         });
 
         let rx = sender.subscribe();
+        let generation = self
+            .inner
+            .generations
+            .lock()
+            .entry(namespace.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(true)))
+            .clone();
 
         tracing::debug!("meta handle subscribed");
 
         MetaStoreHandle {
             namespace,
-            inner: HandleState::External(change_tx, rx),
+            inner: HandleState::External(change_tx, rx, generation),
         }
+    }
+
+    // Called under the store's per-name lock, after a new directory has been
+    // reserved. Revoking old handles is distinct from checking configs: a new
+    // incarnation's first INSERT must be allowed even without a stored row.
+    pub(crate) fn activate_for_create(&self, namespace: &NamespaceName) {
+        let mut generations = self.inner.generations.lock();
+        if let Some(old) = generations.insert(namespace.clone(), Arc::new(AtomicBool::new(true))) {
+            old.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn generation(&self, namespace: &NamespaceName) -> Option<Arc<AtomicBool>> {
+        self.inner.generations.lock().get(namespace).cloned()
     }
 
     // A cancelled config update may already be queued when its caller drops.
@@ -548,7 +600,13 @@ impl MetaStore {
     pub(crate) async fn wait_for_pending_changes(&self) -> Result<()> {
         let (send, recv) = oneshot::channel();
         self.changes_tx
-            .send((NamespaceName::default(), None, send, false))
+            .send((
+                NamespaceName::default(),
+                None,
+                send,
+                false,
+                Arc::new(AtomicBool::new(true)),
+            ))
             .await
             .map_err(|e| Error::MetaStoreUpdateFailure(e.into()))?;
         recv.await
@@ -557,6 +615,16 @@ impl MetaStore {
     }
 
     pub fn remove(&self, namespace: NamespaceName) -> Result<Option<Arc<DatabaseConfig>>> {
+        self.remove_if_generation(namespace, None)
+    }
+
+    // For deferred destroy, an older worker may never remove a later
+    // incarnation. The comparison and revocation happen under the DB lock.
+    pub(crate) fn remove_if_generation(
+        &self,
+        namespace: NamespaceName,
+        expected: Option<&Arc<AtomicBool>>,
+    ) -> Result<Option<Arc<DatabaseConfig>>> {
         tracing::debug!("removing namespace `{}` from meta store", namespace);
 
         // "configs" lock can be used in both async and sync contexts while "conn" lock always used
@@ -568,6 +636,16 @@ impl MetaStore {
         let mut conn = self.inner.conn.blocking_lock();
 
         let mut configs = self.inner.configs.blocking_lock();
+        if let Some(expected) = expected {
+            let generations = self.inner.generations.lock();
+            if !expected.load(Ordering::Acquire)
+                || !generations
+                    .get(&namespace)
+                    .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+            }
+        }
         let r = if let Some(sender) = configs.get(&namespace) {
             tracing::debug!("removed namespace `{}` from meta store", namespace);
             let config = sender.borrow().clone();
@@ -594,6 +672,11 @@ impl MetaStore {
                 [namespace.as_str()],
             )?;
             tx.commit()?;
+            // conn + configs are still held. A worker checking its token after
+            // acquiring conn cannot insert the deleted row or update watches.
+            if let Some(token) = self.inner.generations.lock().get(&namespace) {
+                token.store(false, Ordering::Release);
+            }
             Ok(Some(config.config))
         } else {
             tracing::trace!("namespace `{}` not found in meta store", namespace);
@@ -670,6 +753,111 @@ impl MetaStore {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn stale_handle_cannot_recreate_config_or_schema_link_after_delete_or_recreate() {
+        let tmp = tempdir().unwrap();
+        let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let metadata = MetaStore::new(
+            MetaStoreConfig::default(),
+            tmp.path(),
+            maker().unwrap(),
+            wal,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        {
+            // Only the jobs columns read by the shared-schema guard matter.
+            let conn = maker().unwrap();
+            conn.execute_batch("CREATE TABLE jobs (schema TEXT, finished BOOLEAN)")
+                .unwrap();
+        }
+        let schema = NamespaceName::from("schema");
+        metadata
+            .handle(schema.clone())
+            .await
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        let tenant = NamespaceName::from("tenant");
+        let old = metadata.handle(tenant.clone()).await;
+        let mut linked = DatabaseConfig::default();
+        linked.shared_schema_name = Some(schema);
+        old.store(linked.clone()).await.unwrap();
+        assert!(metadata.exists(&tenant).await);
+        let removed = tokio::task::spawn_blocking({
+            let metadata = metadata.clone();
+            let tenant = tenant.clone();
+            move || metadata.remove(tenant)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(removed.is_some());
+        assert!(!metadata.exists(&tenant).await);
+        // Simulate a message already accepted into the worker queue before
+        // deletion: the handle's early check cannot protect this path.
+        let stale_generation = match &old.inner {
+            HandleState::External(_, _, generation) => generation.clone(),
+            HandleState::Internal(_) => unreachable!(),
+        };
+        let stale_name = tenant.clone();
+        let stale_inner = metadata.inner.clone();
+        let (send, receive) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            process(
+                (
+                    stale_name,
+                    Some(Arc::new(DatabaseConfig::default())),
+                    send,
+                    true,
+                    stale_generation,
+                ),
+                stale_inner,
+            );
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            receive.await.unwrap(),
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        assert!(!metadata.exists(&tenant).await);
+        assert!(matches!(
+            old.store(linked.clone()).await,
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        // A stale handle acquired anew after deletion remains tombstoned.
+        assert!(matches!(
+            metadata.handle(tenant.clone()).await.store(linked).await,
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        metadata.activate_for_create(&tenant);
+        let fresh = metadata.handle(tenant.clone()).await;
+        fresh.store(DatabaseConfig::default()).await.unwrap();
+        assert!(matches!(
+            old.store(DatabaseConfig::default()).await,
+            Err(Error::NamespaceDoesntExist(_))
+        ));
+        let conn = maker().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM namespace_configs WHERE namespace = 'tenant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let links: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM shared_schema_links WHERE namespace = 'tenant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(links, 0);
+    }
 
     #[tokio::test]
     async fn invalid_shared_schema_refuses_startup_without_destroying_metastore() {
@@ -928,21 +1116,21 @@ impl MetaStoreHandle {
     pub fn get(&self) -> Arc<DatabaseConfig> {
         match &self.inner {
             HandleState::Internal(config) => config.lock().clone(),
-            HandleState::External(_, config) => config.borrow().clone().config,
+            HandleState::External(_, config, _) => config.borrow().clone().config,
         }
     }
 
     pub fn version(&self) -> usize {
         match &self.inner {
             HandleState::Internal(_) => 0,
-            HandleState::External(_, config) => config.borrow().version,
+            HandleState::External(_, config, _) => config.borrow().version,
         }
     }
 
     pub fn changed(&self) -> impl Future<Output = ()> {
         let mut rcv = match &self.inner {
             HandleState::Internal(_) => panic!("can't wait for change on internal handle"),
-            HandleState::External(_, rcv) => rcv.clone(),
+            HandleState::External(_, rcv, _) => rcv.clone(),
         };
         // ack the current value.
         rcv.borrow_and_update();
@@ -971,7 +1159,10 @@ impl MetaStoreHandle {
                     *config.lock() = c;
                 }
             }
-            HandleState::External(changes_tx, config) => {
+            HandleState::External(changes_tx, config, generation) => {
+                if !generation.load(Ordering::Acquire) {
+                    return Err(Error::NamespaceDoesntExist(self.namespace.to_string()));
+                }
                 tracing::debug!(?new_config, "storing new namespace config");
                 let mut c = config.clone();
                 // ack the current value.
@@ -981,7 +1172,13 @@ impl MetaStoreHandle {
 
                 let (snd, rcv) = oneshot::channel();
                 changes_tx
-                    .send((self.namespace.clone(), new_config, snd, flush))
+                    .send((
+                        self.namespace.clone(),
+                        new_config,
+                        snd,
+                        flush,
+                        generation.clone(),
+                    ))
                     .await
                     .map_err(|e| Error::MetaStoreUpdateFailure(e.into()))?;
 
