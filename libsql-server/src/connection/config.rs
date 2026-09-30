@@ -108,6 +108,9 @@ impl From<&DatabaseConfig> for metadata::DatabaseConfig {
             shared_schema: Some(value.is_shared_schema),
             shared_schema_name: value.shared_schema_name.as_ref().map(|s| s.to_string()),
             durability_mode: Some(metadata::DurabilityMode::from(value.durability_mode).into()),
+            // Never part of a configuration: the replication `hello` fills it from the live
+            // fence gate, and it is not stored.
+            fence: None,
         }
     }
 }

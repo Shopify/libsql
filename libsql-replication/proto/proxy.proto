@@ -43,6 +43,11 @@ message Error {
     ErrorCode code = 1;
     string message = 2;
     int32 extended_code = 3;
+    // Stable machine-readable outcome of the error, e.g. "MIGRATION_WRITE_FENCED" for a
+    // request refused by a namespace fence. Absent when the error has no typed outcome, and
+    // always absent from older servers: a receiver treats an absent field as "no typed
+    // outcome" and falls back to `code`.
+    optional string stable_code = 4;
 }
 
 message ResultRows {
