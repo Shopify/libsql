@@ -1,42 +1,17 @@
 //! The fence admin API over HTTP (`docs/NAMESPACE_FENCE.md` section 4).
 
 use hyper::StatusCode;
-use serde_json::{json, Value};
+use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
-use super::{command_body, connect, make_primary, sim, state_of, Admin, Primary, ADMIN_KEY};
+use super::{
+    acquire_body, command_body, connect, load_and_log_id, make_primary, sim, state_of, Admin,
+    Primary, ADMIN_KEY,
+};
 
 fn uuid(n: u128) -> Uuid {
     Uuid::from_u128(n)
-}
-
-/// Load `ns` on the server with one write, and return the replication log id the server
-/// reports for it.
-async fn load_and_log_id(admin: &Admin, ns: &str) -> anyhow::Result<String> {
-    let conn = connect(ns)?;
-    conn.execute("create table if not exists t (x)", ()).await?;
-    conn.execute("insert into t values (1)", ()).await?;
-    let (status, body) = admin.inspect(ns).await?;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(state_of(&body), ("UNFENCED", 0), "{body}");
-    Ok(body["fence"]["incarnation"]["current_log_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no current_log_id: {body}"))
-        .to_string())
-}
-
-fn acquire_body(op: Uuid, cmd: Uuid, log_id: &str) -> Value {
-    command_body(
-        op,
-        cmd,
-        "UNFENCED",
-        0,
-        json!({
-            "expected_namespace_identity": { "log_id": log_id },
-            "drain_policy": { "deadline_ms": 5000, "on_deadline": "fail" },
-        }),
-    )
 }
 
 #[test]
