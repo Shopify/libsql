@@ -266,13 +266,15 @@ impl RemoteConnection {
             let response_stream = match client.stream_exec(req).await {
                 Ok(i) => i.into_inner(),
                 Err(e) => {
+                    // Only `UNAVAILABLE` is retried. A fence denial is `FAILED_PRECONDITION`
+                    // with its stable code, answered to the client as the primary's denial.
                     if e.code() == Code::Unavailable {
                         tracing::error!("retrying proxy connection: {}", e);
                         tokio::time::sleep(Duration::from_millis(500) * 2u32.pow(retries)).await;
                         retries += 1;
                         continue;
                     } else {
-                        return Err(e.into());
+                        return Err(Error::from_proxy_status(e));
                     }
                 }
             };
@@ -387,7 +389,7 @@ where
                     )
                 }
                 exec_resp::Response::DescribeResp(_) => Err(Error::PrimaryStreamMisuse),
-                exec_resp::Response::Error(e) => Err(Error::RpcQueryError(e)),
+                exec_resp::Response::Error(e) => Err(Error::from_proxy_error(e)),
             }
         };
 
@@ -430,7 +432,7 @@ where
 
                 Ok(false)
             }
-            exec_resp::Response::Error(e) => Err(Error::RpcQueryError(e)),
+            exec_resp::Response::Error(e) => Err(Error::from_proxy_error(e)),
             exec_resp::Response::ProgramResp(_) => Err(Error::PrimaryStreamMisuse),
         };
 

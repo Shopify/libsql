@@ -162,6 +162,32 @@ impl Error {
             _ => None,
         }
     }
+
+    /// A step or program error the primary returned through the write proxy. A fence denial
+    /// from a primary that fills the additive `stable_code` field
+    /// (`docs/NAMESPACE_FENCE.md` section 6.1) becomes the same [`Error::NamespaceFence`] a
+    /// local denial is, so the replica answers its client exactly as the primary would. Any
+    /// other error, and every error from a primary that does not fill the field, stays
+    /// [`Error::RpcQueryError`].
+    pub(crate) fn from_proxy_error(e: crate::rpc::proxy::rpc::Error) -> Self {
+        let fence = e.stable_code.as_deref().and_then(|code| {
+            crate::namespace::fence::outcome::FenceError::from_proxy_stable_code(code, &e.message)
+        });
+        match fence {
+            Some(fence) => Error::NamespaceFence(fence),
+            None => Error::RpcQueryError(e),
+        }
+    }
+
+    /// A gRPC status from the primary's proxy service: its typed fence denial
+    /// (`FAILED_PRECONDITION` with the stable code, section 6.1) as [`Error::NamespaceFence`],
+    /// anything else unchanged.
+    pub(crate) fn from_proxy_status(status: tonic::Status) -> Self {
+        match crate::namespace::fence::outcome::FenceError::from_grpc_status(&status) {
+            Some(fence) => Error::NamespaceFence(fence),
+            None => Error::RpcQueryExecutionError(status),
+        }
+    }
 }
 
 /// The HTTP response for a fence denial (`docs/NAMESPACE_FENCE.md` section 6): the fence status

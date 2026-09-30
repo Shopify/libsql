@@ -12,8 +12,8 @@ use turmoil::net::TcpStream;
 use uuid::Uuid;
 
 use super::{
-    acquire_body, command_body, load_and_log_id, make_primary, sim, state_of, Admin, Primary,
-    ADMIN_KEY,
+    acquire_body, command_body, load_and_log_id, make_primary, make_replica, sim, state_of, Admin,
+    Primary, ADMIN_KEY,
 };
 use crate::common::net::TurmoilConnector;
 
@@ -26,10 +26,12 @@ fn uuid(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
-/// The user API of `primary`, for any namespace, with an optional basic-auth credential.
+/// The user API of `primary` (or of another host), for any namespace, with an optional
+/// basic-auth credential.
 struct User {
     client: hyper::Client<TurmoilConnector, Body>,
     auth: Option<String>,
+    host: &'static str,
 }
 
 impl User {
@@ -41,6 +43,15 @@ impl User {
         Self {
             client: hyper::Client::builder().build(TurmoilConnector),
             auth: credential.map(|c| format!("basic {c}")),
+            host: "primary",
+        }
+    }
+
+    /// The user API of `host` instead.
+    fn on(host: &'static str) -> Self {
+        Self {
+            host,
+            ..Self::new()
         }
     }
 
@@ -53,7 +64,7 @@ impl User {
     ) -> anyhow::Result<(StatusCode, String)> {
         let mut request = Request::builder()
             .method(method)
-            .uri(format!("http://{ns}.primary:8080{path}"));
+            .uri(format!("http://{ns}.{}:8080{path}", self.host));
         if let Some(auth) = &self.auth {
             request = request.header("authorization", auth.as_str());
         }
@@ -847,6 +858,118 @@ fn auth_and_not_found_distinct() {
             &body["results"][0]["error"],
             WRITE_FENCED,
         );
+        Ok(())
+    });
+    sim.run().unwrap();
+}
+
+/// The replica's count of writes it delegated to the primary for `ns`.
+async fn delegated_writes(ns: &str) -> anyhow::Result<u64> {
+    let resp = crate::common::http::Client::new()
+        .get(&format!("http://replica0:9090/v1/namespaces/{ns}/stats"))
+        .await?;
+    let body: Value = resp.json().await?;
+    body["write_requests_delegated"]
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("no write_requests_delegated: {body}"))
+}
+
+/// A write sent to a replica is proxied to the primary; when the primary's fence refuses it,
+/// the replica answers with the primary's denial: `423` and the stable code on HTTP, the
+/// stable code as the Hrana error code (section 6.1). Reads stay local and are served, and
+/// writes through the replica work again once the fence is released.
+#[test]
+fn replica_proxy_preserves_code() {
+    let mut sim = sim();
+    let primary = tempdir().unwrap();
+    let replica = tempdir().unwrap();
+    make_primary(&mut sim, primary.path().to_path_buf(), Primary::default());
+    make_replica(&mut sim, replica.path().to_path_buf());
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        let user = User::on("replica0");
+        let op = uuid(0x100);
+        let rev = write_fenced(&admin, "src", op).await?;
+        let write = "insert into t values (2)";
+
+        assert_locked(
+            "legacy write",
+            &user.legacy("src", &[write]).await?,
+            WRITE_FENCED,
+        );
+        assert_locked(
+            "v1 execute",
+            &user.execute("src", write).await?,
+            WRITE_FENCED,
+        );
+        // A refused step of a `/v1` batch is a step error, as on the primary.
+        let (status, body) = user.batch("src", &["select 1", write]).await?;
+        assert_eq!(status, StatusCode::OK, "v1 batch: {body}");
+        assert!(
+            body["result"]["step_errors"][0].is_null(),
+            "v1 batch: {body}"
+        );
+        assert_hrana_error("v1 batch", &body["result"]["step_errors"][1], WRITE_FENCED);
+        for version in [2, 3] {
+            let what = format!("v{version}");
+            let (status, body) = user
+                .pipeline(
+                    "src",
+                    version,
+                    None,
+                    json!([execute_req(write), execute_req("select * from t")]),
+                )
+                .await?;
+            assert_eq!(status, StatusCode::OK, "{what}: {body}");
+            let results = &body["results"];
+            assert_eq!(results[0]["type"], "error", "{what}: {body}");
+            assert_hrana_error(&what, &results[0]["error"], WRITE_FENCED);
+            assert_eq!(results[1]["type"], "ok", "{what}: {body}");
+        }
+        let (status, body) = user.legacy("src", &["select count(*) from t"]).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        release(&admin, "src", op, rev).await?;
+        let (status, body) = user.execute("src", write).await?;
+        assert_eq!(status, StatusCode::OK, "after release: {body}");
+        Ok(())
+    });
+    sim.run().unwrap();
+}
+
+/// A fence denial is final for the request: the replica delegates each refused write to the
+/// primary exactly once and answers at once, with no reconnect or retry (the write proxy's
+/// only retry, of `UNAVAILABLE`, backs off 500 ms first).
+#[test]
+fn denial_not_retried() {
+    let mut sim = sim();
+    let primary = tempdir().unwrap();
+    let replica = tempdir().unwrap();
+    make_primary(&mut sim, primary.path().to_path_buf(), Primary::default());
+    make_replica(&mut sim, replica.path().to_path_buf());
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        let user = User::on("replica0");
+        write_fenced(&admin, "src", uuid(0x100)).await?;
+        // Load the namespace on the replica.
+        let (status, body) = user.legacy("src", &["select 1"]).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let before = delegated_writes("src").await?;
+        for i in 0..3u64 {
+            let started = tokio::time::Instant::now();
+            assert_locked(
+                "write",
+                &user.execute("src", "insert into t values (2)").await?,
+                WRITE_FENCED,
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(500),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(delegated_writes("src").await?, before + i + 1);
+        }
         Ok(())
     });
     sim.run().unwrap();

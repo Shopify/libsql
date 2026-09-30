@@ -3,7 +3,7 @@ pub(crate) mod dump;
 mod extract;
 mod hrana_over_http_1;
 mod listen;
-mod result_builder;
+pub(crate) mod result_builder;
 mod trace;
 mod types;
 #[macro_use]

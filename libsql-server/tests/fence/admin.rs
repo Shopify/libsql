@@ -26,7 +26,7 @@ fn capabilities() {
         assert_eq!(body["fence_protocol_version"], 1);
         assert_eq!(body["enabled"], true);
         assert_eq!(body["active_fences"], 0);
-        assert_eq!(body["proxy_stable_code"], false);
+        assert_eq!(body["proxy_stable_code"], true);
         let commands: Vec<&str> = body["commands"]
             .as_array()
             .unwrap()
