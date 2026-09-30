@@ -225,7 +225,7 @@ pub fn apply_program_resp_to_builder<B: QueryResultBuilder>(
                 last_insert_rowid,
             }) => builder.finish_step(affected_row_count, last_insert_rowid)?,
             Step::StepError(StepError { error: Some(err) }) => {
-                builder.step_error(crate::error::Error::RpcQueryError(err))?
+                builder.step_error(crate::error::Error::from_proxy_error(err))?
             }
             Step::ColsDescription(ColsDescription { columns }) => {
                 let cols = columns.iter().map(|c| Column {
