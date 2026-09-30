@@ -1335,3 +1335,128 @@ fn replica_resumes_after_clear_read_fence() {
     });
     sim.run().unwrap();
 }
+
+/// Walks the quarantined target `ns` of `op` to `TARGET_WRITE_FENCED` (readable): seal the
+/// (empty) import, record a successful validation, publish. Returns the revision.
+async fn publish_target(admin: &Admin, ns: &str, op: Uuid) -> anyhow::Result<u64> {
+    let (_, body) = admin.inspect(ns).await?;
+    let (state, mut rev) = state_of(&body);
+    assert_eq!(state, "TARGET_QUARANTINED", "{body}");
+    for (n, route, from, extra, to) in [
+        (
+            2,
+            "target/seal-import",
+            "TARGET_QUARANTINED",
+            json!({}),
+            "TARGET_VALIDATING",
+        ),
+        (
+            3,
+            "target/validation-receipt",
+            "TARGET_VALIDATING",
+            json!({ "result": "ok", "summary": "empty" }),
+            "TARGET_VALIDATING",
+        ),
+        (
+            4,
+            "target/publish-readable",
+            "TARGET_VALIDATING",
+            json!({}),
+            "TARGET_WRITE_FENCED",
+        ),
+    ] {
+        let (status, body) = admin
+            .command(
+                ns,
+                route,
+                command_body(op, uuid(op.as_u128() + n), from, rev, extra),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        assert_eq!(state_of(&body).0, to, "{route}: {body}");
+        rev = state_of(&body).1;
+    }
+    Ok(rev)
+}
+
+/// A replica server creating a namespace lazily, for a name the primary's fence refuses to
+/// replicate (here a quarantined target), fails the request at once with the primary's code
+/// instead of retrying the handshake, and leaves no local copy: no namespace directory it
+/// created (a directory that was already there stays) and no metastore entry. Once the target
+/// is published the same name is created and served normally (section 13.3).
+#[test]
+fn replica_lazy_creation_refused_by_fence() {
+    let mut sim = sim();
+    let primary = tempdir().unwrap();
+    let replica = tempdir().unwrap();
+    // A directory that was on the replica before: a refused creation must not delete it.
+    let kept = replica.path().join("dbs").join("kept");
+    std::fs::create_dir_all(&kept).unwrap();
+    std::fs::write(kept.join("sentinel"), b"x").unwrap();
+    let dbs = replica.path().join("dbs");
+    make_primary(&mut sim, primary.path().to_path_buf(), Primary::default());
+    make_replica(&mut sim, replica.path().to_path_buf());
+    sim.client("client", async move {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        let user = User::on("replica0");
+        let op = uuid(0x100);
+        quarantined_target(&admin, "tgt", op).await?;
+        quarantined_target(&admin, "kept", uuid(0x200)).await?;
+
+        for attempt in 0..2 {
+            let started = tokio::time::Instant::now();
+            assert_locked(
+                &format!("replica read of a quarantined target, attempt {attempt}"),
+                &user.legacy("tgt", &["select 1"]).await?,
+                QUARANTINED,
+            );
+            // Refused at the first handshake, not after a second of retries per attempt.
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(500),
+                "took {took:?}"
+            );
+            assert!(
+                !dbs.join("tgt").exists(),
+                "the refused creation left dbs/tgt behind"
+            );
+        }
+        assert_locked(
+            "replica read of a quarantined target with a directory",
+            &user.legacy("kept", &["select 1"]).await?,
+            QUARANTINED,
+        );
+        assert!(
+            kept.join("sentinel").exists(),
+            "a pre-existing directory was removed"
+        );
+
+        let rev = publish_target(&admin, "tgt", op).await?;
+        let (status, body) = user.legacy("tgt", &["select 1"]).await?;
+        assert_eq!(status, StatusCode::OK, "after publication: {body}");
+        assert!(
+            dbs.join("tgt").exists(),
+            "published target not created on the replica"
+        );
+
+        // Writes through the replica reach the primary once writes are enabled.
+        let (status, body) = admin
+            .command(
+                "tgt",
+                "target/enable-writes",
+                command_body(
+                    op,
+                    uuid(op.as_u128() + 5),
+                    "TARGET_WRITE_FENCED",
+                    rev,
+                    json!({}),
+                ),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = user.legacy("tgt", &["create table t (x)"]).await?;
+        assert_eq!(status, StatusCode::OK, "write through the replica: {body}");
+        Ok(())
+    });
+    sim.run().unwrap();
+}
