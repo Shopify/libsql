@@ -275,6 +275,27 @@ impl FenceError {
         &self.message
     }
 
+    /// The status of this error on either HTTP API: the user API's mapping for a data-plane
+    /// denial (`423`), and the admin API's for any other outcome.
+    pub fn http_status(&self) -> StatusCode {
+        self.outcome
+            .user_http_status()
+            .unwrap_or_else(|| self.outcome.admin_http_status())
+    }
+
+    /// The JSON error body of the HTTP APIs for this error: the usual `error` message plus the
+    /// additive stable `code` and, when there is one, the bounded `detail`.
+    pub fn http_error_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "error": self.to_string(),
+            "code": self.outcome.as_str(),
+        });
+        if let Some(detail) = self.detail {
+            body["detail"] = detail.as_str().into();
+        }
+        body
+    }
+
     /// A gRPC status for this error, if the outcome has a gRPC mapping. The code is in the
     /// [`GRPC_FENCE_CODE_METADATA`] entry and prefixes the message.
     pub fn to_grpc_status(&self) -> Option<tonic::Status> {

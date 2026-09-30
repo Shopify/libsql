@@ -7,6 +7,7 @@ use serde::{Serialize, Serializer};
 use serde_json::ser::{CompactFormatter, Formatter};
 use std::sync::atomic::Ordering;
 
+use crate::namespace::fence::outcome::FenceError;
 use crate::query_result_builder::{
     Column, JsonFormatter, QueryBuilderConfig, QueryResultBuilder, QueryResultBuilderError,
     TOTAL_RESPONSE_SIZE,
@@ -25,6 +26,9 @@ pub struct JsonHttpPayloadBuilder {
     step_row_count: usize,
     is_step_error: bool,
     is_step_empty: bool,
+    /// The first step error that was a fence denial. The legacy API has no per-step codes, so
+    /// a fenced batch is answered as a whole with the fence's status and code.
+    fence_denial: Option<FenceError>,
 }
 
 #[derive(Default)]
@@ -112,7 +116,13 @@ impl JsonHttpPayloadBuilder {
             step_row_count: 0,
             is_step_error: false,
             is_step_empty: false,
+            fence_denial: None,
         }
+    }
+
+    /// The first fence denial reported as a step error, if any.
+    pub fn take_fence_denial(&mut self) -> Option<FenceError> {
+        self.fence_denial.take()
     }
 }
 
@@ -209,6 +219,9 @@ impl QueryResultBuilder for JsonHttpPayloadBuilder {
     }
 
     fn step_error(&mut self, error: crate::error::Error) -> Result<(), QueryResultBuilderError> {
+        if self.fence_denial.is_none() {
+            self.fence_denial = error.fence_error().cloned();
+        }
         self.is_step_error = true;
         self.is_step_empty = false;
         self.buffer.truncate(self.checkpoint);
