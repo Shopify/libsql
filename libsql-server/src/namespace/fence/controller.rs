@@ -500,9 +500,7 @@ impl FenceController {
 
     /// Cancel every read lease held now (the read drain's deadline). Each lease's work is asked
     /// to stop once; the leases stay counted until they are actually released. Returns how many
-    /// were asked.
-    /// [`cancel_read_leases`](Self::cancel_read_leases), counted by the kind of work asked to
-    /// stop.
+    /// were asked, counted by the kind of work asked to stop.
     pub(crate) fn cancel_read_leases_by_kind(&self) -> ReadLeaseCounts {
         let leases = self.read_leases.lock();
         let mut asked = ReadLeaseCounts::default();
@@ -517,10 +515,6 @@ impl FenceController {
             }
         }
         asked
-    }
-
-    pub(crate) fn cancel_read_leases(&self) -> usize {
-        self.cancel_read_leases_by_kind().total()
     }
 
     /// On a replica server: publish what the replicator learned of the primary's fence
@@ -1032,9 +1026,11 @@ impl Transition {
 
         let result = match controller.hook(HookPoint::BeforeMetastoreCommit).await {
             HookOutcome::Continue => run.await,
+            #[cfg(test)]
             HookOutcome::Fail(e) => return Err(e.into()),
             // A commit that failed without applying, but whose outcome the controller cannot
             // know (test hook).
+            #[cfg(test)]
             HookOutcome::Indeterminate => {
                 Err(indeterminate(key, "the commit was not acknowledged (test hook)").into())
             }
@@ -1043,6 +1039,7 @@ impl Transition {
         let result = match result {
             Ok(commit) => match controller.hook(HookPoint::AfterMetastoreCommit).await {
                 HookOutcome::Continue => Ok(commit),
+                #[cfg(test)]
                 HookOutcome::Indeterminate | HookOutcome::Fail(_) => Err(indeterminate(
                     key,
                     "the commit was not acknowledged (test hook)",
