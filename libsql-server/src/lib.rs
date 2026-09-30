@@ -11,7 +11,7 @@ use crate::connection::{Connection, MakeConnection};
 use crate::database::DatabaseKind;
 use crate::error::Error;
 use crate::migration::maybe_migrate;
-use crate::namespace::meta_store::{metastore_connection_maker, MetaStore};
+use crate::namespace::meta_store::{metastore_connection_maker_with_provenance, MetaStore};
 use crate::net::Accept;
 use crate::pager::{make_pager, PAGER_CACHE_SIZE};
 use crate::rpc::proxy::rpc::proxy_server::Proxy;
@@ -611,9 +611,12 @@ where
             connection_creation_timeout: self.db_config.connection_creation_timeout,
         };
 
-        let (metastore_conn_maker, meta_store_wal_manager) =
-            metastore_connection_maker(self.meta_store_config.bottomless.clone(), &self.path)
-                .await?;
+        let (metastore_conn_maker, meta_store_wal_manager, metastore_provenance) =
+            metastore_connection_maker_with_provenance(
+                self.meta_store_config.bottomless.clone(),
+                &self.path,
+            )
+            .await?;
         let meta_conn = metastore_conn_maker()?;
         let meta_store = MetaStore::new(
             self.meta_store_config.clone(),
@@ -623,6 +626,7 @@ where
             db_kind,
         )
         .await?;
+        meta_store.record_restore_provenance(metastore_provenance);
 
         let (configurators, make_replication_svc) = self
             .make_configurators_and_replication_svc(
