@@ -7,6 +7,7 @@ mod lifecycle;
 mod protocol;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::StatusCode;
@@ -18,6 +19,7 @@ use libsql_server::config::{
 };
 use s3s::header::AUTHORIZATION;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 use turmoil::{Builder, Sim};
 use uuid::Uuid;
 
@@ -28,6 +30,7 @@ use crate::common::net::{
 
 pub const ADMIN_KEY: &str = "fence-admin-key";
 
+#[derive(Clone, Copy)]
 pub struct Primary {
     /// `None` starts the admin API without an auth key.
     pub admin_key: Option<&'static str>,
@@ -36,6 +39,8 @@ pub struct Primary {
     pub user_credential: Option<&'static str>,
     /// The fence adoption key; `None` leaves adoption disabled.
     pub adoption_key: Option<&'static str>,
+    /// Capacity of the live namespace cache. Fence controllers live outside this cache.
+    pub max_active_namespaces: usize,
 }
 
 impl Default for Primary {
@@ -45,6 +50,7 @@ impl Default for Primary {
             fence_enabled: true,
             user_credential: None,
             adoption_key: None,
+            max_active_namespaces: 100,
         }
     }
 }
@@ -55,46 +61,79 @@ pub fn sim() -> Sim<'static> {
         .build()
 }
 
-/// A primary on host `primary`: user API on 8080, admin API on 9090.
-pub fn make_primary(sim: &mut Sim, path: PathBuf, primary: Primary) {
-    init_tracing();
+async fn primary_server(path: PathBuf, primary: Primary) -> anyhow::Result<TestServer> {
     let Primary {
         admin_key,
         fence_enabled,
         user_credential,
         adoption_key,
+        max_active_namespaces,
     } = primary;
+    Ok(TestServer {
+        path: path.into(),
+        user_api_config: UserApiConfig {
+            auth_strategy: match user_credential {
+                Some(credential) => Auth::new(HttpBasic::new(credential.into())),
+                None => UserApiConfig::<TurmoilAcceptor>::default().auth_strategy,
+            },
+            ..Default::default()
+        },
+        admin_api_config: Some(AdminApiConfig {
+            acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
+            connector: TurmoilConnector,
+            disable_metrics: true,
+            auth_key: admin_key.map(Into::into),
+        }),
+        rpc_server_config: Some(RpcServerConfig {
+            acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
+            tls_config: None,
+        }),
+        meta_store_config: MetaStoreConfig {
+            namespace_fence: fence_enabled,
+            namespace_fence_adoption_key: adoption_key.and_then(FenceAdoptionKey::new),
+            ..Default::default()
+        },
+        disable_namespaces: false,
+        disable_default_namespace: true,
+        max_active_namespaces,
+        ..Default::default()
+    })
+}
+
+/// A primary on host `primary`: user API on 8080, admin API on 9090.
+pub fn make_primary(sim: &mut Sim, path: PathBuf, primary: Primary) {
+    init_tracing();
     sim.host("primary", move || {
         let path = path.clone();
         async move {
-            let server = TestServer {
-                path: path.into(),
-                user_api_config: UserApiConfig {
-                    auth_strategy: match user_credential {
-                        Some(credential) => Auth::new(HttpBasic::new(credential.into())),
-                        None => UserApiConfig::<TurmoilAcceptor>::default().auth_strategy,
-                    },
-                    ..Default::default()
-                },
-                admin_api_config: Some(AdminApiConfig {
-                    acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
-                    connector: TurmoilConnector,
-                    disable_metrics: true,
-                    auth_key: admin_key.map(Into::into),
-                }),
-                rpc_server_config: Some(RpcServerConfig {
-                    acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
-                    tls_config: None,
-                }),
-                meta_store_config: MetaStoreConfig {
-                    namespace_fence: fence_enabled,
-                    namespace_fence_adoption_key: adoption_key.and_then(FenceAdoptionKey::new),
-                    ..Default::default()
-                },
-                disable_namespaces: false,
-                disable_default_namespace: true,
-                ..Default::default()
-            };
+            primary_server(path, primary).await?.start_sim(8080).await?;
+            Ok(())
+        }
+    });
+}
+
+/// A primary that shuts down when `restart` is notified, then starts again on the same path.
+/// `restarted` is notified after the second server has rebound the admin and RPC listeners; an
+/// admin request made after that notification is the readiness barrier for the restarted server.
+pub fn make_restartable_primary(
+    sim: &mut Sim,
+    path: PathBuf,
+    primary: Primary,
+    restart: Arc<Notify>,
+    restarted: Arc<Notify>,
+) {
+    init_tracing();
+    sim.host("primary", move || {
+        let path = path.clone();
+        let restart = restart.clone();
+        let restarted = restarted.clone();
+        async move {
+            let mut server = primary_server(path.clone(), primary).await?;
+            server.shutdown = restart;
+            server.start_sim(8080).await?;
+
+            let server = primary_server(path, primary).await?;
+            restarted.notify_one();
             server.start_sim(8080).await?;
             Ok(())
         }
@@ -264,6 +303,18 @@ pub fn connect(ns: &str) -> anyhow::Result<libsql::Connection> {
         TurmoilConnector,
     )?;
     Ok(db.connect()?)
+}
+
+/// Execute one statement through the Hrana v1 user endpoint, returning its typed body.
+pub async fn user_execute(ns: &str, sql: &str) -> anyhow::Result<(StatusCode, Value)> {
+    let response = Client::new()
+        .post(
+            &format!("http://{ns}.primary:8080/v1/execute"),
+            json!({ "stmt": { "sql": sql } }),
+        )
+        .await?;
+    let status = response.status();
+    Ok((status, response.json_value().await?))
 }
 
 /// Load `ns` on the server with one write, and return the replication log id the server
