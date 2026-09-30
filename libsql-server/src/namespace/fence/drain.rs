@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::namespace::meta_store::{FenceCommit, FenceContext, MetaStore};
+use crate::namespace::meta_store::{FenceCommit, FenceCommitKind, FenceContext, MetaStore};
 
 use super::audit::{self, CommandAudit, CommandReport, DrainKind, ForcedKind};
 use super::command::{DrainPolicy, FenceCommand, FenceRequest, OnDeadline};
@@ -118,10 +118,13 @@ pub async fn acquire_source_write_fence(
             return Err(e);
         }
     };
-    if commit.receipt.outcome != FenceOutcome::Draining {
-        // A replay of a finished acquisition, or ALREADY_APPLIED.
+    if commit.kind == FenceCommitKind::Replayed || commit.receipt.outcome != FenceOutcome::Draining
+    {
+        // A replay whose drain was superseded, a replay of a finished acquisition, or
+        // ALREADY_APPLIED.
         return Ok(commit);
     }
+    let resumed = commit.kind == FenceCommitKind::Resumed;
     let drain_key = (commit.receipt.operation_id, commit.receipt.command_id);
 
     // Steps 5 and 6.
@@ -146,14 +149,18 @@ pub async fn acquire_source_write_fence(
         );
     }
     ctx.now_ms = now_ms();
-    transition
+    let mut completed = transition
         .complete_drain(
             meta,
             drain_key,
             DrainCompletion::SourceWrites { boundary },
             ctx,
         )
-        .await
+        .await?;
+    if resumed {
+        completed.kind = FenceCommitKind::Resumed;
+    }
+    Ok(completed)
 }
 
 /// Wait until no connection manager of the namespace has a writer holding its write slot, and
@@ -698,6 +705,7 @@ pub(crate) mod tests {
         raw(&holder, "commit").await.unwrap();
         let committed = s.frame_no();
         let done = s.execute(s.acquire(OP, 1, policy)).await.unwrap().unwrap();
+        assert_eq!(done.kind, FenceCommitKind::Resumed);
         assert_eq!(done.receipt.outcome, FenceOutcome::Applied);
         assert_eq!(done.receipt.command_id, Uuid::from_u128(1));
         assert_eq!(
@@ -714,6 +722,46 @@ pub(crate) mod tests {
         assert_eq!(again.kind, FenceCommitKind::Replayed);
         assert_eq!(again.receipt, done.receipt);
         assert_eq!(boundary(&again), boundary(&done));
+    }
+
+    /// A drain that was explicitly rolled back by `ReleaseSourceWriteFence` is historical: an
+    /// exact replay returns its stored `DRAINING` receipt without trying to complete that drain
+    /// against the newer `RELEASED` record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_of_released_drain_does_not_resume_it() {
+        let s = Source::new().await;
+        let holder = s.conn().await;
+        raw(&holder, "begin immediate; insert into t values (1);")
+            .await
+            .unwrap();
+        let policy = DrainPolicy {
+            deadline_ms: 0,
+            on_deadline: OnDeadline::Fail,
+        };
+        let acquire = s.acquire(OP, 1, policy);
+        let first = s.execute(acquire.clone()).await.unwrap().unwrap();
+        assert_eq!(first.receipt.outcome, FenceOutcome::Draining);
+
+        let release = FenceRequest {
+            namespace: "ns".into(),
+            operation_id: OP,
+            command_id: Uuid::from_u128(2),
+            expected_state: FenceState::SourceDraining,
+            expected_revision: s.fence.gate().revision(),
+            command: FenceCommand::ReleaseSourceWriteFence,
+        };
+        let released = s.execute(release).await.unwrap().unwrap();
+        assert_eq!(released.receipt.outcome, FenceOutcome::Applied);
+        assert_eq!(s.fence.gate().state(), FenceState::Released);
+        raw(&holder, "commit").await.unwrap();
+
+        let replay = s.execute(acquire).await.unwrap().unwrap();
+        assert_eq!(replay.kind, FenceCommitKind::Replayed);
+        assert_eq!(replay.receipt.outcome, FenceOutcome::Draining);
+        assert_eq!(s.fence.gate().state(), FenceState::Released);
+        raw(&s.conn().await, "insert into t values (2)")
+            .await
+            .unwrap();
     }
 
     /// Releasing the write fence commits, publishes a new write generation and only then

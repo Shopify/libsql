@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::namespace::meta_store::{FenceCommit, FenceContext, MetaStore};
+use crate::namespace::meta_store::{FenceCommit, FenceCommitKind, FenceContext, MetaStore};
 
 use super::audit::{CommandReport, DrainKind, ForcedKind};
 use super::command::{DrainPolicy, FenceCommand, FenceRequest};
@@ -68,9 +68,11 @@ pub async fn set_source_read_fence(
             return Err(e);
         }
     };
-    if commit.receipt.outcome != FenceOutcome::Draining {
+    if commit.kind == FenceCommitKind::Replayed || commit.receipt.outcome != FenceOutcome::Draining
+    {
         return Ok(commit);
     }
+    let resumed = commit.kind == FenceCommitKind::Resumed;
     let drain_key = (commit.receipt.operation_id, commit.receipt.command_id);
 
     // Step 4.
@@ -84,9 +86,13 @@ pub async fn set_source_read_fence(
         .drained(DrainKind::Read, started.elapsed());
     // Step 5.
     ctx.now_ms = now_ms();
-    transition
+    let mut completed = transition
         .complete_drain(meta, drain_key, DrainCompletion::SourceReads, ctx)
-        .await
+        .await?;
+    if resumed {
+        completed.kind = FenceCommitKind::Resumed;
+    }
+    Ok(completed)
 }
 
 /// Wait until every read lease of the namespace is released. At the deadline the leases still
@@ -433,6 +439,7 @@ pub(crate) mod tests {
         // The program was cancelled by the fence; it reports the fence, not its rows.
         read_fenced(&running.await.unwrap().unwrap_err());
         let replayed = s.execute(request).await.unwrap();
+        assert_eq!(replayed.as_ref().unwrap().kind, FenceCommitKind::Resumed);
         assert_eq!(fence_outcome(&replayed), FenceOutcome::Applied);
         assert_eq!(s.fence.gate().state(), FenceState::SourceReadFenced);
     }

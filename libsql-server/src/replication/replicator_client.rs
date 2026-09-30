@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -114,8 +115,9 @@ pub struct Client {
     /// The namespace's fence controller on this replica server, on which the primary's fence
     /// is published as a local read denial (`docs/NAMESPACE_FENCE.md` section 6.2).
     fence: Arc<FenceController>,
-    /// Replication calls the primary's fence refused since the last `hello` it answered.
-    fence_refusals: u32,
+    /// Replication calls the primary's fence refused since the last `hello` it answered. Shared
+    /// with active frame streams so a refusal delivered as their terminal status is counted too.
+    fence_refusals: Arc<AtomicU32>,
 }
 
 impl Client {
@@ -137,14 +139,14 @@ impl Client {
             wal_impl: wal_flavor,
             first_sync_since_handshake: true,
             fence,
-            fence_refusals: 0,
+            fence_refusals: Arc::new(AtomicU32::new(0)),
         })
     }
 
     /// Replication calls the primary's fence refused in a row, since the last `hello` it
     /// answered. The replica's replication loop paces its reconnects by it.
     pub(crate) fn fence_refusals(&self) -> u32 {
-        self.fence_refusals
+        self.fence_refusals.load(Ordering::Relaxed)
     }
 
     /// Publish what the primary said of its fence as this replica's local read denial, logging
@@ -171,7 +173,11 @@ impl Client {
     fn status_error(&mut self, status: Status) -> Error {
         let error = replica::replicator_error(status);
         if let Some(refusal) = PrimaryFenceRefusal::of(&error) {
-            self.fence_refusals = self.fence_refusals.saturating_add(1);
+            self.fence_refusals
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    Some(count.saturating_add(1))
+                })
+                .ok();
             metrics::increment_counter!(
                 "libsql_server_replica_fence_refusals_total",
                 "code" => refusal.0.outcome().as_str(),
@@ -189,10 +195,16 @@ impl Client {
         stream: tonic::Streaming<RpcFrame>,
     ) -> impl Stream<Item = Result<RpcFrame, Error>> + Send + 'static {
         let fence = self.fence.clone();
+        let fence_refusals = self.fence_refusals.clone();
         let namespace = self.namespace.clone();
         stream.map_err(move |status| {
             let error = replica::replicator_error(status);
             if let Some(refusal) = PrimaryFenceRefusal::of(&error) {
+                fence_refusals
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                        Some(count.saturating_add(1))
+                    })
+                    .ok();
                 metrics::increment_counter!(
                     "libsql_server_replica_fence_refusals_total",
                     "code" => refusal.0.outcome().as_str(),
@@ -253,7 +265,7 @@ impl ReplicatorClient for Client {
         let hello = resp.into_inner();
         verify_session_token(&hello.session_token).map_err(Error::Client)?;
         // The primary answers `hello` only where its fence admits replication.
-        self.fence_refusals = 0;
+        self.fence_refusals.store(0, Ordering::Relaxed);
         self.observe_primary_fence(replica::denial_from_hello(
             hello.config.as_ref().and_then(|c| c.fence.as_ref()),
         ));

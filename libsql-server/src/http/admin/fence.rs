@@ -482,7 +482,7 @@ fn success_reply<C>(
     let outcome = commit.receipt.outcome;
     let body = json!({
         "outcome": outcome.as_str(),
-        "replayed": commit.kind == crate::namespace::meta_store::FenceCommitKind::Replayed,
+        "replayed": commit.kind != crate::namespace::meta_store::FenceCommitKind::Committed,
         "fence": fence,
         "receipt": receipt_json(&commit.receipt),
         "drain": drain_json(controller.as_deref()),

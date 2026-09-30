@@ -228,7 +228,7 @@ GET /v1/namespaces/:namespace/fence
 POST /v1/namespaces/:namespace/fence/source/acquire-write-fence
 ```
 
-`AcquireSourceWriteFence`. Extra body fields: `expected_namespace_identity: { "log_id": "<uuid>" }` (the replication log id the caller observed) and `drain_policy: { "deadline_ms": <u64>, "on_deadline": "fail" | "force_rollback" }`. Returns `APPLIED` with `SOURCE_WRITE_FENCED` and the frozen boundary, or `DRAINING` with `SOURCE_DRAINING` if the deadline passed under `fail`, or if the request was cut short. Replaying the same command resumes the same drain.
+`AcquireSourceWriteFence`. Extra body fields: `expected_namespace_identity: { "log_id": "<uuid>" }` (the replication log id the caller observed) and `drain_policy: { "deadline_ms": <u64>, "on_deadline": "fail" | "force_rollback" }`. Returns `APPLIED` with `SOURCE_WRITE_FENCED` and the frozen boundary, or `DRAINING` with `SOURCE_DRAINING` if the deadline passed under `fail`, or if the request was cut short. Replaying the same command resumes the same drain while its state and revision are still current.
 
 ```HTTP
 POST /v1/namespaces/:namespace/fence/source/set-read-fence
@@ -321,7 +321,9 @@ For every mutating command, under the per-namespace transition lock:
 2. Compute the fingerprint: SHA-256 over the deterministic protobuf encoding of the command *including* namespace, `operation_id`, command kind, `expected_state`, `expected_revision` and every argument, *excluding* `command_id`.
 3. Look up `(namespace, operation_id, command_id)`:
    - found, same fingerprint, final outcome: return the stored result with `"replayed": true`. This holds even though the revision has since advanced.
-   - found, same fingerprint, in-progress (`DRAINING`, or an indeterminate commit being reconciled): resume that same command (section 8.4).
+   - found, same fingerprint, `DRAINING` while the record is still in that command's draining state at the receipt's revision: resume that same command (section 8.4).
+   - found, same fingerprint, `DRAINING` after `ReleaseSourceWriteFence`, `ClearSourceReadFence` or `AbortQuarantinedTarget` superseded the drain: return the stored historical result with `"replayed": true`; do not run the old drain against the newer state.
+   - found, same fingerprint, an indeterminate commit being reconciled: resume that same command (section 8.4).
    - found, different fingerprint: `FENCE_COMMAND_CONFLICT`. Nothing changes.
 4. Only a non-replay proceeds. A namespace whose control state cannot be established refuses everything with `FENCE_STATE_UNAVAILABLE`, except the two commands that reconcile it: a replay of the `CreateTargetQuarantined` that left the marker (section 10.1), and `AdoptFence` after a metastore rollback (section 12).
 5. Owner check (`FENCE_OWNED_BY_ANOTHER_OPERATION`) against an unfinished record.
@@ -528,7 +530,7 @@ This makes the WAL gate independent of statement classification: DDL, misclassif
 4. CAS `SOURCE_DRAINING` in the metastore with receipt outcome `DRAINING`.
    - Committed: the commit publishes `SOURCE_DRAINING` in place of the `INSTALLING` gate (write admission never reopens in between). Continue.
    - A replay of a finished acquisition, or `ALREADY_APPLIED`: publish the durable state, respond with the stored result.
-   - A replay of the `DRAINING` receipt, or a new command of the owner joining the drain the record is in: nothing is written; continue at step 5.
+   - A replay of a `DRAINING` receipt while the record is still in that command's draining state at the receipt's revision, or a new command of the owner joining that state: nothing is written; continue at step 5. A drain superseded by release is returned as a replay without continuing.
    - Proven not committed (the transition function refused it, or the transaction failed before `COMMIT`): remove the `INSTALLING` gate, which moves the generation again, and return the error. A transaction opened while it was up therefore cannot write afterwards.
    - Unknown (error on `COMMIT`, the task died): the gate closes as indeterminate (section 7.2) and the response is `FENCE_COMMIT_INDETERMINATE`. It is never treated as not applied.
 5. For each live source, wait until its connection manager has no connection holding the write slot for a write (a checkpoint, `Maintenance`, may hold it): enable the manager's release `Notify`, check `has_writer()`, and wait for the notification. Elapsed time and `txn_timeout` are never evidence; with admission closed nobody queues behind the holder, so its slot is not stolen by the timeout either. Because admission is closed, a manager seen without a writer stays without one, so the managers are waited for in turn.
@@ -540,7 +542,7 @@ This makes the WAL gate independent of statement classification: DDL, misclassif
 
 ### 8.4 Reconciliation and resumption
 
-- Replay of a command whose receipt says `DRAINING` resumes at step 5, with the request's own deadline counted from the replay. After a restart there is no pre-cutoff writer (SQLite recovery discards uncommitted work), so it completes at once.
+- Replay of a command whose receipt says `DRAINING` resumes at step 5 only while the durable record is still in that command's draining state at the same revision, with the request's own deadline counted from the replay. The revision check distinguishes a later read-fence cycle under the same operation and state. If that replay proves the drain, its response still has `"replayed": true` and the audit event classifies it as `resume`, even though completing the drain wrote the final receipt. After a restart there is no pre-cutoff writer (SQLite recovery discards uncommitted work), so it completes at once. If an explicit release, read-fence clear or target abort has superseded the drain, replay returns the stored historical `DRAINING` result without restarting it.
 - Replay of a command held `Indeterminate` re-reads the metastore: if the row shows the command applied, it continues from that durable point; if it shows it did not, it retries the same CAS. Other commands receive `FENCE_COMMIT_INDETERMINATE` until then. After a restart the gate reflects whatever is durable, which by definition was never acknowledged as open.
 - Opening transitions (`ReleaseSourceWriteFence`, `EnableTargetWrites`) follow **commit → publish the exact revision to the gate → respond `APPLIED`**. A crash after commit and before publication sends no success, and startup recovers the committed gate before exposing the namespace.
 
