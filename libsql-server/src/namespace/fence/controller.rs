@@ -501,16 +501,26 @@ impl FenceController {
     /// Cancel every read lease held now (the read drain's deadline). Each lease's work is asked
     /// to stop once; the leases stay counted until they are actually released. Returns how many
     /// were asked.
-    pub(crate) fn cancel_read_leases(&self) -> usize {
+    /// [`cancel_read_leases`](Self::cancel_read_leases), counted by the kind of work asked to
+    /// stop.
+    pub(crate) fn cancel_read_leases_by_kind(&self) -> ReadLeaseCounts {
         let leases = self.read_leases.lock();
-        let mut asked = 0;
+        let mut asked = ReadLeaseCounts::default();
         for entry in leases.live.values() {
             if !entry.cancelled.swap(true, Ordering::AcqRel) {
                 (entry.cancel)();
-                asked += 1;
+                match entry.kind {
+                    LeaseKind::Sql => asked.sql += 1,
+                    LeaseKind::Dump => asked.dump += 1,
+                    LeaseKind::Replication => asked.replication += 1,
+                }
             }
         }
         asked
+    }
+
+    pub(crate) fn cancel_read_leases(&self) -> usize {
+        self.cancel_read_leases_by_kind().total()
     }
 
     /// On a replica server: publish what the replicator learned of the primary's fence
@@ -757,6 +767,7 @@ impl FenceController {
         let guard = self.transition_lock.clone().lock_owned().await;
         Transition {
             controller: self.clone(),
+            report: Default::default(),
             _guard: guard,
         }
     }
@@ -879,6 +890,8 @@ impl FenceController {
 /// dropped.
 pub struct Transition {
     controller: Arc<FenceController>,
+    /// What the command's drain did, for its audit event (section 15).
+    pub(crate) report: super::audit::CommandReport,
     _guard: OwnedMutexGuard<()>,
 }
 

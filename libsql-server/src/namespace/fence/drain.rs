@@ -16,6 +16,7 @@ use tokio::time::Instant;
 
 use crate::namespace::meta_store::{FenceCommit, FenceContext, MetaStore};
 
+use super::audit::{self, CommandAudit, CommandReport, DrainKind, ForcedKind};
 use super::command::{DrainPolicy, FenceCommand, FenceRequest, OnDeadline};
 use super::controller::{FenceController, LiveWriteDrain, Transition};
 use super::hooks::HookPoint;
@@ -52,7 +53,8 @@ impl FenceController {
         let meta = meta.clone();
         tokio::spawn(async move {
             let mut transition = this.begin_transition().await;
-            match request.command {
+            let audit = CommandAudit::new(&request, this.gate().state());
+            let result = match request.command {
                 FenceCommand::AcquireSourceWriteFence { .. } => {
                     acquire_source_write_fence(&mut transition, &meta, request, ctx).await
                 }
@@ -63,7 +65,9 @@ impl FenceController {
                     super::import::seal_target_import(&mut transition, &meta, request, ctx).await
                 }
                 _ => transition.apply(&meta, request, ctx).await,
-            }
+            };
+            audit::command_finished(&audit, &result, &transition.report);
+            result
         })
         .await?
     }
@@ -121,10 +125,14 @@ pub async fn acquire_source_write_fence(
     let drain_key = (commit.receipt.operation_id, commit.receipt.command_id);
 
     // Steps 5 and 6.
-    let boundary = match drain_writers(&controller, policy).await {
+    let started = Instant::now();
+    let boundary = match drain_writers(&controller, policy, &mut transition.report).await {
         Some(boundary) => boundary,
         None => return Ok(commit),
     };
+    transition
+        .report
+        .drained(DrainKind::Write, started.elapsed());
 
     // Step 7.
     let acquired_on = commit.record.as_ref().and_then(|r| r.identity.log_id);
@@ -156,6 +164,7 @@ pub async fn acquire_source_write_fence(
 async fn drain_writers(
     controller: &FenceController,
     policy: DrainPolicy,
+    report: &mut CommandReport,
 ) -> Option<FrozenBoundary> {
     let namespace = controller.namespace().clone();
     let deadline_after = Duration::from_millis(policy.deadline_ms);
@@ -178,6 +187,10 @@ async fn drain_writers(
             match policy.on_deadline {
                 OnDeadline::ForceRollback if !forced => {
                     forced = true;
+                    report.forced(
+                        ForcedKind::Rollback,
+                        sources.iter().filter(|s| s.manager.has_writer()).count(),
+                    );
                     for source in &sources {
                         let manager = source.manager.clone();
                         // The rollback takes the connection's lock, which a running program
@@ -283,7 +296,7 @@ fn capture_boundary(
     Ok(FrozenBoundary { log_id, frame_no })
 }
 
-pub(super) fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))

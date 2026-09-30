@@ -87,11 +87,15 @@ fn run_admitted(
         }) {
             Ok(lease) => lease,
             Err(e) => {
+                crate::namespace::fence::audit::denied(
+                    &e,
+                    crate::namespace::fence::audit::DenialSurface::AdminShell,
+                );
                 return Ok(rpc::Response {
                     resp: Some(Resp::Error(rpc::Error {
                         error: e.to_string(),
                     })),
-                })
+                });
             }
         };
     let res = run_one(conn, q);
