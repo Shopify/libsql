@@ -18,6 +18,8 @@ use parking_lot::Mutex;
 use tokio::sync::{watch, Notify, OwnedMutexGuard};
 use uuid::Uuid;
 
+use libsql_replication::rpc::metadata::ReplicatedFence;
+
 use crate::connection::connection_manager::{ConnectionManager, WeakConnectionManager};
 use crate::error::Error;
 use crate::namespace::meta_store::{FenceCommit, FenceContext, MetaStore};
@@ -155,6 +157,17 @@ impl GateSnapshot {
             }
         }
         Ok(())
+    }
+
+    /// The fence as a replica needs it (`docs/NAMESPACE_FENCE.md` section 6.2): the state and
+    /// revision of an active fence, `None` while no fence is active. The primary fills it into
+    /// the configuration its replication `hello` returns; it is never stored.
+    pub fn replicated(&self) -> Option<ReplicatedFence> {
+        let state = self.state();
+        state.is_active().then(|| ReplicatedFence {
+            state: state.as_str().into(),
+            revision: self.revision(),
+        })
     }
 
     /// Whether a closing transition is being installed.

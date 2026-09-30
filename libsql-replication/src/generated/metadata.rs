@@ -32,6 +32,23 @@ pub struct DatabaseConfig {
     pub shared_schema_name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(enumeration = "DurabilityMode", optional, tag = "13")]
     pub durability_mode: ::core::option::Option<i32>,
+    /// The namespace fence as seen by the primary when it answered. Only ever filled by the
+    /// primary's replication `Hello`, and only while a fence is active; it is never part of a
+    /// stored configuration. Absent from older primaries; older replicas ignore it and still
+    /// see the legacy `block_*` fields above.
+    #[prost(message, optional, tag = "14")]
+    pub fence: ::core::option::Option<ReplicatedFence>,
+}
+/// The part of a namespace fence a replica needs to apply the primary's read admission.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReplicatedFence {
+    /// The fence state name, e.g. "SOURCE_READ_FENCED".
+    #[prost(string, tag = "1")]
+    pub state: ::prost::alloc::string::String,
+    /// The revision of the fence record the state belongs to.
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

@@ -223,15 +223,18 @@ mod tests {
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use futures::{Stream, StreamExt};
+    use libsql_replication::rpc::metadata::{self, ReplicatedFence};
     use libsql_replication::rpc::replication::replication_log_server::ReplicationLog;
     use libsql_replication::rpc::replication::{
         Frame, HelloRequest, LogOffset, NAMESPACE_METADATA_KEY, SESSION_TOKEN_KEY,
     };
     use tonic::metadata::{AsciiMetadataValue, BinaryMetadataValue};
+    use uuid::Uuid;
 
     use super::*;
     use crate::error::Error;
     use crate::http::user::dump::dump_stream;
+    use crate::namespace::fence::command::{FenceCommand, FenceRequest};
     use crate::namespace::fence::drain::tests::{fence_outcome, raw, Source, LONG, OP, PROMPT};
     use crate::namespace::fence::read::tests::{fenced_source, read_fence, NOW};
     use crate::namespace::fence::state::FenceState;
@@ -411,6 +414,82 @@ mod tests {
                 wal_flavor: None,
             })
         }
+    }
+
+    /// The configuration a replica's `hello` receives from `s`.
+    async fn hello_config(s: &Source) -> metadata::DatabaseConfig {
+        let replication = Replication {
+            service: ReplicationLogService::new(s.store.clone(), None, None, false, false, true),
+            token: None,
+        };
+        replication
+            .service
+            .hello(replication.request(HelloRequest {
+                handshake_version: Some(1),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .config
+            .expect("hello always carries the configuration")
+    }
+
+    /// `hello` carries the live fence while one is active (`docs/NAMESPACE_FENCE.md` section
+    /// 6.2), and nothing before the fence and once it is released. The stored configuration
+    /// never carries it.
+    #[tokio::test]
+    async fn hello_carries_replicated_fence() {
+        let s = Source::new().await;
+        let unfenced = hello_config(&s).await;
+        assert_eq!(unfenced.fence, None);
+        assert!(!unfenced.block_writes);
+
+        let acquired = s.execute(s.acquire(OP, 1, LONG)).await.unwrap();
+        assert_eq!(fence_outcome(&acquired), FenceOutcome::Applied);
+        let gate = s.fence.gate();
+        assert_eq!(gate.state(), FenceState::SourceWriteFenced);
+        let fenced = hello_config(&s).await;
+        assert_eq!(
+            fenced.fence,
+            Some(ReplicatedFence {
+                state: "SOURCE_WRITE_FENCED".into(),
+                revision: gate.revision(),
+            })
+        );
+        // Apart from the fence, `hello` sends the namespace's logical configuration unchanged:
+        // the legacy `block_*` mirror lives only in the stored config row (section 13.2).
+        let stored = s
+            .store
+            .with("ns".into(), |ns| {
+                metadata::DatabaseConfig::from(ns.config().as_ref())
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored.fence, None);
+        assert_eq!(
+            metadata::DatabaseConfig {
+                fence: None,
+                ..fenced
+            },
+            stored
+        );
+
+        let released = s
+            .execute(FenceRequest {
+                namespace: "ns".into(),
+                operation_id: OP,
+                command_id: Uuid::from_u128(2),
+                expected_state: gate.state(),
+                expected_revision: gate.revision(),
+                command: FenceCommand::ReleaseSourceWriteFence,
+            })
+            .await
+            .unwrap();
+        assert_eq!(fence_outcome(&released), FenceOutcome::Applied);
+        assert_eq!(s.fence.gate().state(), FenceState::Released);
+        let after = hello_config(&s).await;
+        assert_eq!(after.fence, None);
+        assert!(!after.block_writes);
     }
 
     fn assert_read_fenced_status(status: &tonic::Status) {

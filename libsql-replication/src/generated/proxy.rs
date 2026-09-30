@@ -77,6 +77,12 @@ pub struct Error {
     pub message: ::prost::alloc::string::String,
     #[prost(int32, tag = "3")]
     pub extended_code: i32,
+    /// Stable machine-readable outcome of the error, e.g. "MIGRATION_WRITE_FENCED" for a
+    /// request refused by a namespace fence. Absent when the error has no typed outcome, and
+    /// always absent from older servers: a receiver treats an absent field as "no typed
+    /// outcome" and falls back to `code`.
+    #[prost(string, optional, tag = "4")]
+    pub stable_code: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Nested message and enum types in `Error`.
 pub mod error {

@@ -57,6 +57,7 @@ pub mod rpc {
                 message: other.to_string(),
                 code: code as i32,
                 extended_code,
+                stable_code: None,
             }
         }
     }

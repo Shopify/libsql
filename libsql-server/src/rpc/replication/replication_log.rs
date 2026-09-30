@@ -8,6 +8,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use futures_core::Future;
+use libsql_replication::rpc::metadata;
 pub use libsql_replication::rpc::replication as rpc;
 use libsql_replication::rpc::replication::log_offset::WalFlavor;
 use libsql_replication::rpc::replication::replication_log_server::ReplicationLog;
@@ -431,7 +432,7 @@ impl ReplicationLog for ReplicationLogService {
                 guard.insert((replica_addr, namespace.clone()));
             }
         }
-        let (logger, config, version, _, _, _) = self
+        let (logger, config, version, _, _, fence) = self
             .logger_from_namespace(namespace, "hello", &req, false)
             .await?;
 
@@ -451,7 +452,13 @@ impl ReplicationLog for ReplicationLogService {
             generation_id: self.generation_id.to_string(),
             generation_start_index: 0,
             current_replication_index: *logger.new_frame_notifier.borrow(),
-            config: Some(config.as_ref().into()),
+            config: Some(metadata::DatabaseConfig {
+                // The live fence, for a replica that applies it (section 6.2 of
+                // `docs/NAMESPACE_FENCE.md`); older replicas skip it and see the legacy
+                // `block_*` mirror. The stored configuration never carries it.
+                fence: fence.gate().replicated(),
+                ..config.as_ref().into()
+            }),
         };
 
         Ok(tonic::Response::new(response))
