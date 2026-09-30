@@ -45,3 +45,20 @@ pub(crate) mod proto {
 
 /// Version of the fence admin protocol reported by capability discovery.
 pub const FENCE_PROTOCOL_VERSION: u32 = 1;
+
+/// Whether this server fills the proxy protocol's additive `Error.stable_code` field and maps
+/// it on the replica side (`docs/NAMESPACE_FENCE.md` section 6.1). Reported by capability
+/// discovery so that deployment tooling can check every server before fences are used.
+pub const PROXY_STABLE_CODE: bool = false;
+
+/// The identity of this server process: its build and an id generated once per process. It is
+/// written into records and receipts, and reported by the admin API.
+pub fn server_identity() -> record::ServerIdentity {
+    static IDENTITY: std::sync::OnceLock<record::ServerIdentity> = std::sync::OnceLock::new();
+    IDENTITY
+        .get_or_init(|| record::ServerIdentity {
+            build: crate::version::version(),
+            instance_id: uuid::Uuid::new_v4(),
+        })
+        .clone()
+}

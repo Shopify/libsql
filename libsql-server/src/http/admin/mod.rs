@@ -31,6 +31,7 @@ use crate::namespace::{DumpSource, DumpStream, NamespaceName, NamespaceStore, Re
 use crate::net::Connector;
 use crate::LIBSQL_PAGE_SIZE;
 
+pub mod fence;
 pub mod stats;
 
 #[derive(Clone)]
@@ -50,6 +51,9 @@ struct AppState<C> {
     connector: C,
     metrics: Metrics,
     set_env_filter: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Sync + Send + 'static>>,
+    /// Whether an admin auth key is configured. Namespace fence commands refuse to run without
+    /// one (`docs/NAMESPACE_FENCE.md` section 4.1).
+    admin_auth_configured: bool,
 }
 
 impl<C> FromRef<Arc<AppState<C>>> for Metrics {
@@ -171,12 +175,14 @@ where
         .route("/profile/heap/disable/:id", post(disable_profile_heap))
         .route("/profile/heap/:id", delete(delete_profile_heap))
         .route("/log-filter", post(handle_set_log_filter))
+        .merge(fence::routes())
         .with_state(Arc::new(AppState {
             namespaces: namespaces.clone(),
             connector,
             user_http_server,
             metrics,
             set_env_filter,
+            admin_auth_configured: auth.is_some(),
         }))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
