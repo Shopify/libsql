@@ -19,6 +19,7 @@ use crate::database::{Database, ReplicaDatabase};
 use crate::namespace::broadcasters::BroadcasterHandle;
 use crate::namespace::configurator::helpers::{make_stats, run_storage_monitor};
 use crate::namespace::fence::controller::FenceController;
+use crate::namespace::fence::replica::{refusal_backoff, PrimaryFenceRefusal};
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{Namespace, NamespaceBottomlessDbIdInit, RestoreOption};
 use crate::namespace::{NamespaceName, NamespaceStore, ResetCb, ResetOp, ResolveNamespacePathFn};
@@ -77,6 +78,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
                 meta_store_handle.clone(),
                 store.clone(),
                 WalImpl::new_sqlite(&db_path, new_frame_sender).await?,
+                fence.clone(),
             )
             .await?;
             let mut replicator = libsql_replication::replicator::Replicator::new_sqlite(
@@ -126,6 +128,19 @@ impl ConfigureNamespace for ReplicaConfigurator {
                 loop {
                     match replicator.run().await {
                         err @ Error::Fatal(_) => Err(err)?,
+                        e @ Error::Internal(_) if PrimaryFenceRefusal::of(&e).is_some() => {
+                            // The primary's fence refuses replication of this namespace
+                            // (`docs/NAMESPACE_FENCE.md` section 6.2). The client has published
+                            // the local read denial; retry at a capped, growing interval rather
+                            // than at once, until the primary answers `hello` again.
+                            let refusals = replicator.client_mut().fence_refusals();
+                            let delay = refusal_backoff(refusals);
+                            tracing::debug!(
+                                "{e}; retrying replication of {namespace} in {delay:?} \
+                                 ({refusals} refusals in a row)"
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
                         _err @ Error::NamespaceDoesntExist => {
                             // TODO(lucio): there is a bug where a primary will report that a valid
                             // namespace doesn't exist when it does and causes the replicate to

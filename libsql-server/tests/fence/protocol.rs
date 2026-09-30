@@ -974,3 +974,364 @@ fn denial_not_retried() {
     });
     sim.run().unwrap();
 }
+
+/// The primary's internal replication service (the one replica servers use), as a raw client
+/// that sees statuses and their metadata.
+struct Replication {
+    client: libsql_replication::rpc::replication::replication_log_client::ReplicationLogClient<
+        tonic::transport::Channel,
+    >,
+    ns: String,
+    token: Option<bytes::Bytes>,
+}
+
+impl Replication {
+    fn new(ns: &str) -> anyhow::Result<Self> {
+        use tower::ServiceExt as _;
+        let uri = tonic::transport::Uri::from_static("http://primary:4567");
+        let channel = tonic::transport::Channel::builder(uri.clone()).connect_with_connector_lazy(
+            TurmoilConnector.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() }),
+        );
+        Ok(Self {
+            client: libsql_replication::rpc::replication::replication_log_client::ReplicationLogClient::with_origin(channel, uri),
+            ns: ns.into(),
+            token: None,
+        })
+    }
+
+    fn request<T>(&self, msg: T) -> tonic::Request<T> {
+        use libsql_replication::rpc::replication::{NAMESPACE_METADATA_KEY, SESSION_TOKEN_KEY};
+        let mut req = tonic::Request::new(msg);
+        req.metadata_mut().insert_bin(
+            NAMESPACE_METADATA_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(self.ns.as_bytes()),
+        );
+        if let Some(token) = &self.token {
+            req.metadata_mut().insert(
+                SESSION_TOKEN_KEY,
+                tonic::metadata::AsciiMetadataValue::try_from(token.as_ref()).unwrap(),
+            );
+        }
+        req
+    }
+
+    /// `hello`; on success keeps the session token and returns the replicated fence.
+    async fn hello(
+        &mut self,
+    ) -> Result<Option<libsql_replication::rpc::metadata::ReplicatedFence>, tonic::Status> {
+        let req = self.request(libsql_replication::rpc::replication::HelloRequest::new());
+        let hello = self.client.hello(req).await?.into_inner();
+        self.token = Some(hello.session_token.clone());
+        Ok(hello.config.and_then(|c| c.fence))
+    }
+
+    fn offset(&self) -> tonic::Request<libsql_replication::rpc::replication::LogOffset> {
+        self.request(libsql_replication::rpc::replication::LogOffset {
+            next_offset: 0,
+            wal_flavor: None,
+        })
+    }
+
+    async fn log_entries(
+        &mut self,
+    ) -> Result<tonic::Streaming<libsql_replication::rpc::replication::Frame>, tonic::Status> {
+        let req = self.offset();
+        Ok(self.client.log_entries(req).await?.into_inner())
+    }
+
+    async fn snapshot(
+        &mut self,
+    ) -> Result<tonic::Streaming<libsql_replication::rpc::replication::Frame>, tonic::Status> {
+        let req = self.offset();
+        Ok(self.client.snapshot(req).await?.into_inner())
+    }
+}
+
+/// A status in the typed form of section 6: `FAILED_PRECONDITION`, the stable code in
+/// `x-libsql-fence-code`, and the code prefixing the message.
+#[track_caller]
+fn assert_fence_status(what: &str, status: &tonic::Status, code: &str) {
+    assert_eq!(
+        status.code(),
+        tonic::Code::FailedPrecondition,
+        "{what}: {status:?}"
+    );
+    assert_eq!(
+        status
+            .metadata()
+            .get("x-libsql-fence-code")
+            .and_then(|v| v.to_str().ok()),
+        Some(code),
+        "{what}: {status:?}"
+    );
+    assert!(status.message().starts_with(code), "{what}: {status:?}");
+}
+
+/// Replication as a raw peer of the primary sees it (sections 6.2 and 9): `hello` carries the
+/// replicated fence while the primary admits replication; under a read fence an open stream
+/// ends with the typed status and every call is refused with it; a quarantined target refuses
+/// with its own code; after the read fence is cleared `hello` is answered again.
+#[test]
+fn replication_codes() {
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf(), Primary::default());
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        let op = uuid(0x100);
+        admin.create_namespace("plain").await?;
+        load_and_log_id(&admin, "plain").await?;
+        assert_eq!(Replication::new("plain")?.hello().await?, None, "unfenced");
+
+        let mut repl = Replication::new("src")?;
+        let rev = write_fenced(&admin, "src", op).await?;
+        let fence = repl.hello().await?.expect("hello carries the write fence");
+        assert_eq!(
+            (fence.state.as_str(), fence.revision),
+            ("SOURCE_WRITE_FENCED", rev)
+        );
+        let mut tail = repl.log_entries().await?;
+        let frame = tail
+            .next()
+            .await
+            .expect("a frame")
+            .expect("frames are served");
+        assert!(!frame.data.is_empty());
+
+        let rev = read_fence(&admin, "src", op, rev).await?;
+        // The open stream ends with the terminal status (frames already buffered first).
+        let ended = loop {
+            match tail.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(status)) => break status,
+                None => panic!("the stream ended without a status"),
+            }
+        };
+        assert_fence_status("open log_entries", &ended, READ_FENCED);
+        assert!(tail.next().await.is_none());
+        assert_fence_status("hello", &repl.hello().await.unwrap_err(), READ_FENCED);
+        assert_fence_status(
+            "log_entries",
+            &repl.log_entries().await.unwrap_err(),
+            READ_FENCED,
+        );
+        assert_fence_status("snapshot", &repl.snapshot().await.unwrap_err(), READ_FENCED);
+
+        let rev = clear_read_fence(&admin, "src", op, rev).await?;
+        let fence = repl.hello().await?.expect("hello carries the write fence");
+        assert_eq!(
+            (fence.state.as_str(), fence.revision),
+            ("SOURCE_WRITE_FENCED", rev)
+        );
+        release(&admin, "src", op, rev).await?;
+        assert_eq!(repl.hello().await?, None, "released");
+
+        quarantined_target(&admin, "dst", uuid(0x200)).await?;
+        let mut target = Replication::new("dst")?;
+        assert_fence_status(
+            "target hello",
+            &target.hello().await.unwrap_err(),
+            QUARANTINED,
+        );
+        Ok(())
+    });
+    sim.run().unwrap();
+}
+
+/// The first `/v2` result of `sql` on `user`'s host: `Ok(())` or the Hrana error code.
+async fn v2_read(user: &User, ns: &str, sql: &str) -> anyhow::Result<Result<(), String>> {
+    let (status, body) = user
+        .pipeline(ns, 2, None, json!([execute_req(sql)]))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let result = &body["results"][0];
+    Ok(match result["type"].as_str() {
+        Some("ok") => Ok(()),
+        _ => Err(result["error"]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no error code: {body}"))
+            .to_string()),
+    })
+}
+
+/// Poll the legacy API on `user`'s host with `sql` until it answers `status`, for at most
+/// `within` of simulated time, and return that answer and how long it took.
+async fn poll_until(
+    user: &User,
+    ns: &str,
+    sql: &str,
+    status: StatusCode,
+    within: std::time::Duration,
+) -> anyhow::Result<(Value, std::time::Duration)> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let (got, body) = user.legacy(ns, &[sql]).await?;
+        if got == status {
+            return Ok((body, started.elapsed()));
+        }
+        assert!(
+            started.elapsed() < within,
+            "still {got} after {:?}: {body}",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// `src` write-fenced on the primary and loaded on the replica, then read-fenced; returns once
+/// the replica denies local reads, with the fence's revision.
+async fn replica_read_fenced(admin: &Admin, replica: &User, op: Uuid) -> anyhow::Result<u64> {
+    let rev = write_fenced(admin, "src", op).await?;
+    let (status, body) = replica.legacy("src", &["select count(*) from t"]).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "replica before the read fence: {body}"
+    );
+    let rev = read_fence(admin, "src", op, rev).await?;
+    // The replica learns of the fence when its replication stream ends, which the primary's
+    // read drain waits for; the denial is published as the terminal status arrives.
+    let (body, took) = poll_until(
+        replica,
+        "src",
+        "select count(*) from t",
+        StatusCode::LOCKED,
+        std::time::Duration::from_secs(2),
+    )
+    .await?;
+    assert_eq!(body["code"], READ_FENCED, "{body}");
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "took {took:?}"
+    );
+    Ok(rev)
+}
+
+/// A replica server denies local reads of a namespace whose primary is read-fenced, on every
+/// read surface, with the primary's code (section 6.2).
+#[test]
+fn replica_reads_denied_while_source_read_fenced() {
+    let mut sim = sim();
+    let primary = tempdir().unwrap();
+    let replica = tempdir().unwrap();
+    make_primary(&mut sim, primary.path().to_path_buf(), Primary::default());
+    make_replica(&mut sim, replica.path().to_path_buf());
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        let user = User::on("replica0");
+        replica_read_fenced(&admin, &user, uuid(0x100)).await?;
+
+        assert_locked(
+            "legacy read",
+            &user.legacy("src", &["select * from t"]).await?,
+            READ_FENCED,
+        );
+        assert_locked(
+            "v1 execute",
+            &user.execute("src", "select * from t").await?,
+            READ_FENCED,
+        );
+        assert_eq!(
+            v2_read(&user, "src", "select * from t").await?,
+            Err(READ_FENCED.to_string())
+        );
+        // `/dump` is not served by a replica server at all ("database is not a primary").
+        // Still denied later: the replica does not forget while the primary keeps refusing.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert_locked(
+            "legacy read later",
+            &user.legacy("src", &["select * from t"]).await?,
+            READ_FENCED,
+        );
+        Ok(())
+    });
+    sim.run().unwrap();
+}
+
+/// While the primary's fence refuses replication, the replica retries at a growing interval
+/// capped at 15 s, not every second or in a tight loop: over 60 s of simulated time it makes
+/// a handful of attempts (1 + 2 + 4 + 8 + 15 + 15 + 15 s of pauses), each counted.
+#[test]
+fn replica_backs_off_on_fence_code() {
+    let mut sim = sim();
+    let primary = tempdir().unwrap();
+    let replica = tempdir().unwrap();
+    make_primary(&mut sim, primary.path().to_path_buf(), Primary::default());
+    make_replica(&mut sim, replica.path().to_path_buf());
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        let user = User::on("replica0");
+        replica_read_fenced(&admin, &user, uuid(0x100)).await?;
+
+        let refusals = || {
+            crate::common::snapshot_metrics()
+                .get_counter_label(
+                    "libsql_server_replica_fence_refusals_total",
+                    ("code", READ_FENCED),
+                )
+                .unwrap_or(0)
+        };
+        let before = refusals();
+        assert!(before >= 1, "the ended stream is counted");
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let attempts = refusals() - before;
+        assert!(
+            (4..=9).contains(&attempts),
+            "{attempts} refused attempts in 60 s"
+        );
+        Ok(())
+    });
+    sim.run().unwrap();
+}
+
+/// Once the primary clears the read fence the replica answers `hello` again within the
+/// back-off cap, serves local reads, and replicates new writes once the source is released.
+#[test]
+fn replica_resumes_after_clear_read_fence() {
+    let mut sim = sim();
+    let primary = tempdir().unwrap();
+    let replica = tempdir().unwrap();
+    make_primary(&mut sim, primary.path().to_path_buf(), Primary::default());
+    make_replica(&mut sim, replica.path().to_path_buf());
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        let user = User::on("replica0");
+        let op = uuid(0x100);
+        let rev = replica_read_fenced(&admin, &user, op).await?;
+        // Let the back-off grow to its cap before clearing.
+        tokio::time::sleep(std::time::Duration::from_secs(40)).await;
+
+        let rev = clear_read_fence(&admin, "src", op, rev).await?;
+        let (_, took) = poll_until(
+            &user,
+            "src",
+            "select count(*) from t",
+            StatusCode::OK,
+            std::time::Duration::from_secs(20),
+        )
+        .await?;
+        assert!(took <= std::time::Duration::from_secs(16), "took {took:?}");
+        assert_eq!(v2_read(&user, "src", "select * from t").await?, Ok(()));
+
+        release(&admin, "src", op, rev).await?;
+        let (status, body) = User::new()
+            .legacy("src", &["insert into t values (2)"])
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let started = tokio::time::Instant::now();
+        loop {
+            let (status, body) = user.legacy("src", &["select count(*) from t"]).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if body[0]["results"]["rows"][0][0] == 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "not replicated: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(())
+    });
+    sim.run().unwrap();
+}

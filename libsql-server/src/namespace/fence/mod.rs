@@ -11,8 +11,8 @@
 //! on them: the per-namespace [`controller`] with its gate and read leases, the positive write
 //! [`drain`], the source [`read`] fence and its
 //! [`stream`] leases for dump and replication, quarantined migration [`target`]s with their
-//! [`capability`]-scoped [`import`] sessions and seal drain, the [`registry`] that holds the controllers outside the namespace cache, and the test [`hooks`]
-//! on their paths.
+//! [`capability`]-scoped [`import`] sessions and seal drain, the [`registry`] that holds the controllers outside the namespace cache, the
+//! [`replica`]-server view of a primary's fence, and the test [`hooks`] on their paths.
 
 // The persistence, controller and protocol layers that consume these types land in the
 // following commits of this series; until then most of the module is unused by the rest of
@@ -29,6 +29,7 @@ pub mod outcome;
 pub mod read;
 pub mod record;
 pub mod registry;
+pub mod replica;
 pub mod state;
 pub mod store;
 pub mod stream;
