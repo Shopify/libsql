@@ -41,6 +41,20 @@ impl Client {
         Ok(Response(self.0.get(s.parse()?).await?))
     }
 
+    pub(crate) async fn get_with_headers(
+        &self,
+        url: &str,
+        headers: &[(HeaderName, &str)],
+    ) -> anyhow::Result<Response> {
+        let mut request = hyper::Request::get(url).body(Body::empty())?;
+        for (key, val) in headers {
+            request
+                .headers_mut()
+                .insert(key.clone(), val.parse().unwrap());
+        }
+        Ok(Response(self.0.request(request).await?))
+    }
+
     pub(crate) async fn post<T: Serialize>(&self, url: &str, body: T) -> anyhow::Result<Response> {
         self.post_with_headers(url, &[], body).await
     }

@@ -233,6 +233,14 @@ pub enum LeaseKind {
     Replication,
 }
 
+/// The live drain counters of a namespace (see [`FenceController::drain_counters`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainCounters {
+    pub active_writers: usize,
+    pub read_leases: ReadLeaseCounts,
+    pub import_writers: usize,
+}
+
 /// The number of read leases held on a namespace, by kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadLeaseCounts {
@@ -650,6 +658,29 @@ impl FenceController {
     /// The import calls running now.
     pub fn import_writers(&self) -> usize {
         self.capabilities.lock().import_writers
+    }
+
+    /// The live drain counters reported by `InspectFence` and every admin response
+    /// (`docs/NAMESPACE_FENCE.md` section 4.3): connections holding a write slot for a write
+    /// transaction, read leases by kind, and running import calls. A snapshot; never waits.
+    pub fn drain_counters(&self) -> DrainCounters {
+        let active_writers = self
+            .live_write_drains()
+            .iter()
+            .filter(|source| source.manager.has_writer())
+            .count();
+        DrainCounters {
+            active_writers,
+            read_leases: self.read_lease_counts(),
+            import_writers: self.import_writers(),
+        }
+    }
+
+    /// The replication log id of the namespace as it is loaded now, if it is loaded on this
+    /// server as a primary. After a dirty restart this can differ from the log id a source was
+    /// acquired on (section 8.5).
+    pub fn current_log_id(&self) -> Option<Uuid> {
+        self.live_write_drains().last().map(|source| source.log_id)
     }
 
     /// The capabilities issued and still live.

@@ -82,6 +82,22 @@ impl FenceRegistry {
         }
     }
 
+    /// How many namespaces have an active fence (`docs/NAMESPACE_FENCE.md` section 4.4,
+    /// `active_fences`): a record in any state but `RELEASED` or `TARGET_WRITABLE`, an
+    /// unavailable state, a target being created, or a commit whose outcome is not known yet.
+    pub fn active_count(&self) -> usize {
+        let controllers: Vec<_> = self.controllers.lock().values().cloned().collect();
+        controllers
+            .iter()
+            .filter(|controller| {
+                let gate = controller.gate();
+                gate.state().is_active()
+                    || gate.indeterminate.is_some()
+                    || gate.is_creating_target()
+            })
+            .count()
+    }
+
     pub fn len(&self) -> usize {
         self.controllers.lock().len()
     }
