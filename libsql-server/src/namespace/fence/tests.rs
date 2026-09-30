@@ -582,7 +582,7 @@ fn restart_at(case: &Boundary) {
                 // The drain that was requested resumes and completes at once: recovery
                 // discarded any uncommitted work. The boundary is on the live, rebuilt log.
                 let commit = replay.unwrap();
-                assert_eq!(commit.kind, FenceCommitKind::Committed, "{name}");
+                assert_eq!(commit.kind, FenceCommitKind::Resumed, "{name}");
                 assert_eq!(commit.receipt.outcome, FenceOutcome::Applied, "{name}");
                 assert_eq!(commit.receipt.command_id, request.command_id);
                 assert_eq!(commit.receipt.revision_after, 2, "{name}");

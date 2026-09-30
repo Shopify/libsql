@@ -25,7 +25,7 @@ use crate::connection::legacy::LegacyConnection;
 use crate::connection::Connection as _;
 use crate::error::Error;
 use crate::namespace::configurator::{load_dump_sql, read_dump};
-use crate::namespace::meta_store::{FenceCommit, FenceContext, MetaStore};
+use crate::namespace::meta_store::{FenceCommit, FenceCommitKind, FenceContext, MetaStore};
 use crate::namespace::replication_wal::ReplicationWalWrapper;
 
 use super::capability::MigrationCapability;
@@ -167,9 +167,11 @@ pub async fn seal_target_import(
             return Err(e);
         }
     };
-    if commit.receipt.outcome != FenceOutcome::Draining {
+    if commit.kind == FenceCommitKind::Replayed || commit.receipt.outcome != FenceOutcome::Draining
+    {
         return Ok(commit);
     }
+    let resumed = commit.kind == FenceCommitKind::Resumed;
     let drain_key = (commit.receipt.operation_id, commit.receipt.command_id);
 
     if !drain_import_writers(&controller, policy).await {
@@ -177,9 +179,13 @@ pub async fn seal_target_import(
     }
 
     ctx.now_ms = now_ms();
-    transition
+    let mut completed = transition
         .complete_drain(meta, drain_key, DrainCompletion::TargetImport, ctx)
-        .await
+        .await?;
+    if resumed {
+        completed.kind = FenceCommitKind::Resumed;
+    }
+    Ok(completed)
 }
 
 /// Wait until no import call is running and no connection manager of the target has a writer
@@ -610,6 +616,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(replay.kind, FenceCommitKind::Resumed);
         assert_eq!(replay.receipt.outcome, FenceOutcome::Applied);
         assert_eq!(
             (fence.gate().state(), fence.gate().revision()),

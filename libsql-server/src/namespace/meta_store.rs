@@ -884,14 +884,17 @@ fn apply_fence_command(
 
     let decision = transition::apply(stored.as_current(), existing.as_ref(), request, &env)?;
     let (record, receipt) = match decision {
-        Decision::Replay(receipt) | Decision::Resume(receipt) => {
-            let kind = if receipt.is_final() {
-                FenceCommitKind::Replayed
-            } else {
-                FenceCommitKind::Resumed
-            };
+        Decision::Replay(receipt) => {
             return Ok(FenceCommit {
-                kind,
+                kind: FenceCommitKind::Replayed,
+                receipt,
+                record: stored.record().cloned(),
+                created_config: None,
+            });
+        }
+        Decision::Resume(receipt) => {
+            return Ok(FenceCommit {
+                kind: FenceCommitKind::Resumed,
                 receipt,
                 record: stored.record().cloned(),
                 created_config: None,
