@@ -382,9 +382,8 @@ impl Replicator {
             let frame = tokio::fs::File::open(&obj).await?;
             let frame_buf_reader = BufReader::new(frame);
 
-            let mut frameno = first_frame_no;
             let mut reader = bottomless::read::BatchReader::new(
-                frameno,
+                first_frame_no,
                 frame_buf_reader,
                 page_size as usize,
                 compression_kind,
@@ -411,7 +410,6 @@ impl Replicator {
                     );
                     pending_pages.flush(db).await?;
                 }
-                frameno += 1;
                 last_received_frame_no += 1;
             }
             db.flush().await?;

@@ -797,7 +797,7 @@ impl Stmt for RemoteStatement {
         }
     }
 
-    fn columns(&self) -> Vec<Column> {
+    fn columns(&self) -> Vec<Column<'_>> {
         if let Some(stmt) = self.local_statement.as_ref() {
             return stmt.columns();
         }

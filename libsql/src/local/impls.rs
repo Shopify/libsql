@@ -160,7 +160,7 @@ impl Stmt for LibsqlStmt {
         self.0.column_count()
     }
 
-    fn columns(&self) -> Vec<Column> {
+    fn columns(&self) -> Vec<Column<'_>> {
         self.0.columns()
     }
 }

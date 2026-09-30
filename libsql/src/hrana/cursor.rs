@@ -147,7 +147,7 @@ where
         })
     }
 
-    pub async fn next_step(&mut self) -> Result<CursorStep<S>> {
+    pub async fn next_step(&mut self) -> Result<CursorStep<'_, S>> {
         CursorStep::new(self).await
     }
 

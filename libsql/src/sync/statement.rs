@@ -67,7 +67,7 @@ impl Stmt for SyncedStatement {
         self.inner.column_count()
     }
 
-    fn columns(&self) -> Vec<Column> {
+    fn columns(&self) -> Vec<Column<'_>> {
         self.inner.columns()
     }
 }
