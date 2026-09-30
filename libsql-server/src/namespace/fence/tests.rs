@@ -631,6 +631,46 @@ fn restart_at(case: &Boundary) {
     server.crash();
 }
 
+/// A dirty restart rebuilds the replication log under a new id. The stored record keeps the
+/// log the source was acquired on and the boundary frozen in it; the controller's
+/// `current_log_id`, which `InspectFence` and every admin response report as
+/// `incarnation.current_log_id` (section 4.5), names the rebuilt log, so a caller can see the
+/// rebuild without a separate probe.
+#[test]
+fn current_log_id_is_the_rebuilt_log_after_restart() {
+    let dir = tempdir().unwrap();
+
+    let server = Server::boot(dir.path());
+    server.create_source();
+    let (acquired_on, _) = server.run(server.log());
+    let commit = server.fence_source();
+    assert_eq!(
+        commit.record.as_ref().unwrap().state,
+        FenceState::SourceWriteFenced
+    );
+    server.run(async {
+        assert_eq!(server.fence().await.current_log_id(), Some(acquired_on));
+    });
+    server.crash();
+
+    let server = Server::boot(dir.path());
+    server.run(async {
+        let fence = server.fence().await;
+        let (live, _) = server.log().await;
+        assert_ne!(live, acquired_on, "a dirty restart rebuilds the log");
+        assert_eq!(fence.current_log_id(), Some(live));
+
+        let inspected = server.inspect().await;
+        let record = inspected.fence.record().unwrap();
+        assert_eq!(record.state, FenceState::SourceWriteFenced);
+        assert_eq!(record.identity.log_id, Some(acquired_on));
+        assert_eq!(boundary(&commit).log_id, acquired_on);
+        // The data is the same; only the log was rebuilt.
+        assert_eq!(server.count().await, ROWS);
+    });
+    server.crash();
+}
+
 /// After a restart in `SOURCE_DRAINING` with a writer that was active at the crash, nothing
 /// advances by itself: the namespace stays closed, other commands cannot move it on, and only
 /// the replay of the same acquisition completes the drain, at once.
