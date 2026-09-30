@@ -343,4 +343,95 @@ mod fence_tests {
         );
         assert_eq!(s.fence.read_lease_counts().total(), 0);
     }
+
+    /// Section 17 row 12: a quarantined target is written only through its operation's import
+    /// capability. The admin shell, which reaches the namespace with admin authority and runs raw
+    /// SQL, can neither read nor write it: every query is refused by the read admission with the
+    /// quarantine code, and a raw write that skipped the admission is still refused at the WAL.
+    /// The import session keeps working, and nothing the shell sent changed the data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admin_shell_cannot_write_quarantined() {
+        use crate::namespace::fence::target::tests::{create, create_request, OP as TARGET_OP};
+        use crate::namespace::open_test_store as open_store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path()).await;
+        create(&store, create_request("tgt", 1))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut session = store
+            .open_import_session("tgt".into(), TARGET_OP, 1)
+            .await
+            .unwrap();
+        session
+            .with_raw(|c| c.execute_batch("create table t (x); insert into t values (1)"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let shell = AdminShell::new(store.clone());
+        let sql = [
+            "insert into t values (2)",
+            "delete from t",
+            "create table u (y)",
+            "pragma user_version = 7",
+            "begin immediate",
+            "select count(*) from t",
+        ];
+        let queries = tokio_stream::iter(sql.map(|q| Ok(rpc::Query { query: q.into() })));
+        let responses: Vec<_> = shell
+            .with_namespace(Bytes::from_static(b"tgt"), queries)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(responses.len(), sql.len());
+        for (q, resp) in sql.iter().zip(&responses) {
+            let resp = resp.as_ref().unwrap();
+            assert!(
+                error(resp).starts_with("MIGRATION_TARGET_QUARANTINED"),
+                "{q}: {}",
+                error(resp)
+            );
+        }
+
+        // Without the shell's read admission, the raw write is refused by the WAL gate: the
+        // connection holds no capability.
+        let (fence, maker) = store
+            .with("tgt".into(), |ns| {
+                (ns.fence().clone(), ns.db.connection_maker())
+            })
+            .await
+            .unwrap();
+        let conn = maker.create().await.unwrap();
+        for q in ["insert into t values (3)", "create table v (z)"] {
+            let resp = conn.with_raw(|c| run_one(c, q.into())).unwrap();
+            assert!(error(&resp).contains("authoriz"), "{q}: {}", error(&resp));
+        }
+        assert_eq!(fence.read_lease_counts().total(), 0);
+
+        // The capability still writes, and it sees only its own rows.
+        let rows: i64 = session
+            .with_raw(|c| {
+                c.execute("insert into t values (4)", ())?;
+                c.query_row("select count(*) from t", (), |r| r.get(0))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows, 2);
+        let tables: i64 = session
+            .with_raw(|c| {
+                c.query_row(
+                    "select count(*) from sqlite_schema where type = 'table'",
+                    (),
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tables, 1);
+    }
 }

@@ -28,6 +28,9 @@ pub mod replication_wal;
 mod schema_lock;
 mod store;
 
+#[cfg(test)]
+pub(crate) use store::fence_tests::open_store as open_test_store;
+
 pub type ResetCb = Box<dyn Fn(ResetOp) + Send + Sync + 'static>;
 /// Resolves a namespace that a program ATTACHes: its directory, and its fence controller, which
 /// admits the attachment as a read of that namespace (`docs/NAMESPACE_FENCE.md` section 9).
