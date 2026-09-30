@@ -144,6 +144,7 @@ pub enum DenialSurface {
 }
 
 impl DenialSurface {
+    #[cfg(test)]
     pub const ALL: [DenialSurface; 8] = [
         DenialSurface::Http,
         DenialSurface::Hrana,
@@ -216,10 +217,7 @@ impl CommandReport {
         }
     }
 
-    pub fn drain(&self) -> Option<(DrainKind, Duration)> {
-        self.drain
-    }
-
+    #[cfg(test)]
     pub fn forced_kinds(&self) -> &[ForcedKind] {
         &self.forced
     }
