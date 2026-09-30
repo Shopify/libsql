@@ -519,8 +519,11 @@ impl MetaStoreInner {
 
     /// Load every namespace's fence after the configs (section 5.6). The stored config row of
     /// a fenced namespace carries the legacy mirror of the fence in its `block_*` fields
-    /// (section 13.2); the in-memory config is the namespace's own configuration, so those
-    /// fields are put back to the values the record saved. A marker that fell behind its
+    /// (section 13.2) while the record is in force; the in-memory config is the namespace's own
+    /// configuration, so those fields are put back to the values the record saved
+    /// ([`fence_store::own_config`]). Once the operation has released the namespace or enabled
+    /// target writes, the row holds the namespace's own values (including any config written
+    /// since) and is used as it is. A marker that fell behind its
     /// record is rewritten. A namespace whose fence cannot be established is logged and keeps
     /// its stored config, mirror included.
     fn restore_fences(&mut self) -> Result<()> {
@@ -554,7 +557,7 @@ impl MetaStoreInner {
                     }
                     let sender = self.configs.get_mut().get_mut(&ns).expect("listed above");
                     let config = sender.borrow().config.clone();
-                    let config = fence_store::with_legacy_blocks(&config, &record.legacy_blocks);
+                    let config = fence_store::own_config(&config, record);
                     sender.send_modify(|c| c.config = Arc::new(config));
                 }
                 StoredFence::Unavailable {
@@ -1032,14 +1035,14 @@ fn apply_fence_command(
     })
 }
 
-/// Put the namespace's own `block_*` values (the record's saved values) into its in-memory
+/// Put the namespace's own `block_*` values ([`fence_store::own_config`]) into its in-memory
 /// config, if it has one. The caller holds the connection lock, which is taken before the
 /// config map's everywhere.
 fn restore_own_blocks(inner: &MetaStoreInner, ns: &NamespaceName, record: &NamespaceFenceRecord) {
     let configs = inner.configs.blocking_lock();
     if let Some(sender) = configs.get(ns) {
         let config = sender.borrow().config.clone();
-        let config = fence_store::with_legacy_blocks(&config, &record.legacy_blocks);
+        let config = fence_store::own_config(&config, record);
         sender.send_modify(|c| c.config = Arc::new(config));
     }
 }
@@ -1552,8 +1555,9 @@ impl MetaStore {
 
     /// Make a migration target that the metastore holds visible in the in-memory config map,
     /// which is what makes `exists()` and `lookup()` find it (section 10.1, step 5). The config
-    /// published is the stored row with the record's own `block_*` values in place of the
-    /// legacy mirror, as `restore_fences` does at startup. The caller has already installed
+    /// published is the namespace's own config ([`fence_store::own_config`]): the stored row
+    /// with the record's saved `block_*` values in place of the legacy mirror, or the row
+    /// itself once target writes are enabled, as `restore_fences` does at startup. The caller has already installed
     /// the target's gate. Returns whether the map changed; `false` also when the namespace is
     /// not a target with a stored config.
     pub async fn publish_target_config(&self, namespace: NamespaceName) -> Result<bool> {
@@ -1571,7 +1575,7 @@ impl MetaStore {
                 return Ok(false);
             };
             drop(tx);
-            let config = Arc::new(fence_store::with_legacy_blocks(&row, &record.legacy_blocks));
+            let config = Arc::new(fence_store::own_config(&row, &record));
             let mut configs = inner.configs.blocking_lock();
             match configs.get_mut(&namespace) {
                 Some(sender)
