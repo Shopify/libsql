@@ -4,6 +4,7 @@
 
 mod admin;
 mod lifecycle;
+mod observability;
 mod protocol;
 
 use std::path::PathBuf;

@@ -187,7 +187,13 @@ pub fn batch_error_from_sqld_error(sqld_error: SqldError) -> Result<BatchError, 
         SqldError::BuilderError(QueryResultBuilderError::ResponseTooLarge(_)) => {
             BatchError::ResponseTooLarge
         }
-        SqldError::NamespaceFence(e) => BatchError::Fence(e),
+        SqldError::NamespaceFence(e) => {
+            crate::namespace::fence::audit::denied(
+                &e,
+                crate::namespace::fence::audit::DenialSurface::Hrana,
+            );
+            BatchError::Fence(e)
+        }
         sqld_error => return Err(sqld_error),
     })
 }

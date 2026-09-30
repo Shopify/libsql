@@ -174,7 +174,13 @@ impl Error {
             crate::namespace::fence::outcome::FenceError::from_proxy_stable_code(code, &e.message)
         });
         match fence {
-            Some(fence) => Error::NamespaceFence(fence),
+            Some(fence) => {
+                crate::namespace::fence::audit::denied(
+                    &fence,
+                    crate::namespace::fence::audit::DenialSurface::Proxy,
+                );
+                Error::NamespaceFence(fence)
+            }
             None => Error::RpcQueryError(e),
         }
     }
@@ -184,7 +190,13 @@ impl Error {
     /// anything else unchanged.
     pub(crate) fn from_proxy_status(status: tonic::Status) -> Self {
         match crate::namespace::fence::outcome::FenceError::from_grpc_status(&status) {
-            Some(fence) => Error::NamespaceFence(fence),
+            Some(fence) => {
+                crate::namespace::fence::audit::denied(
+                    &fence,
+                    crate::namespace::fence::audit::DenialSurface::Proxy,
+                );
+                Error::NamespaceFence(fence)
+            }
             None => Error::RpcQueryExecutionError(status),
         }
     }
@@ -195,6 +207,7 @@ impl Error {
 pub(crate) fn fence_error_response(
     e: &crate::namespace::fence::outcome::FenceError,
 ) -> axum::response::Response {
+    crate::namespace::fence::audit::denied(e, crate::namespace::fence::audit::DenialSurface::Http);
     let status = e.http_status();
     tracing::debug!("HTTP API: {status}, {e}");
     (status, axum::Json(e.http_error_body())).into_response()

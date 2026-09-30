@@ -87,10 +87,9 @@ impl ReplicationLogService {
     /// The status of a replication call (or stream) that the namespace fence refuses. Counted
     /// every time, and logged at most once per namespace per [`FENCE_DENIAL_LOG_INTERVAL`].
     fn fence_denied(&self, namespace: &NamespaceName, call: &str, error: FenceError) -> Status {
-        metrics::increment_counter!(
-            "libsql_server_fence_denials_total",
-            "code" => error.outcome().as_str(),
-            "surface" => "replication",
+        crate::namespace::fence::audit::denied(
+            &error,
+            crate::namespace::fence::audit::DenialSurface::Replication,
         );
         let now = Instant::now();
         let log = {

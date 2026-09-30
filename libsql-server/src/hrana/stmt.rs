@@ -220,7 +220,13 @@ pub fn stmt_error_from_sqld_error(sqld_error: SqldError) -> Result<StmtError, Sq
         }
         SqldError::Blocked(reason) => Ok(StmtError::Blocked { reason }),
         SqldError::RpcQueryError(e) => Ok(StmtError::Proxy(e.message)),
-        SqldError::NamespaceFence(e) => Ok(StmtError::Fence(e)),
+        SqldError::NamespaceFence(e) => {
+            crate::namespace::fence::audit::denied(
+                &e,
+                crate::namespace::fence::audit::DenialSurface::Hrana,
+            );
+            Ok(StmtError::Fence(e))
+        }
         SqldError::RusqliteError(rusqlite_error)
         | SqldError::RusqliteErrorExtended(rusqlite_error, _) => match rusqlite_error {
             rusqlite::Error::SqliteFailure(sqlite_error, Some(message)) => {

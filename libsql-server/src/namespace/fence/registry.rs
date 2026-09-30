@@ -110,10 +110,14 @@ impl FenceRegistry {
     /// installed, a target being created, an indeterminate commit or an unavailable state. A
     /// name without a controller has no fence state and is not refused here.
     pub fn check_lifecycle(&self, namespace: &NamespaceName) -> Result<(), FenceError> {
-        match self.get(namespace) {
+        let refused = match self.get(namespace) {
             Some(controller) => controller.gate().permits(OperationClass::Lifecycle),
             None => Ok(()),
+        };
+        if let Err(e) = &refused {
+            super::audit::denied(e, super::audit::DenialSurface::Lifecycle);
         }
+        refused
     }
 
     /// How many namespaces have an active fence (`docs/NAMESPACE_FENCE.md` section 4.4,
@@ -130,6 +134,19 @@ impl FenceRegistry {
                     || gate.is_creating_target()
             })
             .count()
+    }
+
+    /// The published state of every namespace the registry holds, with the creation time of
+    /// its record when it has one (for the fence gauges, section 15).
+    pub fn census(&self) -> Vec<(super::state::FenceState, Option<i64>)> {
+        let controllers: Vec<_> = self.controllers.lock().values().cloned().collect();
+        controllers
+            .iter()
+            .map(|controller| {
+                let gate = controller.gate();
+                (gate.state(), gate.fence.record().map(|r| r.created_at_ms))
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
