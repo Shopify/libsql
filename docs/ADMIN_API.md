@@ -25,14 +25,30 @@ or allowing their rows to be overwritten; this holds even
 with `--meta-store-destroy-on-error`. Filesystem recovery skips invalid and
 symlinked directory entries without deleting them. An invalid persisted
 migration job/task stops its scheduler without marking that work complete.
-Back up and inspect
-metastore and namespace files before repairing these entries explicitly.
+Back up and inspect metastore and namespace files before repairing these entries
+explicitly.
 
-This validation prevents path traversal *through a namespace string*. It does
-not establish ownership of existing directories or protect against symlinks,
-case/normalization aliases, or filesystem replacement races. Only trusted
-operators should have write access to the data directory; additional directory
-reservation and ownership protection is addressed separately.
+Validation prevents path traversal *through a namespace string*. Directory
+ownership checks additionally reserve new namespace/fork directories atomically,
+reject any existing entry (including aliases and orphan directories), and
+require an unloaded persisted namespace's actual directory entry to match its
+stored name. A legacy alias or symlink is refused rather than opened or
+deleted. These checks assume the data directory is trusted; they do not make
+filesystem operations atomic against a privileged external process replacing
+paths or symlinks outside the server's coordination locks.
+
+A cancelled create/fork or failed cleanup can retain a newly reserved directory
+as quarantine after metadata has been removed, so delayed writes cannot reach
+a retry. Inspect it and the metastore after the work stops before repairing or
+retrying. Per-name operation locks allow unrelated namespace administration to
+continue during slow restores. Shutdown signals in-flight create/fork work to
+stop and permits a bounded drain before reporting an error. A replica detecting
+an incompatible log moves its old files to `replica-log-quarantine/` outside
+`dbs/`, retaining the namespace directory identity, then retries once. Inspect
+quarantined files before removal. Destroy/reset confirms remote backups before
+moving a directory to `namespace-teardown-quarantine/` for local removal;
+backup failure/cancellation before confirmation leaves the old directory in
+place. Inspect remaining quarantine files after interrupted teardown.
 
 ## Routes
 
@@ -40,7 +56,9 @@ reservation and ownership protection is addressed separately.
 POST /v1/namespaces/:namespace/create
 ```
 
-Create a namespace named `:namespace`.
+Create a namespace named `:namespace`. Explicit creation rejects an existing
+namespace, including `default`; internal startup/lazy loading of `default`
+reuses its persisted config rather than replacing it.
 body:
 
 ```json

@@ -54,7 +54,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
     fn setup<'a>(
         &'a self,
         meta_store_handle: MetaStoreHandle,
-        restore_option: RestoreOption,
+        _restore_option: RestoreOption,
         name: &'a NamespaceName,
         reset: ResetCb,
         resolve_attach_path: ResolveNamespacePathFn,
@@ -67,49 +67,48 @@ impl ConfigureNamespace for ReplicaConfigurator {
             let channel = self.channel.clone();
             let uri = self.uri.clone();
 
-            let (new_frame_sender, new_frame_receiver) = watch::channel(None);
-            let rpc_client = ReplicationLogClient::with_origin(channel.clone(), uri.clone());
-            let client = crate::replication::replicator_client::Client::new(
-                name.clone(),
-                rpc_client,
-                meta_store_handle.clone(),
-                store.clone(),
-                WalImpl::new_sqlite(&db_path, new_frame_sender).await?,
-            )
-            .await?;
-            let mut replicator = libsql_replication::replicator::Replicator::new_sqlite(
-                client,
-                db_path.join("data"),
-                DEFAULT_AUTO_CHECKPOINT,
-                None,
-            )
-            .await?;
+            // Capture the directory inode before opening the WAL. The global
+            // identity lock must not cover handshake: a linked tenant can
+            // load an uncached schema through store.with during that call.
+            let directory_identity = store.replica_directory_identity(name).await?;
+            let mut retried_incompatible_log = false;
+            let (mut replicator, new_frame_receiver) = loop {
+                let (new_frame_sender, new_frame_receiver) = watch::channel(None);
+                let rpc_client = ReplicationLogClient::with_origin(channel.clone(), uri.clone());
+                let client = crate::replication::replicator_client::Client::new(
+                    name.clone(),
+                    rpc_client,
+                    meta_store_handle.clone(),
+                    store.clone(),
+                    WalImpl::new_sqlite(&db_path, new_frame_sender).await?,
+                )
+                .await?;
+                let mut replicator = libsql_replication::replicator::Replicator::new_sqlite(
+                    client,
+                    db_path.join("data"),
+                    DEFAULT_AUTO_CHECKPOINT,
+                    None,
+                )
+                .await?;
 
-            tracing::debug!("try perform handshake");
-            // force a handshake now, to retrieve the primary's current replication index
-            match replicator.try_perform_handshake().await {
-                Err(libsql_replication::replicator::Error::Meta(
-                    libsql_replication::meta::Error::LogIncompatible,
-                )) => {
-                    tracing::error!(
-                        "trying to replicate incompatible logs, reseting replica and nuking db dir"
-                    );
-                    std::fs::remove_dir_all(&db_path).unwrap();
-                    return self
-                        .setup(
-                            meta_store_handle,
-                            restore_option,
-                            name,
-                            reset,
-                            resolve_attach_path,
-                            store,
-                            broadcaster,
-                        )
-                        .await;
+                tracing::debug!("try perform handshake");
+                match replicator.try_perform_handshake().await {
+                    Err(libsql_replication::replicator::Error::Meta(
+                        libsql_replication::meta::Error::LogIncompatible,
+                    )) if !retried_incompatible_log => {
+                        // Close the WAL before moving its files. Retain the
+                        // directory inode and quarantine its old contents so
+                        // reservations stay valid and a failed retry is safe.
+                        drop(replicator);
+                        store
+                            .quarantine_incompatible_replica_log(name, directory_identity)
+                            .await?;
+                        retried_incompatible_log = true;
+                    }
+                    Err(e) => return Err(e.into()),
+                    Ok(_) => break (replicator, new_frame_receiver),
                 }
-                Err(e) => Err(e)?,
-                Ok(_) => (),
-            }
+            };
 
             tracing::debug!("done performing handshake");
 
@@ -278,21 +277,14 @@ impl ConfigureNamespace for ReplicaConfigurator {
         })
     }
 
-    fn cleanup<'a>(
+    fn prepare_cleanup<'a>(
         &'a self,
-        namespace: &'a NamespaceName,
+        _namespace: &'a NamespaceName,
         _db_config: &DatabaseConfig,
         _prune_all: bool,
         _bottomless_db_id_init: NamespaceBottomlessDbIdInit,
     ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let ns_path = self.base.base_path.join("dbs").join(namespace.as_str());
-            if ns_path.try_exists()? {
-                tracing::debug!("removing database directory: {}", ns_path.display());
-                tokio::fs::remove_dir_all(ns_path).await?;
-            }
-            Ok(())
-        })
+        Box::pin(async move { Ok(()) })
     }
 
     fn fork<'a>(

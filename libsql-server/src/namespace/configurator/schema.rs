@@ -13,7 +13,7 @@ use crate::namespace::{
 };
 use crate::schema::SchedulerHandle;
 
-use super::helpers::{cleanup_primary, make_primary_connection_maker};
+use super::helpers::{make_primary_connection_maker, prepare_primary_cleanup};
 use super::{BaseNamespaceConfig, ConfigureNamespace, PrimaryConfig};
 
 pub struct SchemaConfigurator {
@@ -94,7 +94,7 @@ impl ConfigureNamespace for SchemaConfigurator {
         })
     }
 
-    fn cleanup<'a>(
+    fn prepare_cleanup<'a>(
         &'a self,
         namespace: &'a NamespaceName,
         db_config: &'a DatabaseConfig,
@@ -102,7 +102,7 @@ impl ConfigureNamespace for SchemaConfigurator {
         bottomless_db_id_init: crate::namespace::NamespaceBottomlessDbIdInit,
     ) -> std::pin::Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            cleanup_primary(
+            prepare_primary_cleanup(
                 &self.base,
                 &self.primary_config,
                 namespace,

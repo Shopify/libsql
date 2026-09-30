@@ -82,7 +82,8 @@ impl Scheduler {
                     break;
                 }
                 Err(e @ Error::InvalidPersistedNamespace { .. }) => {
-                    // Keep unfinished work intact for explicit operator repair.
+                    // Do not retry or skip corrupt work: it must be repaired before
+                    // resuming, and must remain unfinished in the metastore.
                     tracing::error!(
                         "migration scheduler stopped on invalid persisted namespace: {e}"
                     );
@@ -859,10 +860,17 @@ mod test {
         .unwrap();
         let (sender, mut receiver) = mpsc::channel(100);
         let config = make_config(sender.clone().into(), tmp.path());
-        let store =
-            NamespaceStore::new(false, false, 10, meta_store, config, DatabaseKind::Primary)
-                .await
-                .unwrap();
+        let store = NamespaceStore::new(
+            false,
+            false,
+            10,
+            meta_store,
+            config,
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
         let mut scheduler = Scheduler::new(store.clone(), maker().unwrap())
             .await
             .unwrap();
@@ -991,10 +999,17 @@ mod test {
             .unwrap();
             let (sender, mut receiver) = mpsc::channel(100);
             let config = make_config(sender.clone().into(), tmp.path());
-            let store =
-                NamespaceStore::new(false, false, 10, meta_store, config, DatabaseKind::Primary)
-                    .await
-                    .unwrap();
+            let store = NamespaceStore::new(
+                false,
+                false,
+                10,
+                meta_store,
+                config,
+                DatabaseKind::Primary,
+                tmp.path(),
+            )
+            .await
+            .unwrap();
             let mut scheduler = Scheduler::new(store.clone(), maker().unwrap())
                 .await
                 .unwrap();
@@ -1072,10 +1087,17 @@ mod test {
         .unwrap();
         let (sender, _receiver) = mpsc::channel(100);
         let config = make_config(sender.clone().into(), tmp.path());
-        let store =
-            NamespaceStore::new(false, false, 10, meta_store, config, DatabaseKind::Primary)
-                .await
-                .unwrap();
+        let store = NamespaceStore::new(
+            false,
+            false,
+            10,
+            meta_store,
+            config,
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
 
         store
             .with("ns".into(), |ns| {
@@ -1106,10 +1128,17 @@ mod test {
         .unwrap();
         let (sender, mut receiver) = mpsc::channel(100);
         let config = make_config(sender.clone().into(), tmp.path());
-        let store =
-            NamespaceStore::new(false, false, 10, meta_store, config, DatabaseKind::Primary)
-                .await
-                .unwrap();
+        let store = NamespaceStore::new(
+            false,
+            false,
+            10,
+            meta_store,
+            config,
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
         let mut scheduler = Scheduler::new(store.clone(), maker().unwrap())
             .await
             .unwrap();
@@ -1186,10 +1215,17 @@ mod test {
         .unwrap();
         let (sender, _receiver) = mpsc::channel(100);
         let config = make_config(sender.clone().into(), tmp.path());
-        let store =
-            NamespaceStore::new(false, false, 10, meta_store, config, DatabaseKind::Primary)
-                .await
-                .unwrap();
+        let store = NamespaceStore::new(
+            false,
+            false,
+            10,
+            meta_store,
+            config,
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
         let scheduler = Scheduler::new(store.clone(), maker().unwrap())
             .await
             .unwrap();

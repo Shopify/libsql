@@ -17,7 +17,7 @@ use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{Namespace, NamespaceBottomlessDbId};
 use crate::replication::primary::frame_stream::FrameStream;
 use crate::replication::{LogReadError, ReplicationLogger};
-use crate::{BLOCKING_RT, LIBSQL_PAGE_SIZE};
+use crate::LIBSQL_PAGE_SIZE;
 
 use super::helpers::make_bottomless_options;
 use super::{NamespaceName, NamespaceStore, PrimaryConfig, RestoreOption};
@@ -126,26 +126,13 @@ pub struct PointInTimeRestore {
 
 impl ForkTask {
     pub async fn fork(self) -> Result<super::Namespace> {
-        let base_path = self.base_path.clone();
-        let dest_namespace = self.to_namespace.clone();
-        match self.try_fork().await {
-            Err(e) => {
-                let _ =
-                    tokio::fs::remove_dir_all(base_path.join("dbs").join(dest_namespace.as_str()))
-                        .await;
-                Err(e)
-            }
-            Ok(ns) => Ok(ns),
-        }
-    }
-
-    async fn try_fork(self) -> Result<super::Namespace> {
-        // until what index to replicate
-        let base_path = self.base_path.clone();
-        let temp_dir = BLOCKING_RT
-            .spawn_blocking(move || tempfile::tempdir_in(base_path))
-            .await??;
-        let db_path = temp_dir.path().join("data");
+        // The caller atomically reserved this directory and exclusively owns
+        // cleanup until we return. Never delete a destination by name here.
+        let db_path = self
+            .base_path
+            .join("dbs")
+            .join(self.to_namespace.as_str())
+            .join("data");
 
         if let Some(restore) = self.restore_to {
             Self::restore_from_backup(restore, db_path)
@@ -154,9 +141,6 @@ impl ForkTask {
         } else {
             Self::restore_from_log_file(&self.logger, db_path).await?;
         }
-
-        let dest_path = self.base_path.join("dbs").join(self.to_namespace.as_str());
-        tokio::fs::rename(temp_dir.path(), dest_path).await?;
 
         self.store
             .make_namespace(&self.to_namespace, self.to_config, RestoreOption::Latest)
@@ -185,18 +169,22 @@ impl ForkTask {
                             write_frame(&frame, &mut data_file).await?;
                         }
                         Err(LogReadError::SnapshotRequired) => {
-                            let snapshot = loop {
-                                if let Some(snap) = logger
-                                    .get_snapshot_file(next_frame_no)
-                                    .await
-                                    .map_err(ForkError::Internal)?
-                                {
-                                    break snap;
+                            // Bound the wait for each missing snapshot, not the
+                            // total restore (large valid forks may take longer).
+                            let snapshot = tokio::time::timeout(Duration::from_secs(600), async {
+                                loop {
+                                    if let Some(snap) = logger
+                                        .get_snapshot_file(next_frame_no)
+                                        .await
+                                        .map_err(ForkError::Internal)?
+                                    {
+                                        break Ok::<_, ForkError>(snap);
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
                                 }
-
-                                // the snapshot must exist, it is just not yet available.
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            };
+                            })
+                            .await
+                            .map_err(|_| ForkError::LogRead(anyhow!("timed out waiting for replication snapshot at frame {next_frame_no}")))??;
 
                             let frames = snapshot.into_stream_mut_from(next_frame_no);
                             tokio::pin!(frames);

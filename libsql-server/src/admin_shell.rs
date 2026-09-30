@@ -105,6 +105,61 @@ fn try_run_one(conn: &mut rusqlite::Connection, q: String) -> anyhow::Result<rpc
     })
 }
 
+fn namespace_from_metadata(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<NamespaceName, tonic::Status> {
+    let namespace = metadata
+        .get_bin("x-namespace-bin")
+        .ok_or_else(|| tonic::Status::invalid_argument("missing namespace"))?;
+    let bytes = namespace
+        .to_bytes()
+        .map_err(|_| tonic::Status::invalid_argument("bad namespace encoding"))?;
+    NamespaceName::from_bytes(bytes)
+        .map_err(|_| tonic::Status::invalid_argument("invalid namespace name"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_namespace_metadata() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        assert_eq!(
+            namespace_from_metadata(&metadata).unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        for name in [
+            b"".as_slice(),
+            b"..",
+            b"../outside",
+            b"/outside",
+            b"a\\b",
+            b"a\0b",
+            b"\xff",
+        ] {
+            metadata.insert_bin("x-namespace-bin", BinaryMetadataValue::from_bytes(name));
+            assert_eq!(
+                namespace_from_metadata(&metadata).unwrap_err().code(),
+                tonic::Code::InvalidArgument,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_safe_namespace_metadata() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        for name in ["default", "tenant-1.example", "tenant café"] {
+            metadata.insert_bin(
+                "x-namespace-bin",
+                BinaryMetadataValue::from_bytes(name.as_bytes()),
+            );
+            assert_eq!(namespace_from_metadata(&metadata).unwrap().as_str(), name);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl AdminShellService for AdminShell {
     type ShellStream = Pin<Box<dyn Stream<Item = Result<rpc::Response, tonic::Status>> + Send>>;
@@ -113,21 +168,8 @@ impl AdminShellService for AdminShell {
         &self,
         request: tonic::Request<tonic::Streaming<rpc::Query>>,
     ) -> std::result::Result<tonic::Response<Self::ShellStream>, tonic::Status> {
-        let Some(namespace) = request.metadata().get_bin("x-namespace-bin") else {
-            return Err(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "missing namespace",
-            ));
-        };
-        let Ok(ns_bytes) = namespace.to_bytes() else {
-            return Err(tonic::Status::new(
-                tonic::Code::InvalidArgument,
-                "bad namespace encoding",
-            ));
-        };
+        let namespace = namespace_from_metadata(request.metadata())?;
 
-        let namespace = NamespaceName::from_bytes(ns_bytes)
-            .map_err(|_| tonic::Status::invalid_argument("invalid namespace"))?;
         match self.with_namespace(namespace, request.into_inner()).await {
             Ok(s) => Ok(tonic::Response::new(Box::pin(s))),
             Err(e) => Err(tonic::Status::new(

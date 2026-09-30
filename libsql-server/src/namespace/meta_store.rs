@@ -530,6 +530,32 @@ impl MetaStore {
         }
     }
 
+    // A cancelled config update may already be queued when its caller drops.
+    // Place a barrier after it before removing that caller's metadata, so the
+    // background worker cannot reinsert a row after cleanup.
+    #[cfg(test)]
+    pub(crate) fn pending_change_count_for_test(&self) -> usize {
+        self.changes_tx.max_capacity() - self.changes_tx.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_connection_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, MetaStoreConnection> {
+        self.inner.conn.lock().await
+    }
+
+    pub(crate) async fn wait_for_pending_changes(&self) -> Result<()> {
+        let (send, recv) = oneshot::channel();
+        self.changes_tx
+            .send((NamespaceName::default(), None, send, false))
+            .await
+            .map_err(|e| Error::MetaStoreUpdateFailure(e.into()))?;
+        recv.await
+            .map_err(|e| Error::MetaStoreUpdateFailure(e.into()))??;
+        Ok(())
+    }
+
     pub fn remove(&self, namespace: NamespaceName) -> Result<Option<Arc<DatabaseConfig>>> {
         tracing::debug!("removing namespace `{}` from meta store", namespace);
 
@@ -662,9 +688,20 @@ mod tests {
             let conn = maker().unwrap();
             setup_connection(&conn).unwrap();
             std::fs::write(&metastore_sentinel, b"metastore intact").unwrap();
+            let schema = metadata::DatabaseConfig::from(&DatabaseConfig::default()).encode_to_vec();
+            conn.execute(
+                "INSERT INTO namespace_configs VALUES (?1, ?2)",
+                rusqlite::params!["schema", schema],
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO namespace_configs VALUES (?1, ?2)",
                 rusqlite::params!["tenant", invalid.clone()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO shared_schema_links VALUES ('schema', 'tenant')",
+                [],
             )
             .unwrap();
         }
@@ -705,8 +742,19 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(stored, invalid);
-            let repaired =
-                metadata::DatabaseConfig::from(&DatabaseConfig::default()).encode_to_vec();
+            let links: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM shared_schema_links WHERE shared_schema_name = 'schema' AND namespace = 'tenant'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(links, 1);
+            let repaired = metadata::DatabaseConfig {
+                shared_schema_name: Some("schema".into()),
+                ..metadata::DatabaseConfig::from(&DatabaseConfig::default())
+            }
+            .encode_to_vec();
             conn.execute(
                 "UPDATE namespace_configs SET config = ?1 WHERE namespace = 'tenant'",
                 [repaired],
@@ -722,7 +770,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(store.exists(&NamespaceName::from("tenant")).await);
+        assert_eq!(
+            store
+                .handle(NamespaceName::from("tenant"))
+                .await
+                .get()
+                .shared_schema_name
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "schema"
+        );
     }
 
     #[tokio::test]

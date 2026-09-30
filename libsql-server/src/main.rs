@@ -709,6 +709,7 @@ async fn build_server(
         disable_default_namespace: config.disable_default_namespace,
         disable_namespaces: !config.enable_namespaces,
         shutdown,
+        namespace_store_ready: None,
         max_active_namespaces: config.max_active_namespaces,
         meta_store_config,
         max_concurrent_connections: config.max_concurrent_connections,

@@ -121,7 +121,9 @@ pub trait ConfigureNamespace {
         broadcaster: BroadcasterHandle,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>>;
 
-    fn cleanup<'a>(
+    // Remote backup/pruning only. Local directory detachment is owned by
+    // NamespaceStore under its filesystem identity lock.
+    fn prepare_cleanup<'a>(
         &'a self,
         namespace: &'a NamespaceName,
         db_config: &'a DatabaseConfig,
