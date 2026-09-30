@@ -66,6 +66,11 @@ pub struct GateSnapshot {
     /// observability is refused with `MIGRATION_TARGET_QUARANTINED`, and the namespace is not
     /// set up. Never persisted; replaced by the record the command's commit publishes.
     pub creating_target: Option<CommandKey>,
+    /// On a replica server only: the primary's fence denies reads of this namespace (section
+    /// 6.2), as the replicator last learned it from a refused replication call or from the
+    /// fence `hello` replicated. Normal reads and streams of the local copy are refused with
+    /// it. Never persisted and never set on a primary.
+    pub primary_denial: Option<FenceError>,
 }
 
 impl GateSnapshot {
@@ -77,6 +82,7 @@ impl GateSnapshot {
             installing: None,
             closing_reads: None,
             creating_target: None,
+            primary_denial: None,
         }
     }
 
@@ -154,6 +160,11 @@ impl GateSnapshot {
                          {operation_id} is closing read admission"
                     ),
                 ));
+            }
+        }
+        if let Some(denial) = &self.primary_denial {
+            if matches!(class, OperationClass::NormalRead | OperationClass::Stream) {
+                return Err(denial.clone());
             }
         }
         Ok(())
@@ -500,6 +511,39 @@ impl FenceController {
             }
         }
         asked
+    }
+
+    /// On a replica server: publish what the replicator learned of the primary's fence
+    /// (section 6.2). `Some` denies normal reads and streams of the local copy with that error
+    /// and asks every read lease held now to stop, so that work admitted before the replica
+    /// learned of the fence does not outlive it; `None` admits them again. The denial is
+    /// published under the lease lock, so a read admitted concurrently is either refused or
+    /// counted and cancelled. A denial with the code already published leaves the gate as it
+    /// is. Returns whether the gate changed.
+    pub fn observe_primary(&self, denial: Option<FenceError>) -> bool {
+        let leases = self.read_leases.lock();
+        let deny = denial.is_some();
+        let changed = self.gate.send_if_modified(|gate| {
+            // A denial with the same code is the same denial, whichever call reported it.
+            let same = match (&gate.primary_denial, &denial) {
+                (Some(old), Some(new)) => old.outcome() == new.outcome(),
+                (None, None) => true,
+                _ => false,
+            };
+            if same {
+                return false;
+            }
+            gate.primary_denial = denial;
+            true
+        });
+        if changed && deny {
+            for entry in leases.live.values() {
+                if !entry.cancelled.swap(true, Ordering::AcqRel) {
+                    (entry.cancel)();
+                }
+            }
+        }
+        changed
     }
 
     /// Notified on every read-lease release. Enable the notification before checking

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -23,6 +24,9 @@ use crate::connection::config::DatabaseConfig;
 use crate::metrics::{
     REPLICATION_LATENCY, REPLICATION_LATENCY_CACHE_MISS, REPLICATION_LATENCY_OUT_OF_SYNC,
 };
+use crate::namespace::fence::controller::FenceController;
+use crate::namespace::fence::outcome::FenceError;
+use crate::namespace::fence::replica::{self, PrimaryFenceRefusal};
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{NamespaceName, NamespaceStore};
 use crate::replication::FrameNo;
@@ -107,6 +111,11 @@ pub struct Client {
     store: NamespaceStore,
     wal_impl: WalImpl,
     first_sync_since_handshake: bool,
+    /// The namespace's fence controller on this replica server, on which the primary's fence
+    /// is published as a local read denial (`docs/NAMESPACE_FENCE.md` section 6.2).
+    fence: Arc<FenceController>,
+    /// Replication calls the primary's fence refused since the last `hello` it answered.
+    fence_refusals: u32,
 }
 
 impl Client {
@@ -116,6 +125,7 @@ impl Client {
         meta_store_handle: MetaStoreHandle,
         store: NamespaceStore,
         wal_flavor: WalImpl,
+        fence: Arc<FenceController>,
     ) -> crate::Result<Self> {
         Ok(Self {
             namespace,
@@ -126,6 +136,78 @@ impl Client {
             store,
             wal_impl: wal_flavor,
             first_sync_since_handshake: true,
+            fence,
+            fence_refusals: 0,
+        })
+    }
+
+    /// Replication calls the primary's fence refused in a row, since the last `hello` it
+    /// answered. The replica's replication loop paces its reconnects by it.
+    pub(crate) fn fence_refusals(&self) -> u32 {
+        self.fence_refusals
+    }
+
+    /// Publish what the primary said of its fence as this replica's local read denial, logging
+    /// when that changes.
+    fn observe_primary_fence(&self, denial: Option<FenceError>) {
+        let denies = denial.as_ref().map(|d| d.outcome());
+        if self.fence.observe_primary(denial) {
+            match denies {
+                Some(code) => tracing::warn!(
+                    namespace = %self.namespace,
+                    "the primary's namespace fence denies reads ({code}): local reads of this \
+                     replica are refused until the primary admits replication again"
+                ),
+                None => tracing::info!(
+                    namespace = %self.namespace,
+                    "the primary admits replication again: local reads are served"
+                ),
+            }
+        }
+    }
+
+    /// Map a status of a replication call: a fence refusal is published as the local read
+    /// denial, counted, and returned as a [`PrimaryFenceRefusal`].
+    fn status_error(&mut self, status: Status) -> Error {
+        let error = replica::replicator_error(status);
+        if let Some(refusal) = PrimaryFenceRefusal::of(&error) {
+            self.fence_refusals = self.fence_refusals.saturating_add(1);
+            metrics::increment_counter!(
+                "libsql_server_replica_fence_refusals_total",
+                "code" => refusal.0.outcome().as_str(),
+            );
+            tracing::debug!(namespace = %self.namespace, "{refusal}");
+            self.observe_primary_fence(Some(refusal.local_denial()));
+        }
+        error
+    }
+
+    /// A stream of the primary's that ends with a fence refusal publishes it as the local read
+    /// denial.
+    fn fenced_frames(
+        &self,
+        stream: tonic::Streaming<RpcFrame>,
+    ) -> impl Stream<Item = Result<RpcFrame, Error>> + Send + 'static {
+        let fence = self.fence.clone();
+        let namespace = self.namespace.clone();
+        stream.map_err(move |status| {
+            let error = replica::replicator_error(status);
+            if let Some(refusal) = PrimaryFenceRefusal::of(&error) {
+                metrics::increment_counter!(
+                    "libsql_server_replica_fence_refusals_total",
+                    "code" => refusal.0.outcome().as_str(),
+                );
+                if fence.observe_primary(Some(refusal.local_denial())) {
+                    tracing::warn!(
+                        namespace = %namespace,
+                        "the primary ended replication because its namespace fence denies \
+                         reads ({}): local reads of this replica are refused until the primary \
+                         admits replication again",
+                        refusal.0.outcome()
+                    );
+                }
+            }
+            error
         })
     }
 
@@ -164,9 +246,17 @@ impl ReplicatorClient for Client {
         self.first_sync_since_handshake = true;
         tracing::debug!("Attempting to perform handshake with primary.");
         let req = self.make_request(HelloRequest::new());
-        let resp = self.client.hello(req).await?;
+        let resp = match self.client.hello(req).await {
+            Ok(resp) => resp,
+            Err(status) => return Err(self.status_error(status)),
+        };
         let hello = resp.into_inner();
         verify_session_token(&hello.session_token).map_err(Error::Client)?;
+        // The primary answers `hello` only where its fence admits replication.
+        self.fence_refusals = 0;
+        self.observe_primary_fence(replica::denial_from_hello(
+            hello.config.as_ref().and_then(|c| c.fence.as_ref()),
+        ));
         self.primary_replication_index = hello.current_replication_index;
         self.session_token.replace(hello.session_token.clone());
 
@@ -207,32 +297,30 @@ impl ReplicatorClient for Client {
         };
 
         let req = self.make_request(offset);
-        let stream = self
-            .client
-            .log_entries(req)
-            .await?
-            .into_inner()
-            .inspect_ok(|f| {
-                match f.timestamp {
-                    Some(ts_millis) => {
-                        if let Some(commited_at) = DateTime::from_timestamp_millis(ts_millis) {
-                            let lat = Utc::now() - commited_at;
-                            match lat.to_std() {
-                                Ok(lat) => {
-                                    // we can record negative values if the clocks are out-of-sync. There is not
-                                    // point in recording those values.
-                                    REPLICATION_LATENCY.record(lat);
-                                }
-                                Err(_) => {
-                                    REPLICATION_LATENCY_OUT_OF_SYNC.increment(1);
-                                }
+        let stream = match self.client.log_entries(req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => return Err(self.status_error(status)),
+        };
+        let stream = self.fenced_frames(stream).inspect_ok(|f| {
+            match f.timestamp {
+                Some(ts_millis) => {
+                    if let Some(commited_at) = DateTime::from_timestamp_millis(ts_millis) {
+                        let lat = Utc::now() - commited_at;
+                        match lat.to_std() {
+                            Ok(lat) => {
+                                // we can record negative values if the clocks are out-of-sync. There is not
+                                // point in recording those values.
+                                REPLICATION_LATENCY.record(lat);
+                            }
+                            Err(_) => {
+                                REPLICATION_LATENCY_OUT_OF_SYNC.increment(1);
                             }
                         }
                     }
-                    None => REPLICATION_LATENCY_CACHE_MISS.increment(1),
                 }
-            })
-            .map_err(Into::into);
+                None => REPLICATION_LATENCY_CACHE_MISS.increment(1),
+            }
+        });
 
         Ok(Box::pin(stream))
     }
@@ -245,11 +333,11 @@ impl ReplicatorClient for Client {
         let req = self.make_request(offset);
         match self.client.snapshot(req).await {
             Ok(resp) => {
-                let stream = resp.into_inner().map_err(Into::into);
+                let stream = self.fenced_frames(resp.into_inner());
                 Ok(Box::pin(stream))
             }
             Err(e) if e.code() == Code::Unavailable => Err(Error::SnapshotPending),
-            Err(e) => return Err(e.into()),
+            Err(e) => Err(self.status_error(e)),
         }
     }
 
