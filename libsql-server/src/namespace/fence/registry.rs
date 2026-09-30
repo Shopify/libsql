@@ -82,6 +82,17 @@ impl FenceRegistry {
         }
     }
 
+    /// Refuse generic lifecycle and configuration work on `namespace` while its gate denies it
+    /// (section 3.3, the lifecycle column): an active fence, a closing transition being
+    /// installed, a target being created, an indeterminate commit or an unavailable state. A
+    /// name without a controller has no fence state and is not refused here.
+    pub fn check_lifecycle(&self, namespace: &NamespaceName) -> Result<(), FenceError> {
+        match self.get(namespace) {
+            Some(controller) => controller.gate().permits(OperationClass::Lifecycle),
+            None => Ok(()),
+        }
+    }
+
     /// How many namespaces have an active fence (`docs/NAMESPACE_FENCE.md` section 4.4,
     /// `active_fences`): a record in any state but `RELEASED` or `TARGET_WRITABLE`, an
     /// unavailable state, a target being created, or a commit whose outcome is not known yet.
