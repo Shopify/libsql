@@ -32,7 +32,7 @@ use crate::namespace::fence::record::{CommandReceipt, NamespaceFenceRecord, Serv
 use crate::namespace::fence::state::FenceState;
 use crate::namespace::fence::store::{StoredFence, StoredReceipt};
 use crate::namespace::fence::{server_identity, FENCE_PROTOCOL_VERSION, PROXY_STABLE_CODE};
-use crate::namespace::meta_store::FenceCommit;
+use crate::namespace::meta_store::{FenceCommit, MetastoreProvenance};
 use crate::namespace::NamespaceName;
 use crate::net::Connector;
 
@@ -132,8 +132,7 @@ async fn handle_capabilities<C>(State(state): State<Arc<AppState<C>>>) -> Json<V
         "proxy_stable_code": PROXY_STABLE_CODE,
         "server": server_json(&server_identity()),
         "active_fences": state.namespaces.active_fences(),
-        // Metastore restore provenance is not tracked yet.
-        "metastore": { "restored_from_backup": false, "restored_generation": null },
+        "metastore": metastore_provenance_json(&meta.restore_provenance()),
     }))
 }
 
@@ -204,7 +203,12 @@ async fn handle_inspect<C>(
     let body = json!({
         "outcome": FenceOutcome::Applied.as_str(),
         "replayed": false,
-        "fence": fence_json(&namespace, &inspection.fence, controller.as_deref()),
+        "fence": fence_json(
+            &namespace,
+            &inspection.fence,
+            controller.as_deref(),
+            &meta.restore_provenance(),
+        ),
         "receipts": receipts,
         "drain": drain_json(controller.as_deref()),
     });
@@ -307,9 +311,10 @@ async fn handle_validation_query<C>(
     drop(session);
 
     let controller = state.namespaces.existing_fence_controller(&namespace);
+    let provenance = state.namespaces.meta_store().restore_provenance();
     let fence = controller
         .as_ref()
-        .map(|c| fence_json(&namespace, &c.gate().fence, Some(c)))
+        .map(|c| fence_json(&namespace, &c.gate().fence, Some(c), &provenance))
         .unwrap_or(Value::Null);
     let body = json!({
         "results": results,
@@ -396,14 +401,20 @@ async fn error_reply<C>(
     error: FenceError,
 ) -> Response {
     let mut reply = ErrorReply::new(error);
+    let provenance = state.namespaces.meta_store().restore_provenance();
     match state.namespaces.existing_fence_controller(namespace) {
         Some(controller) => {
-            reply.fence = fence_json(namespace, &controller.gate().fence, Some(&controller));
+            reply.fence = fence_json(
+                namespace,
+                &controller.gate().fence,
+                Some(&controller),
+                &provenance,
+            );
             reply.drain = drain_json(Some(&controller));
         }
         None => {
             if let Ok((inspection, _)) = state.namespaces.inspect_fence(namespace).await {
-                reply.fence = fence_json(namespace, &inspection.fence, None);
+                reply.fence = fence_json(namespace, &inspection.fence, None, &provenance);
             }
         }
     }
@@ -424,13 +435,15 @@ fn success_reply<C>(
     commit: FenceCommit,
 ) -> Response {
     let controller = state.namespaces.existing_fence_controller(namespace);
+    let provenance = state.namespaces.meta_store().restore_provenance();
     let fence = match (&commit.record, &controller) {
         (Some(record), _) => fence_json(
             namespace,
             &StoredFence::Record(record.clone()),
             controller.as_deref(),
+            &provenance,
         ),
-        (None, Some(c)) => fence_json(namespace, &c.gate().fence, Some(c)),
+        (None, Some(c)) => fence_json(namespace, &c.gate().fence, Some(c), &provenance),
         (None, None) => Value::Null,
     };
     let outcome = commit.receipt.outcome;
@@ -916,11 +929,13 @@ fn record_fields(record: &NamespaceFenceRecord, out: &mut Map<String, Value>) {
 }
 
 /// The fence view of section 4.3. `fence` is the durable state being reported; `controller`,
-/// when the namespace has one, supplies the live admission and the live log id.
+/// when the namespace has one, supplies the live admission and the live log id; `provenance`
+/// says whether the metastore that holds `fence` was restored from its backup at startup.
 fn fence_json(
     namespace: &NamespaceName,
     fence: &StoredFence,
     controller: Option<&FenceController>,
+    provenance: &MetastoreProvenance,
 ) -> Value {
     let gate = controller.map(|c| c.gate());
     let mut out = Map::new();
@@ -990,9 +1005,21 @@ fn fence_json(
     out.insert("server".into(), server_json(&server_identity()));
     out.insert(
         "provenance".into(),
-        json!({ "metastore_restored_from_backup": false, "marker": marker }),
+        json!({
+            "metastore_restored_from_backup": provenance.restored_from_backup,
+            "metastore_restored_generation": provenance.restored_generation.map(|g| g.to_string()),
+            "marker": marker,
+        }),
     );
     Value::Object(out)
+}
+
+/// The `metastore` object of the capability endpoint (section 4.4).
+fn metastore_provenance_json(provenance: &MetastoreProvenance) -> Value {
+    json!({
+        "restored_from_backup": provenance.restored_from_backup,
+        "restored_generation": provenance.restored_generation.map(|g| g.to_string()),
+    })
 }
 
 fn receipt_json(receipt: &CommandReceipt) -> Value {
@@ -1020,5 +1047,59 @@ fn stored_receipt_json(stored: &StoredReceipt) -> Value {
             "applied_at": timestamp(stored.applied_at_ms),
             "error": e.to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A metastore restored from its backup is reported in the fence view (section 4.3) and
+    /// in the capability endpoint's `metastore` object (section 4.4), with the generation.
+    #[test]
+    fn restore_provenance_is_reported() {
+        let generation = Uuid::from_u128(0x77);
+        let restored = MetastoreProvenance {
+            restored_from_backup: true,
+            restored_generation: Some(generation),
+        };
+        let namespace = NamespaceName::from_string("db".into()).unwrap();
+        let unavailable = StoredFence::Unavailable {
+            detail: FenceDetail::MetastoreBehindMarker,
+            reason: "the metastore is behind the marker".into(),
+            marker: None,
+        };
+
+        let view = fence_json(&namespace, &unavailable, None, &restored);
+        assert_eq!(
+            view["provenance"],
+            json!({
+                "metastore_restored_from_backup": true,
+                "metastore_restored_generation": generation.to_string(),
+                "marker": "metastore_behind_marker",
+            })
+        );
+        assert_eq!(view["state"], "UNKNOWN_UNAVAILABLE");
+        assert_eq!(
+            metastore_provenance_json(&restored),
+            json!({ "restored_from_backup": true, "restored_generation": generation.to_string() })
+        );
+
+        let plain = StoredFence::None {
+            namespace_exists: true,
+        };
+        let view = fence_json(&namespace, &plain, None, &MetastoreProvenance::default());
+        assert_eq!(
+            view["provenance"],
+            json!({
+                "metastore_restored_from_backup": false,
+                "metastore_restored_generation": null,
+                "marker": null,
+            })
+        );
+        assert_eq!(
+            metastore_provenance_json(&MetastoreProvenance::default()),
+            json!({ "restored_from_backup": false, "restored_generation": null })
+        );
     }
 }

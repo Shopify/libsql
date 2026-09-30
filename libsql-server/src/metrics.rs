@@ -32,6 +32,14 @@ pub static TOTAL_RESPONSE_SIZE_HIST: Lazy<Histogram> = Lazy::new(|| {
     describe_histogram!(NAME, "total response size value before connection lock");
     register_histogram!(NAME)
 });
+pub static METASTORE_RESTORED_FROM_BACKUP: Lazy<Gauge> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_metastore_restored_from_backup";
+    describe_gauge!(
+        NAME,
+        "1 when the metastore was restored from its backup at startup, 0 otherwise"
+    );
+    register_gauge!(NAME)
+});
 pub static STREAM_HANDLES_COUNT: Lazy<Gauge> = Lazy::new(|| {
     const NAME: &str = "libsql_server_stream_handles";
     describe_gauge!(NAME, "amount of in-memory stream handles");

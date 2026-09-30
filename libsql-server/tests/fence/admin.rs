@@ -56,11 +56,34 @@ fn capabilities() {
             .unwrap()
             .starts_with("sqld "));
         Uuid::parse_str(body["server"]["instance_id"].as_str().unwrap())?;
-        assert_eq!(body["metastore"]["restored_from_backup"], false);
+        // Metastore restore provenance: this server's metastore was not restored from a
+        // backup, which the capability endpoint, every fence view and the gauge all report.
+        assert_eq!(body["metastore"]["restored_from_backup"], false, "{body}");
+        assert_eq!(
+            body["metastore"]["restored_generation"],
+            json!(null),
+            "{body}"
+        );
+        assert_eq!(
+            crate::common::snapshot_metrics()
+                .get_gauge("libsql_server_metastore_restored_from_backup"),
+            Some(0.0)
+        );
 
         // An active fence is counted.
         admin.create_namespace("src").await?;
         let log_id = load_and_log_id(&admin, "src").await?;
+        let (status, body) = admin.inspect("src").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["fence"]["provenance"],
+            json!({
+                "metastore_restored_from_backup": false,
+                "metastore_restored_generation": null,
+                "marker": null,
+            }),
+            "{body}"
+        );
         let (status, body) = admin
             .command(
                 "src",
@@ -69,6 +92,14 @@ fn capabilities() {
             )
             .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["fence"]["provenance"]["metastore_restored_from_backup"], false,
+            "{body}"
+        );
+        assert_eq!(
+            body["fence"]["provenance"]["marker"], "consistent",
+            "{body}"
+        );
         let (_, body) = admin.get("/v1/fence/capabilities").await?;
         assert_eq!(body["active_fences"], 1, "{body}");
 
