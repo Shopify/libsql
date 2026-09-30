@@ -220,15 +220,30 @@ impl MetaStoreInner {
             let db_dir = read_dir(&dbs_dir_path)?;
             for entry in db_dir {
                 let entry = entry?;
-                if !entry.path().is_dir() {
+                // Do not follow symlinked directories during filesystem recovery.
+                if !entry.file_type()?.is_dir() {
                     continue;
                 }
+                let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+                    tracing::warn!("skipping namespace directory with non-UTF-8 name");
+                    continue;
+                };
+                let name = match NamespaceName::from_string(file_name) {
+                    Ok(name) => name,
+                    Err(_) => {
+                        tracing::warn!("skipping invalid namespace directory during recovery");
+                        continue;
+                    }
+                };
                 let config_path = entry.path().join("config.json");
-                let name =
-                    NamespaceName::from_string(entry.file_name().to_str().unwrap().to_string())?;
                 let config = if config_path.try_exists()? {
                     let config_bytes = std::fs::read(&config_path)?;
-                    serde_json::from_slice(&config_bytes)?
+                    serde_json::from_slice(&config_bytes).map_err(|e| {
+                        Error::InvalidPersistedNamespaceConfig {
+                            namespace: name.to_string(),
+                            reason: format!("invalid filesystem config.json: {e}"),
+                        }
+                    })?
                 } else {
                     DatabaseConfig::default()
                 };
@@ -265,21 +280,23 @@ impl MetaStoreInner {
         for row in rows {
             match row {
                 Ok((k, v)) => {
-                    let ns = match NamespaceName::from_string(k) {
-                        Ok(ns) => ns,
-                        Err(e) => {
-                            tracing::warn!("unable to convert namespace name: {}", e);
-                            continue;
+                    let ns = NamespaceName::from_string(k.clone()).map_err(|e| {
+                        Error::InvalidPersistedNamespaceConfig {
+                            namespace: k,
+                            reason: format!("invalid persisted namespace name: {e}"),
                         }
-                    };
+                    })?;
 
-                    let config = match metadata::DatabaseConfig::decode(&v[..]) {
-                        Ok(c) => Arc::new(DatabaseConfig::from(&c)),
-                        Err(e) => {
-                            tracing::warn!("unable to convert config: {}", e);
-                            continue;
-                        }
-                    };
+                    // Retained invalid configs must not be treated as missing: a
+                    // later create could overwrite the row and its schema links.
+                    let config = metadata::DatabaseConfig::decode(&v[..])
+                        .map_err(Error::from)
+                        .and_then(|c| DatabaseConfig::try_from(&c))
+                        .map_err(|e| Error::InvalidPersistedNamespaceConfig {
+                            namespace: ns.to_string(),
+                            reason: e.to_string(),
+                        })?;
+                    let config = Arc::new(config);
 
                     // We don't store the version in the sqlitedb due to the session token
                     // changed each time we start the primary, this will cause the replica to
@@ -417,6 +434,11 @@ impl MetaStore {
         let inner = match maybe_inner {
             Ok(inner) => inner,
             Err(e) => {
+                // An invalid persisted name/config requires operator repair; do
+                // not erase otherwise healthy metastore links, jobs, or data.
+                if matches!(e, Error::InvalidPersistedNamespaceConfig { .. }) {
+                    return Err(e);
+                }
                 if destroy_on_error {
                     let db_path = base_path.join("metastore");
 
@@ -618,6 +640,199 @@ impl MetaStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn invalid_shared_schema_refuses_startup_without_destroying_metastore() {
+        let tmp = tempdir().unwrap();
+        let namespace_dir = tmp.path().join("dbs/tenant");
+        std::fs::create_dir_all(&namespace_dir).unwrap();
+        std::fs::write(namespace_dir.join("sentinel"), b"namespace intact").unwrap();
+        let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let metastore_sentinel = tmp.path().join("metastore/sentinel");
+        let invalid = metadata::DatabaseConfig {
+            shared_schema_name: Some("../schema".into()),
+            ..metadata::DatabaseConfig::from(&DatabaseConfig::default())
+        }
+        .encode_to_vec();
+        {
+            let conn = maker().unwrap();
+            setup_connection(&conn).unwrap();
+            std::fs::write(&metastore_sentinel, b"metastore intact").unwrap();
+            conn.execute(
+                "INSERT INTO namespace_configs VALUES (?1, ?2)",
+                rusqlite::params!["tenant", invalid.clone()],
+            )
+            .unwrap();
+        }
+        let config = MetaStoreConfig {
+            destroy_on_error: true,
+            ..Default::default()
+        };
+        let err = match MetaStore::new(
+            config.clone(),
+            tmp.path(),
+            maker().unwrap(),
+            wal.clone(),
+            DatabaseKind::Primary,
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid persisted config should fail startup"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Error::InvalidPersistedNamespaceConfig { namespace, .. } if namespace == "tenant")
+        );
+        assert_eq!(
+            std::fs::read(&metastore_sentinel).unwrap(),
+            b"metastore intact"
+        );
+        assert_eq!(
+            std::fs::read(namespace_dir.join("sentinel")).unwrap(),
+            b"namespace intact"
+        );
+        {
+            let conn = maker().unwrap();
+            let stored: Vec<u8> = conn
+                .query_row(
+                    "SELECT config FROM namespace_configs WHERE namespace = 'tenant'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, invalid);
+            let repaired =
+                metadata::DatabaseConfig::from(&DatabaseConfig::default()).encode_to_vec();
+            conn.execute(
+                "UPDATE namespace_configs SET config = ?1 WHERE namespace = 'tenant'",
+                [repaired],
+            )
+            .unwrap();
+        }
+        let store = MetaStore::new(
+            config,
+            tmp.path(),
+            maker().unwrap(),
+            wal,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        assert!(store.exists(&NamespaceName::from("tenant")).await);
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_name_refuses_startup_without_erasing_other_rows() {
+        let tmp = tempdir().unwrap();
+        let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let metastore_sentinel = tmp.path().join("metastore/sentinel");
+        {
+            let conn = maker().unwrap();
+            setup_connection(&conn).unwrap();
+            std::fs::write(&metastore_sentinel, b"keep").unwrap();
+            let valid = metadata::DatabaseConfig::from(&DatabaseConfig::default()).encode_to_vec();
+            conn.execute(
+                "INSERT INTO namespace_configs VALUES (?1, ?2)",
+                rusqlite::params!["valid", valid.clone()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO namespace_configs VALUES (?1, ?2)",
+                rusqlite::params!["../bad", valid],
+            )
+            .unwrap();
+        }
+        let config = MetaStoreConfig {
+            destroy_on_error: true,
+            ..Default::default()
+        };
+        let err = match MetaStore::new(
+            config.clone(),
+            tmp.path(),
+            maker().unwrap(),
+            wal.clone(),
+            DatabaseKind::Primary,
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid persisted name should fail startup"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Error::InvalidPersistedNamespaceConfig { namespace, .. } if namespace == "../bad")
+        );
+        assert_eq!(std::fs::read(&metastore_sentinel).unwrap(), b"keep");
+        {
+            let conn = maker().unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM namespace_configs", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 2);
+            conn.execute(
+                "UPDATE namespace_configs SET namespace = 'repaired' WHERE namespace = '../bad'",
+                [],
+            )
+            .unwrap();
+        }
+        let store = MetaStore::new(
+            config,
+            tmp.path(),
+            maker().unwrap(),
+            wal,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        assert!(store.exists(&NamespaceName::from("valid")).await);
+        assert!(store.exists(&NamespaceName::from("repaired")).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_recovery_skips_invalid_names_without_deleting_dirs() {
+        let tmp = tempdir().unwrap();
+        let dbs = tmp.path().join("dbs");
+        std::fs::create_dir_all(dbs.join("valid")).unwrap();
+        std::fs::create_dir_all(dbs.join("bad\\name")).unwrap();
+        std::fs::write(dbs.join("bad\\name/sentinel"), b"keep").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside intact").unwrap();
+        std::os::unix::fs::symlink(&outside, dbs.join("alias")).unwrap();
+        let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let config = MetaStoreConfig {
+            allow_recover_from_fs: true,
+            destroy_on_error: true,
+            ..Default::default()
+        };
+        let store = MetaStore::new(
+            config,
+            tmp.path(),
+            maker().unwrap(),
+            wal,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        assert!(store.exists(&NamespaceName::from("valid")).await);
+        assert_eq!(
+            std::fs::read(dbs.join("bad\\name/sentinel")).unwrap(),
+            b"keep"
+        );
+        assert!(!store.exists(&NamespaceName::from("alias")).await);
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"outside intact"
+        );
+    }
+}
+
 impl MetaStoreHandle {
     #[cfg(test)]
     pub fn new_test() -> Self {
@@ -633,21 +848,21 @@ impl MetaStoreHandle {
         let config = match fs::read(config_path) {
             Ok(data) => {
                 let c = metadata::DatabaseConfig::decode(&data[..])?;
-                DatabaseConfig::from(&c)
+                DatabaseConfig::try_from(&c)?
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => DatabaseConfig::default(),
             Err(err) => return Err(Error::IOError(err)),
         };
 
         Ok(Self {
-            namespace: NamespaceName::new_unchecked("testmetastore"),
+            namespace: NamespaceName::from("testmetastore"),
             inner: HandleState::Internal(Arc::new(Mutex::new(Arc::new(config)))),
         })
     }
 
     pub fn internal() -> Self {
         MetaStoreHandle {
-            namespace: NamespaceName::new_unchecked("testmetastore"),
+            namespace: NamespaceName::from("testmetastore"),
             inner: HandleState::Internal(Arc::new(Mutex::new(Arc::new(DatabaseConfig::default())))),
         }
     }

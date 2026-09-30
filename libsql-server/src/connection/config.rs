@@ -65,30 +65,36 @@ impl Default for DatabaseConfig {
     }
 }
 
-impl From<&metadata::DatabaseConfig> for DatabaseConfig {
-    fn from(value: &metadata::DatabaseConfig) -> Self {
-        DatabaseConfig {
+impl TryFrom<&metadata::DatabaseConfig> for DatabaseConfig {
+    type Error = crate::Error;
+
+    fn try_from(value: &metadata::DatabaseConfig) -> Result<Self, Self::Error> {
+        Ok(DatabaseConfig {
             block_reads: value.block_reads,
             block_writes: value.block_writes,
             block_reason: value.block_reason.clone(),
             max_db_pages: value.max_db_pages,
-            heartbeat_url: value.heartbeat_url.as_ref().map(|s| Url::parse(s).unwrap()),
+            heartbeat_url: value
+                .heartbeat_url
+                .as_ref()
+                .map(|s| Url::parse(s))
+                .transpose()?,
             bottomless_db_id: value.bottomless_db_id.clone(),
             jwt_key: value.jwt_key.clone(),
             txn_timeout: value.txn_timeout_s.map(Duration::from_secs),
             allow_attach: value.allow_attach,
             max_row_size: value.max_row_size.unwrap_or_else(default_max_row_size),
             is_shared_schema: value.shared_schema.unwrap_or(false),
-            // namespace name is coming from primary, we assume it's valid
             shared_schema_name: value
                 .shared_schema_name
                 .clone()
-                .map(NamespaceName::new_unchecked),
+                .map(NamespaceName::from_string)
+                .transpose()?,
             durability_mode: match value.durability_mode {
                 None => DurabilityMode::default(),
                 Some(m) => DurabilityMode::from(metadata::DurabilityMode::try_from(m)),
             },
-        }
+        })
     }
 }
 
@@ -108,6 +114,47 @@ impl From<&DatabaseConfig> for metadata::DatabaseConfig {
             shared_schema: Some(value.is_shared_schema),
             shared_schema_name: value.shared_schema_name.as_ref().map(|s| s.to_string()),
             durability_mode: Some(metadata::DurabilityMode::from(value.durability_mode).into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replicated_config_rejects_unsafe_shared_schema_names() {
+        for name in ["", ".", "..", "../schema", "/schema", "a\\b", "a\0b"] {
+            let config = metadata::DatabaseConfig {
+                shared_schema_name: Some(name.into()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    DatabaseConfig::try_from(&config),
+                    Err(crate::Error::InvalidNamespace)
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replicated_config_preserves_safe_shared_schema_names() {
+        for name in [None, Some("schema-1.example"), Some("tenant café")] {
+            let config = metadata::DatabaseConfig {
+                shared_schema_name: name.map(str::to_owned),
+                ..Default::default()
+            };
+            let decoded = DatabaseConfig::try_from(&config).unwrap();
+            assert_eq!(
+                decoded.shared_schema_name.as_ref().map(|n| n.as_str()),
+                name
+            );
+            assert_eq!(
+                metadata::DatabaseConfig::from(&decoded).shared_schema_name,
+                config.shared_schema_name
+            );
         }
     }
 }

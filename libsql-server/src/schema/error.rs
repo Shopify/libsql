@@ -15,6 +15,12 @@ pub enum Error {
     CorruptedJobStatus(serde_json::Error),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("invalid persisted namespace in migration {kind} {id}: {name:?}; repair the metastore entry before restarting the scheduler")]
+    InvalidPersistedNamespace {
+        kind: &'static str,
+        id: i64,
+        name: String,
+    },
     #[error("`{0}` is not a schema database")]
     NotASchema(NamespaceName),
     #[error("schema `{0}` doesn't exist")]
