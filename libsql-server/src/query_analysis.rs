@@ -233,7 +233,7 @@ impl StmtKind {
     }
 }
 
-fn to_ascii_lower(s: &str) -> Cow<str> {
+fn to_ascii_lower(s: &str) -> Cow<'_, str> {
     if s.chars().all(|c| char::is_ascii_lowercase(&c)) {
         Cow::Borrowed(s)
     } else {

@@ -24,7 +24,7 @@ pub(crate) trait Stmt {
 
     fn column_count(&self) -> usize;
 
-    fn columns(&self) -> Vec<Column>;
+    fn columns(&self) -> Vec<Column<'_>>;
 }
 
 /// A cached prepared statement.
@@ -103,7 +103,7 @@ impl Statement {
     }
 
     /// Fetch the list of columns for the prepared statement.
-    pub fn columns(&self) -> Vec<Column> {
+    pub fn columns(&self) -> Vec<Column<'_>> {
         self.inner.columns()
     }
 }
