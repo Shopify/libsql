@@ -2,7 +2,6 @@ use std::fmt::Display;
 use std::pin::Pin;
 use std::str::FromStr;
 
-use bytes::Bytes;
 use dialoguer::BasicHistory;
 use rusqlite::types::ValueRef;
 use tokio_stream::{Stream, StreamExt as _};
@@ -37,10 +36,9 @@ impl AdminShell {
 
     async fn with_namespace(
         &self,
-        ns: Bytes,
+        namespace: NamespaceName,
         queries: impl Stream<Item = Result<rpc::Query, tonic::Status>>,
     ) -> anyhow::Result<impl Stream<Item = Result<rpc::Response, tonic::Status>>> {
-        let namespace = NamespaceName::from_bytes(ns).unwrap();
         let connection_maker = self
             .namespace_store
             .with(namespace, |ns| ns.db.connection_maker())
@@ -128,7 +126,9 @@ impl AdminShellService for AdminShell {
             ));
         };
 
-        match self.with_namespace(ns_bytes, request.into_inner()).await {
+        let namespace = NamespaceName::from_bytes(ns_bytes)
+            .map_err(|_| tonic::Status::invalid_argument("invalid namespace"))?;
+        match self.with_namespace(namespace, request.into_inner()).await {
             Ok(s) => Ok(tonic::Response::new(Box::pin(s))),
             Err(e) => Err(tonic::Status::new(
                 tonic::Code::FailedPrecondition,
