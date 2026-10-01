@@ -418,6 +418,10 @@ impl Scheduler {
             .schema_locks()
             .acquire_exlusive(schema.clone())
             .await;
+        self.namespace_store
+            .ensure_schema_has_no_pending_resets(&schema)
+            .await
+            .map_err(|e| Error::Registration(Box::new(e)))?;
         with_conn_async(self.migration_db.clone(), move |conn| {
             register_schema_migration_job(conn, &schema, &migration)
         })

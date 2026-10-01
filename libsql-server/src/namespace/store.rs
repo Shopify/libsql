@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use crate::broadcaster::BroadcastMsg;
 use crate::connection::config::DatabaseConfig;
 use crate::database::DatabaseKind;
 use crate::error::Error;
-use crate::metrics::NAMESPACE_LOAD_LATENCY;
+use crate::metrics::{NAMESPACE_LOAD_LATENCY, NAMESPACE_QUARANTINE_COUNT};
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
 use crate::stats::Stats;
 
@@ -31,6 +32,12 @@ use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
 type NamespaceEntry = Arc<RwLock<Option<Namespace>>>;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResetIntent {
+    old_identity: (u64, u64),
+    old_config: Vec<u8>,
+}
 
 // A new directory is owned only after create_dir succeeds. Dropping a
 // reservation never deletes by path: cancellation without a cleanup worker
@@ -80,6 +87,7 @@ impl PendingCleanup {
                 "quarantining cancelled namespace directory {:?}",
                 self.directory.path
             );
+            NAMESPACE_QUARANTINE_COUNT.increment(1);
             self.directory.disarm();
         }
         if let Err(e) = self.metadata.wait_for_pending_changes().await {
@@ -100,6 +108,18 @@ impl PendingCleanup {
             tracing::error!("namespace cleanup worker failed: {e}");
         }
     }
+}
+
+// Unix directory fsync orders the intent's publication ahead of SQLite's
+// delete commit. Windows does not expose a portable directory fsync here:
+// process-crash recovery works, but sudden-power-loss durability is NOT
+// promised on Windows (nor does macOS fsync imply hardware F_FULLFSYNC).
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn directory_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
@@ -178,6 +198,7 @@ mod directory_tests {
     };
     use crate::namespace::meta_store::metastore_connection_maker;
     use libsql_sys::wal::Sqlite3WalManager;
+    use prost::Message;
     use tokio::sync::{Notify, Semaphore};
     use tokio::time::timeout;
 
@@ -288,6 +309,33 @@ mod directory_tests {
         primary_fixture_with_cleanup_gate(None).await
     }
 
+    async fn reopened_store(tmp: &tempfile::TempDir) -> NamespaceStore {
+        let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let metadata = MetaStore::new(
+            crate::config::MetaStoreConfig {
+                allow_recover_from_fs: true,
+                ..Default::default()
+            },
+            tmp.path(),
+            maker().unwrap(),
+            wal,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        NamespaceStore::new(
+            false,
+            false,
+            10,
+            metadata,
+            NamespaceConfigurators::empty(),
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await
+        .unwrap()
+    }
+
     async fn primary_fixture_with_cleanup_gate(
         gate: Option<(Arc<Notify>, Arc<Notify>, bool)>,
     ) -> (tempfile::TempDir, NamespaceStore) {
@@ -346,6 +394,27 @@ mod directory_tests {
         .await
         .unwrap();
         (tmp, store)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_existing_directory_single_scan_rejects_symlink_alias() {
+        use std::os::unix::fs::symlink;
+        let (tmp, store) = primary_fixture().await;
+        let real = tmp.path().join("dbs/real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("sentinel"), b"real").unwrap();
+        symlink(&real, tmp.path().join("dbs/alias")).unwrap();
+        assert!(store
+            .ensure_existing_directory(&NamespaceName::from("alias"))
+            .await
+            .is_err());
+        assert!(store
+            .ensure_existing_directory(&NamespaceName::from("real"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(real.join("sentinel")).unwrap(), b"real");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -471,7 +540,7 @@ mod directory_tests {
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("sentinel"), b"new owner").unwrap();
         assert!(store
-            .detach_owned_directory(&name, expected, false)
+            .detach_owned_directory(&name, expected, false, None)
             .await
             .is_err());
         assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"new owner");
@@ -546,6 +615,700 @@ mod directory_tests {
             .unwrap();
         assert!(!victim_path.join("sentinel").exists());
         assert!(store.exists(&victim).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_setup_failure_fences_old_data_until_restart() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let path = tmp.path().join("dbs/victim");
+        std::fs::write(path.join("sentinel"), b"old").unwrap();
+        let old = store.cleanup_directory_identity(&name).await.unwrap();
+        let dump = futures::stream::iter(vec![Ok(bytes::Bytes::from_static(b"not valid SQL;"))]);
+        assert!(store
+            .reset(name.clone(), RestoreOption::Dump(Box::new(dump)))
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(store.reset_quarantine_path(&name).join("sentinel")).unwrap(),
+            b"old"
+        );
+        assert!(store.reset_intent_path(&name).exists());
+        assert!(store.lock_names(&[name.clone()]).await.is_err());
+        // Simulate config changes from setup that must not remain paired with
+        // the restored old database after process restart.
+        let mut changed = DatabaseConfig::default();
+        changed.block_reads = true;
+        store
+            .inner
+            .metadata
+            .handle(name.clone())
+            .await
+            .store(changed)
+            .await
+            .unwrap();
+        drop(store);
+        let restarted = reopened_store(&tmp).await;
+        assert_eq!(
+            restarted.cleanup_directory_identity(&name).await.unwrap(),
+            old
+        );
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"old");
+        assert!(
+            !restarted
+                .inner
+                .metadata
+                .handle(name.clone())
+                .await
+                .get()
+                .block_reads
+        );
+        assert!(!restarted.reset_intent_path(&name).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_reset_waiter_cannot_release_name_lock_during_setup() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let path = tmp.path().join("dbs/victim");
+        std::fs::write(path.join("sentinel"), b"old").unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let dump = futures::stream::once({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(bytes::Bytes::from_static(b"not valid SQL;"))
+            }
+        });
+        let waiter = tokio::spawn({
+            let store = store.clone();
+            let name = name.clone();
+            async move {
+                store
+                    .reset(name, RestoreOption::Dump(Box::new(Box::pin(dump))))
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let name_lock = store
+            .inner
+            .name_operations
+            .lock()
+            .unwrap()
+            .get(&name)
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), name_lock.clone().lock_owned())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        // The detached owner finishes (or safely fences on setup failure)
+        // before a new same-name operation can proceed.
+        let guard = timeout(Duration::from_secs(5), name_lock.lock_owned())
+            .await
+            .unwrap();
+        assert!(store.reset_intent_path(&name).exists());
+        assert_eq!(
+            std::fs::read(store.reset_quarantine_path(&name).join("sentinel")).unwrap(),
+            b"old"
+        );
+        drop(guard);
+        drop(store);
+        let restarted = reopened_store(&tmp).await;
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"old");
+        assert!(!restarted.reset_intent_path(&name).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_reconciles_reset_at_each_boundary() {
+        let name = NamespaceName::from("victim");
+        for stage in 0..7 {
+            let (tmp, store) = primary_fixture().await;
+            store
+                .create(
+                    name.clone(),
+                    RestoreOption::Latest,
+                    DatabaseConfig::default(),
+                )
+                .await
+                .unwrap();
+            store.evict_cached_namespace(&name).await;
+            let path = tmp.path().join("dbs/victim");
+            std::fs::write(path.join("sentinel"), b"old").unwrap();
+            let expected = store
+                .cleanup_directory_identity(&name)
+                .await
+                .unwrap()
+                .unwrap();
+            let old_config = tokio::task::spawn_blocking({
+                let metadata = store.inner.metadata.clone();
+                let name = name.clone();
+                move || metadata.pin_reset_and_snapshot(&name).unwrap()
+            })
+            .await
+            .unwrap();
+            let bytes = serde_json::to_vec(&ResetIntent {
+                old_identity: expected,
+                old_config,
+            })
+            .unwrap();
+            store
+                .publish_reset_file(&store.reset_intent_path(&name), &bytes)
+                .unwrap();
+            if stage >= 1 {
+                store
+                    .detach_owned_directory(
+                        &name,
+                        Some(expected),
+                        true,
+                        Some(store.reset_quarantine_path(&name)),
+                    )
+                    .await
+                    .unwrap();
+                if stage >= 2 {
+                    std::fs::write(path.join("partial"), b"new").unwrap();
+                }
+                let mut changed = DatabaseConfig::default();
+                changed.block_reads = true;
+                store
+                    .inner
+                    .metadata
+                    .handle(name.clone())
+                    .await
+                    .store(changed)
+                    .await
+                    .unwrap();
+            }
+            if stage >= 3 {
+                let fresh = store
+                    .cleanup_directory_identity(&name)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                store
+                    .publish_reset_file(
+                        &store.reset_committed_path(&name),
+                        format!("committed {} {}\n", fresh.0, fresh.1).as_bytes(),
+                    )
+                    .unwrap();
+            }
+            if stage >= 4 {
+                std::fs::remove_dir_all(store.reset_quarantine_path(&name)).unwrap();
+            }
+            if stage >= 5 {
+                std::fs::remove_file(store.reset_intent_path(&name)).unwrap();
+            }
+            if stage == 6 {
+                std::fs::remove_file(store.reset_committed_path(&name)).unwrap();
+            }
+            drop(store);
+            let restarted = reopened_store(&tmp).await;
+            assert!(!restarted.reset_intent_path(&name).exists());
+            assert!(!restarted.reset_committed_path(&name).exists());
+            if stage < 3 {
+                assert_eq!(
+                    restarted.cleanup_directory_identity(&name).await.unwrap(),
+                    Some(expected)
+                );
+                assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"old");
+                assert!(
+                    !restarted
+                        .inner
+                        .metadata
+                        .handle(name.clone())
+                        .await
+                        .get()
+                        .block_reads
+                );
+                if stage >= 1 {
+                    assert!(
+                        std::fs::read_dir(tmp.path().join("namespace-reset-abandoned"))
+                            .unwrap()
+                            .next()
+                            .is_some()
+                    );
+                }
+            } else {
+                assert_ne!(
+                    restarted.cleanup_directory_identity(&name).await.unwrap(),
+                    Some(expected)
+                );
+                assert_eq!(std::fs::read(path.join("partial")).unwrap(), b"new");
+                assert!(
+                    restarted
+                        .inner
+                        .metadata
+                        .handle(name.clone())
+                        .await
+                        .get()
+                        .block_reads
+                );
+                assert!(!restarted.reset_quarantine_path(&name).exists());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_reset_refuses_schema_switch_and_keeps_migration_membership() {
+        let (tmp, store) = primary_fixture().await;
+        let tenant = NamespaceName::from("tenant");
+        store
+            .create(
+                tenant.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.evict_cached_namespace(&tenant).await;
+        std::fs::write(tmp.path().join("dbs/tenant/sentinel"), b"old tenant").unwrap();
+        {
+            let conn = store.inner.metadata.hold_connection_for_test().await;
+            conn.execute_batch("CREATE TABLE jobs (schema TEXT, finished BOOLEAN)")
+                .unwrap();
+        }
+        let a = NamespaceName::from("schema-a");
+        let b = NamespaceName::from("schema-b");
+        let mut schema_config = DatabaseConfig::default();
+        schema_config.is_shared_schema = true;
+        store
+            .inner
+            .metadata
+            .handle(a.clone())
+            .await
+            .store(schema_config.clone())
+            .await
+            .unwrap();
+        store
+            .inner
+            .metadata
+            .handle(b.clone())
+            .await
+            .store(schema_config)
+            .await
+            .unwrap();
+        let mut linked = DatabaseConfig::default();
+        linked.shared_schema_name = Some(a.clone());
+        store
+            .inner
+            .metadata
+            .handle(tenant.clone())
+            .await
+            .store(linked.clone())
+            .await
+            .unwrap();
+        let old_identity = store
+            .cleanup_directory_identity(&tenant)
+            .await
+            .unwrap()
+            .unwrap();
+        let old_config = tokio::task::spawn_blocking({
+            let metadata = store.inner.metadata.clone();
+            let tenant = tenant.clone();
+            move || metadata.pin_reset_and_snapshot(&tenant).unwrap()
+        })
+        .await
+        .unwrap();
+        store
+            .publish_reset_file(
+                &store.reset_intent_path(&tenant),
+                &serde_json::to_vec(&ResetIntent {
+                    old_identity,
+                    old_config,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .detach_owned_directory(
+                &tenant,
+                Some(old_identity),
+                true,
+                Some(store.reset_quarantine_path(&tenant)),
+            )
+            .await
+            .unwrap();
+        assert!(store.ensure_schema_has_no_pending_resets(&a).await.is_err());
+        linked.shared_schema_name = Some(b.clone());
+        // Refuse the switch rather than create a second A+B link: links are
+        // also the schema migration worklist, not only a deletion guard.
+        assert!(store
+            .inner
+            .metadata
+            .handle(tenant.clone())
+            .await
+            .store(linked)
+            .await
+            .is_err());
+        let remove_a = tokio::task::spawn_blocking({
+            let metadata = store.inner.metadata.clone();
+            let a = a.clone();
+            move || metadata.remove(a)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(remove_a, Err(crate::Error::HasLinkedDbs(_))));
+        drop(store);
+        let restarted = reopened_store(&tmp).await;
+        assert!(restarted
+            .ensure_schema_has_no_pending_resets(&a)
+            .await
+            .is_ok());
+        assert_eq!(
+            restarted.cleanup_directory_identity(&tenant).await.unwrap(),
+            Some(old_identity)
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("dbs/tenant/sentinel")).unwrap(),
+            b"old tenant"
+        );
+        assert_eq!(
+            restarted
+                .inner
+                .metadata
+                .handle(tenant.clone())
+                .await
+                .get()
+                .shared_schema_name
+                .as_ref(),
+            Some(&a)
+        );
+        let conn = restarted.inner.metadata.hold_connection_for_test().await;
+        let links_a: i64 = conn.query_row(
+            "SELECT count(*) FROM shared_schema_links WHERE shared_schema_name = 'schema-a' AND namespace = 'tenant'",
+            [], |row| row.get(0)).unwrap();
+        let links_b: i64 = conn.query_row(
+            "SELECT count(*) FROM shared_schema_links WHERE shared_schema_name = 'schema-b' AND namespace = 'tenant'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!((links_a, links_b), (1, 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_own_reset_blocks_migration_registration_until_recovered() {
+        let (tmp, store) = primary_fixture().await;
+        let schema = NamespaceName::from("schema-a");
+        let mut config = DatabaseConfig::default();
+        config.is_shared_schema = true;
+        store
+            .inner
+            .metadata
+            .handle(schema.clone())
+            .await
+            .store(config)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(tmp.path().join("dbs/schema-a")).unwrap();
+        let old = store
+            .cleanup_directory_identity(&schema)
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = tokio::task::spawn_blocking({
+            let metadata = store.inner.metadata.clone();
+            let schema = schema.clone();
+            move || metadata.pin_reset_and_snapshot(&schema).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            MetaStore::reset_snapshot_schema_lock(&schema, &snapshot).unwrap(),
+            Some(schema.clone())
+        );
+        let shared = store.schema_locks().acquire_shared(schema.clone()).await;
+        let registration = tokio::spawn({
+            let store = store.clone();
+            let schema = schema.clone();
+            async move {
+                let _exclusive = store.schema_locks().acquire_exlusive(schema.clone()).await;
+                store.ensure_schema_has_no_pending_resets(&schema).await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!registration.is_finished());
+        let intent = serde_json::to_vec(&ResetIntent {
+            old_identity: old,
+            old_config: snapshot,
+        })
+        .unwrap();
+        store
+            .publish_reset_file(&store.reset_intent_path(&schema), &intent)
+            .unwrap();
+        drop(shared);
+        assert!(timeout(Duration::from_secs(5), registration)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        drop(store);
+        let restarted = reopened_store(&tmp).await;
+        assert!(!restarted.reset_intent_path(&schema).exists());
+        assert_eq!(
+            restarted.cleanup_directory_identity(&schema).await.unwrap(),
+            Some(old)
+        );
+        assert!(restarted
+            .ensure_schema_has_no_pending_resets(&schema)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_refuses_pending_schema_migration_before_detaching_old_data() {
+        let (_tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("tenant");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let a = NamespaceName::from("schema-a");
+        {
+            let conn = store.inner.metadata.hold_connection_for_test().await;
+            conn.execute_batch("CREATE TABLE jobs (schema TEXT, finished BOOLEAN)")
+                .unwrap();
+        }
+        store
+            .inner
+            .metadata
+            .handle(a.clone())
+            .await
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        let mut linked = DatabaseConfig::default();
+        linked.shared_schema_name = Some(a);
+        store
+            .inner
+            .metadata
+            .handle(name.clone())
+            .await
+            .store(linked)
+            .await
+            .unwrap();
+        {
+            let conn = store.inner.metadata.hold_connection_for_test().await;
+            conn.execute("INSERT INTO jobs VALUES ('schema-a', false)", [])
+                .unwrap();
+        }
+        let old = store.cleanup_directory_identity(&name).await.unwrap();
+        assert!(store
+            .reset(name.clone(), RestoreOption::Latest)
+            .await
+            .is_err());
+        assert_eq!(store.cleanup_directory_identity(&name).await.unwrap(), old);
+        assert!(!store.reset_intent_path(&name).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_schema_lock_uses_persisted_snapshot_not_stale_watch() {
+        let (_tmp, store) = primary_fixture().await;
+        let tenant = NamespaceName::from("tenant");
+        store
+            .create(
+                tenant.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let a = NamespaceName::from("schema-a");
+        let b = NamespaceName::from("schema-b");
+        {
+            let conn = store.inner.metadata.hold_connection_for_test().await;
+            conn.execute_batch("CREATE TABLE jobs (schema TEXT, finished BOOLEAN)")
+                .unwrap();
+        }
+        store
+            .inner
+            .metadata
+            .handle(a.clone())
+            .await
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        store
+            .inner
+            .metadata
+            .handle(b.clone())
+            .await
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        let mut linked = DatabaseConfig::default();
+        linked.shared_schema_name = Some(b);
+        store
+            .inner
+            .metadata
+            .handle(tenant.clone())
+            .await
+            .store(linked.clone())
+            .await
+            .unwrap();
+        // Reproduce the worker gap after SQL committed A but before it updates
+        // the watch: the cache still says B while the old row/link says A.
+        linked.shared_schema_name = Some(a.clone());
+        let encoded =
+            libsql_replication::rpc::metadata::DatabaseConfig::from(&linked).encode_to_vec();
+        {
+            let conn = store.inner.metadata.hold_connection_for_test().await;
+            conn.execute(
+                "UPDATE namespace_configs SET config = ?1 WHERE namespace = 'tenant'",
+                [encoded],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM shared_schema_links WHERE namespace = 'tenant'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO shared_schema_links VALUES ('schema-a', 'tenant')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO jobs VALUES ('schema-a', false)", [])
+                .unwrap();
+        }
+        let old = store.cleanup_directory_identity(&tenant).await.unwrap();
+        assert!(store
+            .reset(tenant.clone(), RestoreOption::Latest)
+            .await
+            .is_err());
+        assert_eq!(
+            store.cleanup_directory_identity(&tenant).await.unwrap(),
+            old
+        );
+        assert!(!store.reset_intent_path(&tenant).exists());
+        assert_eq!(
+            store
+                .inner
+                .metadata
+                .handle(tenant)
+                .await
+                .get()
+                .shared_schema_name,
+            Some(a)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_reset_journal_publication_releases_ephemeral_schema_pin() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("tenant");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let old = store.cleanup_directory_identity(&name).await.unwrap();
+        std::fs::write(
+            tmp.path().join("namespace-reset-intents"),
+            b"not a directory",
+        )
+        .unwrap();
+        assert!(store
+            .reset(name.clone(), RestoreOption::Latest)
+            .await
+            .is_err());
+        assert_eq!(store.cleanup_directory_identity(&name).await.unwrap(), old);
+        // The failed temporary journal write must not leave an invisible
+        // in-memory pin blocking otherwise valid config updates.
+        {
+            let conn = store.inner.metadata.hold_connection_for_test().await;
+            conn.execute_batch("CREATE TABLE jobs (schema TEXT, finished BOOLEAN)")
+                .unwrap();
+        }
+        let schema = NamespaceName::from("schema-b");
+        store
+            .inner
+            .metadata
+            .handle(schema.clone())
+            .await
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        let mut changed = DatabaseConfig::default();
+        changed.shared_schema_name = Some(schema);
+        store
+            .inner
+            .metadata
+            .handle(name.clone())
+            .await
+            .store(changed)
+            .await
+            .unwrap();
+        assert!(!store.reset_intent_path(&name).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_reset_backup_preserves_old_inode_without_journal() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (tmp, store) =
+            primary_fixture_with_cleanup_gate(Some((entered.clone(), release.clone(), true))).await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let path = tmp.path().join("dbs/victim");
+        std::fs::write(path.join("sentinel"), b"old data").unwrap();
+        let old = store.cleanup_directory_identity(&name).await.unwrap();
+        let reset = tokio::spawn({
+            let store = store.clone();
+            let name = name.clone();
+            async move { store.reset(name, RestoreOption::Latest).await }
+        });
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(store.cleanup_directory_identity(&name).await.unwrap(), old);
+        release.notify_one();
+        assert!(timeout(Duration::from_secs(5), reset)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert_eq!(store.cleanup_directory_identity(&name).await.unwrap(), old);
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"old data");
+        assert!(!store.reset_intent_path(&name).exists());
+        assert!(!store.reset_quarantine_path(&name).exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -838,6 +1601,261 @@ mod directory_tests {
             std::fs::read(tmp.path().join("original/sentinel")).unwrap(),
             b"old inode"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sql_failure_after_intent_publication_preserves_original_directory() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        let path = tmp.path().join("dbs/victim");
+        std::fs::write(path.join("sentinel"), b"original").unwrap();
+        let conn = store.inner.metadata.hold_connection_for_test().await;
+        conn.execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON namespace_configs BEGIN SELECT RAISE(ABORT, 'injected failure'); END;")
+            .unwrap();
+        let destroy = tokio::spawn({
+            let store = store.clone();
+            let name = name.clone();
+            async move { store.destroy(name, false).await }
+        });
+        // Prove the durable intent is published *before* entering SQL. This
+        // assertion distinguishes this protocol from the old trigger test.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.destroy_intent_path(&name).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(store.exists(&name).await);
+        drop(conn);
+        assert!(destroy.await.unwrap().is_err());
+        assert!(!store.destroy_intent_path(&name).exists());
+        assert!(store.exists(&name).await);
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"original");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_recovers_destroy_at_each_durable_boundary() {
+        for stage in 0..3 {
+            let (tmp, store) = primary_fixture().await;
+            let name = NamespaceName::from("victim");
+            store
+                .create(
+                    name.clone(),
+                    RestoreOption::Latest,
+                    DatabaseConfig::default(),
+                )
+                .await
+                .unwrap();
+            let path = tmp.path().join("dbs/victim");
+            std::fs::write(path.join("sentinel"), b"old data").unwrap();
+            store.evict_cached_namespace(&name).await;
+            let identity = store.cleanup_directory_identity(&name).await.unwrap();
+            store.persist_destroy_intent(&name, identity).unwrap();
+            if stage >= 1 {
+                tokio::task::spawn_blocking({
+                    let metadata = store.inner.metadata.clone();
+                    let name = name.clone();
+                    move || metadata.remove(name).unwrap()
+                })
+                .await
+                .unwrap();
+            }
+            if stage == 2 {
+                let identity = store.cleanup_directory_identity(&name).await.unwrap();
+                store
+                    .detach_owned_directory(
+                        &name,
+                        identity,
+                        false,
+                        Some(store.destroy_quarantine_path(&name)),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // Open a fresh SQLite-backed metastore as on process restart.
+            drop(store);
+            let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+            let metadata = MetaStore::new(
+                crate::config::MetaStoreConfig {
+                    allow_recover_from_fs: true,
+                    ..Default::default()
+                },
+                tmp.path(),
+                maker().unwrap(),
+                wal,
+                DatabaseKind::Primary,
+            )
+            .await
+            .unwrap();
+            let restarted = NamespaceStore::new(
+                false,
+                false,
+                10,
+                metadata,
+                NamespaceConfigurators::empty(),
+                DatabaseKind::Primary,
+                tmp.path(),
+            )
+            .await
+            .unwrap();
+            assert!(!restarted.destroy_intent_path(&name).exists());
+            assert!(!restarted.destroy_quarantine_path(&name).exists());
+            if stage == 0 {
+                assert!(restarted.exists(&name).await);
+                assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"old data");
+            } else {
+                assert!(!restarted.exists(&name).await);
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpublished_truncated_intent_is_discarded_without_hiding_live_row() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.evict_cached_namespace(&name).await;
+        let path = tmp.path().join("dbs/victim");
+        std::fs::write(path.join("sentinel"), b"original").unwrap();
+        let root = store.destroy_intent_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let temp = root.join(".tmp-interrupted-write");
+        std::fs::write(&temp, b"destroy 123").unwrap();
+        drop(store);
+        let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let metadata = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            maker().unwrap(),
+            wal,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        let restarted = NamespaceStore::new(
+            false,
+            false,
+            10,
+            metadata,
+            NamespaceConfigurators::empty(),
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        assert!(!temp.exists());
+        assert!(restarted.exists(&name).await);
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"original");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incomplete_destroy_intent_prevents_reuse_until_recovered() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store.persist_destroy_intent(&name, None).unwrap();
+        assert!(store.ensure_existing_directory(&name).await.is_err());
+        assert!(store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default()
+            )
+            .await
+            .is_err());
+        let restarted = NamespaceStore::new(
+            false,
+            false,
+            10,
+            store.inner.metadata.clone(),
+            NamespaceConfigurators::empty(),
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        assert!(!restarted.destroy_intent_path(&name).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_destroy_fences_fork_destination_and_reset() {
+        let (tmp, store) = primary_fixture().await;
+        let source = NamespaceName::from("source");
+        let destination = NamespaceName::from("destination");
+        store
+            .create(
+                source.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.persist_destroy_intent(&destination, None).unwrap();
+        assert!(store
+            .fork(
+                source.clone(),
+                destination.clone(),
+                DatabaseConfig::default(),
+                None
+            )
+            .await
+            .is_err());
+        assert!(!store.exists(&destination).await);
+        assert!(!tmp.path().join("dbs/destination").exists());
+        let identity = store.cleanup_directory_identity(&source).await.unwrap();
+        store.persist_destroy_intent(&source, identity).unwrap();
+        assert!(store
+            .reset(source.clone(), RestoreOption::Latest)
+            .await
+            .is_err());
+        assert!(store.exists(&source).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn row_with_missing_original_and_destroy_intent_fails_closed() {
+        let (tmp, store) = primary_fixture().await;
+        let name = NamespaceName::from("victim");
+        store
+            .create(
+                name.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.evict_cached_namespace(&name).await;
+        let identity = store.cleanup_directory_identity(&name).await.unwrap();
+        store.persist_destroy_intent(&name, identity).unwrap();
+        std::fs::rename(tmp.path().join("dbs/victim"), tmp.path().join("saved")).unwrap();
+        let result = NamespaceStore::new(
+            false,
+            false,
+            10,
+            store.inner.metadata.clone(),
+            NamespaceConfigurators::empty(),
+            DatabaseKind::Primary,
+            tmp.path(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(tmp.path().join("saved").is_dir());
+        assert!(store.exists(&name).await);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1168,6 +2186,12 @@ pub struct NamespaceStoreInner {
     configurators: NamespaceConfigurators,
     db_kind: DatabaseKind,
     dbs_path: PathBuf,
+    // The short exact-name scan and rename remain synchronous while this
+    // lock is held. Naively awaiting spawn_blocking would release a cancelled
+    // caller's name lock while a late filesystem mutation is still running.
+    // Large directory scans can stall a current-thread executor; offloading
+    // them requires moving BOTH the name and identity guards to a detached,
+    // cancellation-independent worker (not just the filesystem syscall).
     fs_operations: Arc<tokio::sync::Mutex<()>>,
     name_operations: StdMutex<HashMap<NamespaceName, Weak<tokio::sync::Mutex<()>>>>,
     shutdown_signal: tokio::sync::watch::Sender<bool>,
@@ -1206,7 +2230,7 @@ impl NamespaceStore {
             .time_to_idle(Duration::from_secs(86400))
             .build();
 
-        Ok(Self {
+        let this = Self {
             inner: Arc::new(NamespaceStoreInner {
                 store,
                 metadata,
@@ -1222,7 +2246,10 @@ impl NamespaceStore {
                 name_operations: StdMutex::new(HashMap::new()),
                 shutdown_signal: tokio::sync::watch::channel(false).0,
             }),
-        })
+        };
+        this.recover_reset_intents().await?;
+        this.recover_destroy_intents().await?;
+        Ok(this)
     }
 
     pub async fn exists(&self, namespace: &NamespaceName) -> bool {
@@ -1267,11 +2294,534 @@ impl NamespaceStore {
         if self.inner.has_shutdown.load(Ordering::Relaxed) {
             return Err(Error::NamespaceStoreShutdown);
         }
+        for name in &names {
+            self.check_no_destroy_intent(name)?;
+        }
         Ok(guards)
     }
 
     fn directory_path(&self, namespace: &NamespaceName) -> PathBuf {
         self.inner.dbs_path.join(namespace.as_str())
+    }
+
+    fn reset_intent_root(&self) -> PathBuf {
+        self.inner
+            .dbs_path
+            .parent()
+            .unwrap()
+            .join("namespace-reset-intents")
+    }
+
+    fn reset_intent_path(&self, namespace: &NamespaceName) -> PathBuf {
+        self.reset_intent_root().join(Self::destroy_key(namespace))
+    }
+
+    fn reset_committed_path(&self, namespace: &NamespaceName) -> PathBuf {
+        self.reset_intent_root()
+            .join(format!("{}.committed", Self::destroy_key(namespace)))
+    }
+
+    fn reset_quarantine_path(&self, namespace: &NamespaceName) -> PathBuf {
+        self.inner
+            .dbs_path
+            .parent()
+            .unwrap()
+            .join("namespace-teardown-quarantine")
+            .join(format!("reset-{}", Self::destroy_key(namespace)))
+    }
+
+    fn destroy_intent_root(&self) -> PathBuf {
+        self.inner
+            .dbs_path
+            .parent()
+            .unwrap()
+            .join("namespace-destroy-intents")
+    }
+
+    fn destroy_key(namespace: &NamespaceName) -> String {
+        namespace
+            .as_slice()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn destroy_intent_path(&self, namespace: &NamespaceName) -> PathBuf {
+        self.destroy_intent_root()
+            .join(Self::destroy_key(namespace))
+    }
+
+    fn check_no_destroy_intent(&self, namespace: &NamespaceName) -> crate::Result<()> {
+        for path in [
+            self.destroy_intent_path(namespace),
+            self.reset_intent_path(namespace),
+            self.reset_committed_path(namespace),
+        ] {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(Error::InvalidPath(format!(
+                        "unfinished namespace operation for `{namespace}` requires recovery"
+                    )))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn destroy_quarantine_path(&self, namespace: &NamespaceName) -> PathBuf {
+        self.inner
+            .dbs_path
+            .parent()
+            .unwrap()
+            .join("namespace-teardown-quarantine")
+            .join(format!("destroy-{}", Self::destroy_key(namespace)))
+    }
+
+    // The intent must reach disk before SQLite commits deletion. Without it,
+    // restart could mistake the old directory for a new, unowned namespace.
+    fn persist_destroy_intent(
+        &self,
+        namespace: &NamespaceName,
+        expected: Option<(u64, u64)>,
+    ) -> crate::Result<()> {
+        let root = self.destroy_intent_root();
+        std::fs::create_dir_all(&root)?;
+        if !std::fs::symlink_metadata(&root)?.file_type().is_dir() {
+            return Err(Error::InvalidPath(format!(
+                "unsafe destroy intent root {:?}",
+                root
+            )));
+        }
+        let path = self.destroy_intent_path(namespace);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(Error::InvalidPath(format!(
+                    "destroy intent already exists: {:?}",
+                    path
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // An incomplete temp file never authorizes metadata deletion. Publish
+        // only the fully written, synced record with an atomic rename.
+        let temp = root.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let record = match expected {
+            Some((device, inode)) => format!("destroy {device} {inode}\n"),
+            None => "destroy none\n".to_owned(),
+        };
+        file.write_all(record.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, &path)?;
+        sync_directory(&root)?;
+        sync_directory(root.parent().unwrap())?;
+        Ok(())
+    }
+
+    fn clear_destroy_intent(&self, namespace: &NamespaceName) -> crate::Result<()> {
+        std::fs::remove_file(self.destroy_intent_path(namespace))?;
+        sync_directory(&self.destroy_intent_root())?;
+        Ok(())
+    }
+
+    // Reset's pending record is immutable; a separate atomic commit marker
+    // decides which incarnation wins after a process crash. Both are published
+    // through a synced temporary file so a truncated record is never visible.
+    fn publish_reset_file(&self, path: &Path, content: &[u8]) -> crate::Result<()> {
+        let root = self.reset_intent_root();
+        std::fs::create_dir_all(&root)?;
+        if !std::fs::symlink_metadata(&root)?.file_type().is_dir() {
+            return Err(Error::InvalidPath(format!(
+                "unsafe reset intent root {:?}",
+                root
+            )));
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(Error::InvalidPath(format!(
+                    "reset intent already exists: {:?}",
+                    path
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let temp = root.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        sync_directory(&root)?;
+        sync_directory(root.parent().unwrap())?;
+        Ok(())
+    }
+
+    fn read_reset_commit(&self, namespace: &NamespaceName) -> crate::Result<Option<(u64, u64)>> {
+        let path = self.reset_committed_path(namespace);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(Error::InvalidPath(format!(
+                "invalid reset commit marker {:?}",
+                path
+            )));
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let parts = content
+            .strip_suffix('\n')
+            .unwrap_or("")
+            .split(' ')
+            .collect::<Vec<_>>();
+        if parts.len() != 3 || parts[0] != "committed" {
+            return Err(Error::InvalidPath(format!(
+                "invalid reset commit marker {:?}",
+                path
+            )));
+        }
+        Ok(Some((
+            parts[1]
+                .parse()
+                .map_err(|_| Error::InvalidPath("invalid reset commit inode".into()))?,
+            parts[2]
+                .parse()
+                .map_err(|_| Error::InvalidPath("invalid reset commit inode".into()))?,
+        )))
+    }
+
+    fn clear_reset_intent(&self, namespace: &NamespaceName) -> crate::Result<()> {
+        let root = self.reset_intent_root();
+        std::fs::remove_file(self.reset_intent_path(namespace))?;
+        sync_directory(&root)?;
+        match std::fs::remove_file(self.reset_committed_path(namespace)) {
+            Ok(()) => sync_directory(&root)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    async fn recover_reset_intents(&self) -> crate::Result<()> {
+        let root = self.reset_intent_root();
+        match std::fs::symlink_metadata(&root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Err(Error::InvalidPath(format!(
+                    "unsafe reset intent root {:?}",
+                    root
+                )))
+            }
+            Ok(_) => {}
+        }
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let key = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Error::InvalidPath("invalid reset intent name".into()))?;
+            if key.starts_with(".tmp-") {
+                if !entry.file_type()?.is_file() {
+                    return Err(Error::InvalidPath(format!(
+                        "unsafe reset temp {:?}",
+                        entry.path()
+                    )));
+                }
+                std::fs::remove_file(entry.path())?;
+                sync_directory(&root)?;
+                continue;
+            }
+            if key.ends_with(".committed") {
+                continue;
+            }
+            if key.is_empty()
+                || key.len() % 2 != 0
+                || !key.is_ascii()
+                || !entry.file_type()?.is_file()
+            {
+                return Err(Error::InvalidPath(format!(
+                    "invalid reset intent {:?}",
+                    entry.path()
+                )));
+            }
+            let bytes = (0..key.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&key[i..i + 2], 16))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    Error::InvalidPath(format!("invalid reset intent {:?}", entry.path()))
+                })?;
+            let namespace = NamespaceName::from_bytes(bytes.into())?;
+            if key != Self::destroy_key(&namespace) || !self.inner.metadata.exists(&namespace).await
+            {
+                return Err(Error::InvalidPath(format!(
+                    "reset of `{namespace}` has no persisted row"
+                )));
+            }
+            let intent: ResetIntent = serde_json::from_slice(&std::fs::read(entry.path())?)
+                .map_err(|e| Error::InvalidPath(format!("invalid reset intent: {e}")))?;
+            let old = self.reset_quarantine_path(&namespace);
+            let old_at_quarantine = match std::fs::symlink_metadata(&old) {
+                Ok(meta) => {
+                    if directory_identity(&meta) != Some(intent.old_identity) {
+                        return Err(Error::InvalidPath(format!(
+                            "reset old inode changed for `{namespace}`"
+                        )));
+                    }
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.into()),
+            };
+            let committed = self.read_reset_commit(&namespace)?;
+            if let Some(new_identity) = committed {
+                let replacement = self.cleanup_directory_identity(&namespace).await?;
+                if replacement != Some(new_identity) || replacement == Some(intent.old_identity) {
+                    return Err(Error::InvalidPath(format!(
+                        "missing committed reset directory for `{namespace}`"
+                    )));
+                }
+                tokio::task::spawn_blocking({
+                    let metadata = self.inner.metadata.clone();
+                    let namespace = namespace.clone();
+                    move || metadata.release_reset_pin(&namespace)
+                })
+                .await?;
+                if old_at_quarantine {
+                    Self::remove_detached_directory(Some(old.clone())).await?;
+                    sync_directory(old.parent().unwrap())?;
+                }
+            } else if old_at_quarantine {
+                // Only process restart can guarantee all canceled setup and
+                // blocking/path-open workers are gone. Retain partial new data
+                // for inspection; never recursively delete by namespace path.
+                let _identity = self.inner.fs_operations.lock().await;
+                self.check_existing_directory(&namespace).await?;
+                let path = self.directory_path(&namespace);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) => {
+                        if directory_identity(&meta).is_none() {
+                            return Err(Error::InvalidPath(format!(
+                                "unsafe reset replacement for `{namespace}`"
+                            )));
+                        }
+                        let abandoned_root = self
+                            .inner
+                            .dbs_path
+                            .parent()
+                            .unwrap()
+                            .join("namespace-reset-abandoned");
+                        std::fs::create_dir_all(&abandoned_root)?;
+                        if !std::fs::symlink_metadata(&abandoned_root)?
+                            .file_type()
+                            .is_dir()
+                        {
+                            return Err(Error::InvalidPath(format!(
+                                "unsafe abandoned reset root {:?}",
+                                abandoned_root
+                            )));
+                        }
+                        let abandoned = abandoned_root.join(uuid::Uuid::new_v4().to_string());
+                        std::fs::rename(&path, &abandoned)?;
+                        NAMESPACE_QUARANTINE_COUNT.increment(1);
+                        sync_directory(&self.inner.dbs_path)?;
+                        sync_directory(&abandoned_root)?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                std::fs::rename(&old, &path)?;
+                sync_directory(&self.inner.dbs_path)?;
+                sync_directory(old.parent().unwrap())?;
+            } else if self.cleanup_directory_identity(&namespace).await?
+                != Some(intent.old_identity)
+            {
+                return Err(Error::InvalidPath(format!(
+                    "pending reset lost old directory for `{namespace}`"
+                )));
+            }
+            if committed.is_none() {
+                tokio::task::spawn_blocking({
+                    let metadata = self.inner.metadata.clone();
+                    let namespace = namespace.clone();
+                    move || metadata.restore_reset_config(&namespace, &intent.old_config)
+                })
+                .await??;
+            }
+            self.clear_reset_intent(&namespace)?;
+        }
+        // A crash after deleting the pending record, before deleting the
+        // commit marker, leaves only a harmless committed marker.
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let Some(key) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(Error::InvalidPath("invalid reset marker name".into()));
+            };
+            let Some(hex) = key.strip_suffix(".committed") else {
+                continue;
+            };
+            if hex.len() % 2 != 0 || hex.is_empty() || !hex.is_ascii() {
+                return Err(Error::InvalidPath(format!(
+                    "invalid reset commit marker {:?}",
+                    entry.path()
+                )));
+            }
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| Error::InvalidPath("invalid reset commit marker".into()))?;
+            let namespace = NamespaceName::from_bytes(bytes.into())?;
+            if hex != Self::destroy_key(&namespace)
+                || !entry.file_type()?.is_file()
+                || !self.inner.metadata.exists(&namespace).await
+                || self.cleanup_directory_identity(&namespace).await?
+                    != self.read_reset_commit(&namespace)?
+                || std::fs::symlink_metadata(self.reset_quarantine_path(&namespace)).is_ok()
+            {
+                return Err(Error::InvalidPath(format!(
+                    "orphan reset marker for `{namespace}`"
+                )));
+            }
+            std::fs::remove_file(entry.path())?;
+            sync_directory(&root)?;
+        }
+        Ok(())
+    }
+
+    async fn recover_destroy_intents(&self) -> crate::Result<()> {
+        let root = self.destroy_intent_root();
+        match std::fs::symlink_metadata(&root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Err(Error::InvalidPath(format!(
+                    "unsafe destroy intent root {:?}",
+                    root
+                )))
+            }
+            Ok(_) => {}
+        }
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let key = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Error::InvalidPath("invalid destroy intent name".into()))?;
+            if key.starts_with(".tmp-") {
+                // The metadata DELETE is never attempted before publication.
+                // Truncated/unpublished files cannot be treated as intents.
+                if !entry.file_type()?.is_file() {
+                    return Err(Error::InvalidPath(format!(
+                        "unsafe destroy temp {:?}",
+                        entry.path()
+                    )));
+                }
+                std::fs::remove_file(entry.path())?;
+                sync_directory(&root)?;
+                continue;
+            }
+            if key.len() % 2 != 0 || key.is_empty() || !key.is_ascii() {
+                return Err(Error::InvalidPath(format!(
+                    "invalid destroy intent {:?}",
+                    entry.path()
+                )));
+            }
+            let bytes = (0..key.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&key[i..i + 2], 16))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    Error::InvalidPath(format!("invalid destroy intent {:?}", entry.path()))
+                })?;
+            let namespace = NamespaceName::from_bytes(bytes.into())?;
+            if key != Self::destroy_key(&namespace) || !entry.file_type()?.is_file() {
+                return Err(Error::InvalidPath(format!(
+                    "invalid destroy intent {:?}",
+                    entry.path()
+                )));
+            }
+            let record = std::fs::read_to_string(entry.path())?;
+            let expected = if record == "destroy none\n" {
+                None
+            } else {
+                let parts = record.trim_end_matches('\n').split(' ').collect::<Vec<_>>();
+                if parts.len() != 3 || parts[0] != "destroy" || !record.ends_with('\n') {
+                    return Err(Error::InvalidPath(format!(
+                        "invalid destroy intent {:?}",
+                        entry.path()
+                    )));
+                }
+                Some((
+                    parts[1]
+                        .parse::<u64>()
+                        .map_err(|_| Error::InvalidPath("invalid destroy identity".into()))?,
+                    parts[2]
+                        .parse::<u64>()
+                        .map_err(|_| Error::InvalidPath("invalid destroy identity".into()))?,
+                ))
+            };
+            let quarantine = self.destroy_quarantine_path(&namespace);
+            if self.inner.metadata.exists(&namespace).await {
+                // Commit did not happen. Do not discard the old database or
+                // allow a missing directory to be lazily replaced with a blank one.
+                if std::fs::symlink_metadata(&quarantine).is_ok()
+                    || self.cleanup_directory_identity(&namespace).await? != expected
+                    || expected.is_none()
+                {
+                    // In particular, never let the live row reopen a blank
+                    // directory if the original files went missing.
+                    return Err(Error::InvalidPath(format!(
+                        "incomplete destroy of `{namespace}` requires repair"
+                    )));
+                }
+                self.check_existing_directory(&namespace).await?;
+            } else {
+                let actual = self.cleanup_directory_identity(&namespace).await?;
+                if actual.is_some() {
+                    if actual != expected {
+                        return Err(Error::InvalidPath(format!(
+                            "destroy of `{namespace}` found a replaced directory"
+                        )));
+                    }
+                    let (detached, _) = self
+                        .detach_owned_directory(
+                            &namespace,
+                            expected,
+                            false,
+                            Some(quarantine.clone()),
+                        )
+                        .await?;
+                    Self::remove_detached_directory(detached).await?;
+                    sync_directory(quarantine.parent().unwrap())?;
+                } else if std::fs::symlink_metadata(&quarantine).is_ok() {
+                    let metadata = std::fs::symlink_metadata(&quarantine)?;
+                    if directory_identity(&metadata) != expected {
+                        return Err(Error::InvalidPath(format!(
+                            "replaced destroy quarantine {:?}",
+                            quarantine
+                        )));
+                    }
+                    Self::remove_detached_directory(Some(quarantine.clone())).await?;
+                    sync_directory(quarantine.parent().unwrap())?;
+                }
+            }
+            self.clear_destroy_intent(&namespace)?;
+        }
+        Ok(())
     }
 
     // Lookup by path alone is insufficient on case-insensitive/normalizing
@@ -1303,6 +2853,7 @@ impl NamespaceStore {
         namespace: &NamespaceName,
     ) -> crate::Result<DirectoryReservation> {
         tokio::fs::create_dir_all(&self.inner.dbs_path).await?;
+        self.check_no_destroy_intent(namespace)?;
         let path = self.directory_path(namespace);
         match tokio::fs::create_dir(&path).await {
             Ok(()) => {
@@ -1330,13 +2881,13 @@ impl NamespaceStore {
         // Also serialize restoration of a missing persisted directory with
         // deletion of a legacy filesystem alias, which may have another key.
         let _identity = self.inner.fs_operations.lock().await;
+        // The exact-name scan rejects aliases and symlinks. No store operation
+        // can replace the entry before mkdir while this lock is held; another
+        // scan on AlreadyExists would repeat the same directory traversal.
         self.check_existing_directory(namespace).await?;
         match self.reserve_directory(namespace).await {
             Ok(reservation) => Ok(Some(reservation)),
-            Err(Error::NamespaceAlreadyExist(_)) => {
-                self.check_existing_directory(namespace).await?;
-                Ok(None)
-            }
+            Err(Error::NamespaceAlreadyExist(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1393,6 +2944,9 @@ impl NamespaceStore {
         }
         let quarantine = quarantine_root.join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir(&quarantine)?;
+        // Count the newly retained directory before any fallible read/rename:
+        // partial moves and an empty quarantine still require inspection.
+        NAMESPACE_QUARANTINE_COUNT.increment(1);
         let entries = std::fs::read_dir(&path)?
             .map(|entry| entry.map(|entry| (entry.path(), entry.file_name())))
             .collect::<std::io::Result<Vec<_>>>()?;
@@ -1436,6 +2990,7 @@ impl NamespaceStore {
         namespace: &NamespaceName,
         expected: Option<(u64, u64)>,
         replace: bool,
+        destroy_target: Option<PathBuf>,
     ) -> crate::Result<(Option<PathBuf>, Option<DirectoryReservation>)> {
         let _identity = self.inner.fs_operations.lock().await;
         self.check_existing_directory(namespace).await?;
@@ -1450,6 +3005,7 @@ impl NamespaceStore {
                 "namespace `{namespace}` directory changed during cleanup; refusing to remove it"
             )));
         }
+        let durable_destroy = destroy_target.is_some();
         let detached = if actual.is_some() {
             let root = self
                 .inner
@@ -1465,8 +3021,19 @@ impl NamespaceStore {
                     root
                 )));
             }
-            let target = root.join(uuid::Uuid::new_v4().to_string());
+            let target =
+                destroy_target.unwrap_or_else(|| root.join(uuid::Uuid::new_v4().to_string()));
+            if std::fs::symlink_metadata(&target).is_ok() {
+                return Err(Error::InvalidPath(format!(
+                    "namespace teardown target already exists: {:?}",
+                    target
+                )));
+            }
             std::fs::rename(&path, &target)?;
+            if durable_destroy {
+                sync_directory(&self.inner.dbs_path)?;
+                sync_directory(&root)?;
+            }
             Some(target)
         } else {
             None
@@ -1503,7 +3070,7 @@ impl NamespaceStore {
 
     async fn remove_detached_directory(path: Option<PathBuf>) -> crate::Result<()> {
         if let Some(path) = path {
-            tokio::fs::remove_dir_all(path).await?;
+            tokio::fs::remove_dir_all(&path).await?;
         }
         Ok(())
     }
@@ -1563,18 +3130,79 @@ impl NamespaceStore {
                     "namespace `{namespace}` directory changed before confirmed teardown"
                 )));
             }
+            // Persist the intent before the database transaction. Recovery
+            // rolls it back if the row survived, and finishes teardown if not.
+            tokio::task::spawn_blocking({
+                let store = store.clone();
+                let name = namespace.clone();
+                move || store.persist_destroy_intent(&name, expected)
+            })
+            .await??;
             let metadata = store.inner.metadata.clone();
             let name = namespace.clone();
-            tokio::task::spawn_blocking(move || {
+            let removed = tokio::task::spawn_blocking(move || {
                 metadata
                     .remove_if_generation(name.clone(), Some(&generation))?
                     .ok_or_else(|| Error::NamespaceDoesntExist(name.to_string()))
             })
-            .await??;
+            .await?;
+            if let Err(e) = removed {
+                // A commit error can be ambiguous. The in-memory watch map
+                // may still contain a row that SQLite has already deleted.
+                // Check the committed SQL state before discarding the intent;
+                // on any uncertainty leave it to startup reconciliation.
+                let persisted = tokio::task::spawn_blocking({
+                    let metadata = store.inner.metadata.clone();
+                    let name = namespace.clone();
+                    move || metadata.persisted_namespace_exists(&name)
+                })
+                .await;
+                match persisted {
+                    Ok(Ok(true))
+                        if expected.is_some()
+                            && store.cleanup_directory_identity(&namespace).await? == expected =>
+                    {
+                        tokio::task::spawn_blocking({
+                            let store = store.clone();
+                            let name = namespace.clone();
+                            move || store.clear_destroy_intent(&name)
+                        })
+                        .await??;
+                    }
+                    Ok(Err(ref check_error)) => tracing::warn!(
+                        "retaining destroy intent after failed persisted-row check: {check_error}"
+                    ),
+                    Err(ref check_error) => tracing::warn!(
+                        "retaining destroy intent after failed persisted-row worker: {check_error}"
+                    ),
+                    _ => {}
+                }
+                return Err(e);
+            }
             let (detached, _) = store
-                .detach_owned_directory(&namespace, expected, false)
+                .detach_owned_directory(
+                    &namespace,
+                    expected,
+                    false,
+                    Some(store.destroy_quarantine_path(&namespace)),
+                )
                 .await?;
             Self::remove_detached_directory(detached).await?;
+            // Durable completion of quarantine removal precedes clearing the
+            // intent, so restart cannot lose the record for stranded files.
+            let quarantine_root = store.destroy_quarantine_path(&namespace);
+            if expected.is_some() {
+                tokio::task::spawn_blocking(move || {
+                    sync_directory(quarantine_root.parent().unwrap())
+                })
+                .await??;
+            }
+            tokio::task::spawn_blocking({
+                let store = store.clone();
+                let name = namespace.clone();
+                move || store.clear_destroy_intent(&name)
+            })
+            .await??;
             tracing::info!("destroyed namespace: {namespace}");
             Ok(())
         });
@@ -1597,18 +3225,54 @@ impl NamespaceStore {
         Ok(())
     }
 
+    async fn release_unpublished_reset_pin(&self, namespace: &NamespaceName) {
+        // A sync failure after atomic publication leaves the valid final
+        // intent in place; keep the pin and fail closed. A failed temp write
+        // left no intent and must not constrain ordinary future updates.
+        if matches!(std::fs::symlink_metadata(self.reset_intent_path(namespace)),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            let metadata = self.inner.metadata.clone();
+            let name = namespace.clone();
+            let _ = tokio::task::spawn_blocking(move || metadata.release_reset_pin(&name)).await;
+        }
+    }
+
     pub async fn reset(
         &self,
         namespace: NamespaceName,
         restore_option: RestoreOption,
     ) -> anyhow::Result<()> {
-        let _name_operation = self.lock_names(&[namespace.clone()]).await?;
-        let expected = self.cleanup_directory_identity(&namespace).await?;
-        // The process for resetting is as follows:
-        // - get a lock on the namespace entry, if the entry exists, then it's a lock on the entry,
-        // if it doesn't exist, insert an empty entry and take a lock on it
-        // - destroy the old namespace
-        // - create a new namespace and insert it in the held lock
+        let operation = self.lock_names(&[namespace.clone()]).await?;
+        // The task owns the name lock before the request can be cancelled.
+        // Never cancel setup after detaching the old inode: blocking/path-open
+        // work can survive cancellation and corrupt a live rollback by name.
+        let store = self.clone();
+        tokio::spawn(async move {
+            store
+                .reset_owned(namespace, restore_option, operation)
+                .await
+        })
+        .await?
+    }
+
+    async fn reset_owned(
+        &self,
+        namespace: NamespaceName,
+        restore_option: RestoreOption,
+        _operation: Vec<OwnedMutexGuard<()>>,
+    ) -> anyhow::Result<()> {
+        if !self.inner.metadata.exists(&namespace).await {
+            return Err(Error::NamespaceDoesntExist(namespace.to_string()).into());
+        }
+        let old_identity = self
+            .cleanup_directory_identity(&namespace)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidPath(format!(
+                    "reset of `{namespace}` needs an existing directory"
+                ))
+            })?;
         let entry = self
             .inner
             .store
@@ -1618,37 +3282,158 @@ impl NamespaceStore {
         if let Some(ns) = lock.take() {
             ns.destroy().await?;
         }
-
-        let db_config = self.inner.metadata.handle(namespace.clone()).await;
-        // Confirm remote backups before detaching the old local inode.
-        self.prepare_cleanup(
-            &namespace,
-            &db_config.get(),
-            false,
-            NamespaceBottomlessDbIdInit::FetchFromConfig,
-        )
-        .await?;
-        let (detached, reservation) = self
-            .detach_owned_directory(&namespace, expected, true)
-            .await?;
-        let mut reservation = reservation.expect("reset reserves a replacement directory");
-        Self::remove_detached_directory(detached).await?;
-        // Reset keeps the same stored row but owns a new on-disk incarnation.
-        // Old handles/handshakes must not overwrite its config after reset.
-        self.inner.metadata.activate_for_create(&namespace);
-        let db_config = self.inner.metadata.handle(namespace.clone()).await;
-        // Replica handshake may load an uncached shared schema. Never retain
-        // the global identity lock over setup or a callback into this store.
-        let mut shutdown = self.inner.shutdown_signal.subscribe();
-        let ns = tokio::select! {
-            biased;
-            _ = shutdown.wait_for(|requested| *requested) => return Err(Error::NamespaceStoreShutdown.into()),
-            result = self.make_namespace(&namespace, db_config, restore_option) => result?,
+        // Revoke old handles and pin the original schema membership while
+        // taking the SQL snapshot. A pending reset cannot switch schemas:
+        // shared_schema_links is also the migration task worklist.
+        let pinned = tokio::task::spawn_blocking({
+            let metadata = self.inner.metadata.clone();
+            let name = namespace.clone();
+            move || metadata.pin_reset_and_snapshot(&name)
+        })
+        .await;
+        let old_config = match pinned {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(e) => {
+                self.release_unpublished_reset_pin(&namespace).await;
+                return Err(e.into());
+            }
         };
-
-        lock.replace(ns);
+        // Registration takes the exclusive schema lock. Hold this shared
+        // guard across the worker; after an error the journal fences future
+        // registrations without starving the migration scheduler.
+        // Use the exact committed snapshot, never the watch (which can lag a
+        // SQL commit between the config worker's DB and watch updates).
+        let old_schema = MetaStore::reset_snapshot_schema_lock(&namespace, &old_config)?;
+        let _schema_guard = if let Some(schema) = old_schema {
+            let guard = self.inner.schema_locks.acquire_shared(schema.clone()).await;
+            let pending = tokio::task::spawn_blocking({
+                let metadata = self.inner.metadata.clone();
+                let schema = schema.clone();
+                move || metadata.schema_has_pending_jobs(&schema)
+            })
+            .await;
+            match pending {
+                Ok(Ok(true)) => {
+                    self.release_unpublished_reset_pin(&namespace).await;
+                    return Err(Error::PendingMigrationOnSchema(schema).into());
+                }
+                Ok(Ok(false)) => Some(guard),
+                Ok(Err(e)) => {
+                    self.release_unpublished_reset_pin(&namespace).await;
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    self.release_unpublished_reset_pin(&namespace).await;
+                    return Err(e.into());
+                }
+            }
+        } else {
+            None
+        };
+        // Backup confirmation must use the same persisted config that will
+        // be journaled; a lagging watch can have different backup/schema IDs.
+        let pinned_config = self.inner.metadata.handle(namespace.clone()).await.get();
+        if let Err(e) = self
+            .prepare_cleanup(
+                &namespace,
+                &pinned_config,
+                false,
+                NamespaceBottomlessDbIdInit::FetchFromConfig,
+            )
+            .await
+        {
+            self.release_unpublished_reset_pin(&namespace).await;
+            return Err(e.into());
+        }
+        let intent = ResetIntent {
+            old_identity,
+            old_config,
+        };
+        let bytes = match serde_json::to_vec(&intent) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.release_unpublished_reset_pin(&namespace).await;
+                return Err(e.into());
+            }
+        };
+        let published = tokio::task::spawn_blocking({
+            let store = self.clone();
+            let name = namespace.clone();
+            move || store.publish_reset_file(&store.reset_intent_path(&name), &bytes)
+        })
+        .await;
+        match published {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.release_unpublished_reset_pin(&namespace).await;
+                return Err(e.into());
+            }
+            Err(e) => {
+                self.release_unpublished_reset_pin(&namespace).await;
+                return Err(e.into());
+            }
+        }
+        let (old, reservation) = self
+            .detach_owned_directory(
+                &namespace,
+                Some(old_identity),
+                true,
+                Some(self.reset_quarantine_path(&namespace)),
+            )
+            .await?;
+        let mut reservation = reservation.expect("reset reserves replacement directory");
+        let fresh = self.inner.metadata.handle(namespace.clone()).await;
+        let ns = match self.make_namespace(&namespace, fresh, restore_option).await {
+            Ok(ns) => ns,
+            Err(e) => {
+                // No live rollback: an already queued path-open/blocking setup
+                // write could target the old inode after rename-back. Leave the
+                // intent and old data fenced until all workers die on restart.
+                tracing::error!(
+                    "reset setup failed for `{namespace}`; old data retained until restart: {e}"
+                );
+                NAMESPACE_QUARANTINE_COUNT.increment(1);
+                reservation.disarm();
+                return Err(e.into());
+            }
+        };
+        // Committing the marker chooses the new incarnation on restart. The
+        // original cannot be deleted before this publication is durable.
+        let new_identity = reservation.identity.ok_or_else(|| {
+            Error::InvalidPath(format!(
+                "reset of `{namespace}` has no new directory identity"
+            ))
+        })?;
+        if self.cleanup_directory_identity(&namespace).await? != Some(new_identity) {
+            return Err(Error::InvalidPath(format!(
+                "reset of `{namespace}` replaced its new directory"
+            ))
+            .into());
+        }
+        tokio::task::spawn_blocking({
+            let store = self.clone();
+            let name = namespace.clone();
+            let marker = format!("committed {} {}\n", new_identity.0, new_identity.1);
+            move || store.publish_reset_file(&store.reset_committed_path(&name), marker.as_bytes())
+        })
+        .await??;
         reservation.disarm();
-
+        lock.replace(ns);
+        tokio::task::spawn_blocking({
+            let metadata = self.inner.metadata.clone();
+            let name = namespace.clone();
+            move || metadata.release_reset_pin(&name)
+        })
+        .await?;
+        Self::remove_detached_directory(old).await?;
+        let root = self.reset_quarantine_path(&namespace);
+        tokio::task::spawn_blocking(move || sync_directory(root.parent().unwrap())).await??;
+        tokio::task::spawn_blocking({
+            let store = self.clone();
+            move || store.clear_reset_intent(&namespace)
+        })
+        .await??;
         Ok(())
     }
 
@@ -2203,6 +3988,54 @@ impl NamespaceStore {
 
     pub(crate) fn schema_locks(&self) -> &SchemaLocksRegistry {
         &self.inner.schema_locks
+    }
+
+    /// Called under the scheduler's exclusive schema lock before registration.
+    /// An in-progress reset holds the shared lock; a failed reset leaves an
+    /// intent that prevents enqueuing a task targeting its fenced namespace.
+    pub(crate) async fn ensure_schema_has_no_pending_resets(
+        &self,
+        schema: &NamespaceName,
+    ) -> crate::Result<()> {
+        // Also fence reset of the schema namespace itself, not just tenants
+        // linked to it. The caller holds this schema's exclusive lock.
+        for path in [
+            self.reset_intent_path(schema),
+            self.reset_committed_path(schema),
+        ] {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    return Err(Error::InvalidPath(format!(
+                        "migration on `{schema}` blocked by its own pending reset"
+                    )))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let namespaces = tokio::task::spawn_blocking({
+            let metadata = self.inner.metadata.clone();
+            let schema = schema.clone();
+            move || metadata.linked_namespaces(&schema)
+        })
+        .await??;
+        for namespace in namespaces {
+            for path in [
+                self.reset_intent_path(&namespace),
+                self.reset_committed_path(&namespace),
+            ] {
+                match std::fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        return Err(Error::InvalidPath(format!(
+                            "migration on `{schema}` blocked by pending reset of `{namespace}`"
+                        )))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn get_configurator(&self, db_config: &DatabaseConfig) -> &DynConfigurator {
