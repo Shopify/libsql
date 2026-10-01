@@ -477,6 +477,9 @@ fn replica_reset_loads_uncached_shared_schema_without_identity_lock_deadlock() {
                 .connect()?
                 .execute("insert into test values (19)", ())
                 .await?;
+            // The replica has no schema scheduler `jobs` table. This real
+            // linked-tenant reset also guards against querying that primary-
+            // only table during the replica reset preflight.
             // Recreating the primary is not a deterministic trigger for a
             // cached replica's existing long-lived frame stream. Ask the
             // replica host itself to run the real NamespaceStore::reset.

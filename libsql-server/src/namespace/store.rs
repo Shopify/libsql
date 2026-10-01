@@ -1079,6 +1079,58 @@ mod directory_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn replica_linked_reset_preflight_skips_missing_scheduler_jobs_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (maker, wal) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let metadata = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            maker().unwrap(),
+            wal,
+            DatabaseKind::Replica,
+        )
+        .await
+        .unwrap();
+        let schema = NamespaceName::from("schema");
+        metadata
+            .handle(schema.clone())
+            .await
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        let mut linked = DatabaseConfig::default();
+        linked.shared_schema_name = Some(schema.clone());
+        metadata
+            .handle(NamespaceName::from("tenant"))
+            .await
+            .store(linked)
+            .await
+            .unwrap();
+        // A replica has neither scheduler nor jobs table. The old unguarded
+        // preflight returned a SQLite "no such table: jobs" error here.
+        let missing = tokio::task::spawn_blocking({
+            let metadata = metadata.clone();
+            let schema = schema.clone();
+            move || metadata.schema_has_pending_jobs(&schema)
+        })
+        .await
+        .unwrap();
+        assert!(missing.is_err());
+        let store = NamespaceStore::new(
+            false,
+            false,
+            10,
+            metadata,
+            NamespaceConfigurators::empty(),
+            DatabaseKind::Replica,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        assert!(!store.reset_migration_job_check(&schema).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn reset_refuses_pending_schema_migration_before_detaching_old_data() {
         let (_tmp, store) = primary_fixture().await;
         let name = NamespaceName::from("tenant");
@@ -3256,6 +3308,21 @@ impl NamespaceStore {
         .await?
     }
 
+    async fn reset_migration_job_check(&self, schema: &NamespaceName) -> anyhow::Result<bool> {
+        // Only primaries run the migration scheduler/create its jobs table.
+        // Replicas still take the shared schema lock and retain the reset
+        // intent, but must not query a table that does not exist locally.
+        if !self.inner.db_kind.is_primary() {
+            return Ok(false);
+        }
+        let metadata = self.inner.metadata.clone();
+        let schema = schema.clone();
+        Ok(
+            tokio::task::spawn_blocking(move || metadata.schema_has_pending_jobs(&schema))
+                .await??,
+        )
+    }
+
     async fn reset_owned(
         &self,
         namespace: NamespaceName,
@@ -3307,25 +3374,15 @@ impl NamespaceStore {
         let old_schema = MetaStore::reset_snapshot_schema_lock(&namespace, &old_config)?;
         let _schema_guard = if let Some(schema) = old_schema {
             let guard = self.inner.schema_locks.acquire_shared(schema.clone()).await;
-            let pending = tokio::task::spawn_blocking({
-                let metadata = self.inner.metadata.clone();
-                let schema = schema.clone();
-                move || metadata.schema_has_pending_jobs(&schema)
-            })
-            .await;
-            match pending {
-                Ok(Ok(true)) => {
+            match self.reset_migration_job_check(&schema).await {
+                Ok(true) => {
                     self.release_unpublished_reset_pin(&namespace).await;
                     return Err(Error::PendingMigrationOnSchema(schema).into());
                 }
-                Ok(Ok(false)) => Some(guard),
-                Ok(Err(e)) => {
-                    self.release_unpublished_reset_pin(&namespace).await;
-                    return Err(e.into());
-                }
+                Ok(false) => Some(guard),
                 Err(e) => {
                     self.release_unpublished_reset_pin(&namespace).await;
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         } else {
