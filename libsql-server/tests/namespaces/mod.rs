@@ -1,7 +1,10 @@
 #![allow(deprecated)]
 
+mod availability;
+mod default_create;
 mod dumps;
 mod meta;
+mod ownership;
 mod shared_schema;
 
 use std::path::PathBuf;
@@ -16,6 +19,15 @@ use tempfile::tempdir;
 use turmoil::{Builder, Sim};
 
 fn make_primary(sim: &mut Sim, path: PathBuf) {
+    make_primary_configured(sim, path, false, true);
+}
+
+fn make_primary_configured(
+    sim: &mut Sim,
+    path: PathBuf,
+    disable_namespaces: bool,
+    disable_default_namespace: bool,
+) {
     init_tracing();
     sim.host("primary", move || {
         let path = path.clone();
@@ -35,8 +47,8 @@ fn make_primary(sim: &mut Sim, path: PathBuf) {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
                     tls_config: None,
                 }),
-                disable_namespaces: false,
-                disable_default_namespace: true,
+                disable_namespaces,
+                disable_default_namespace,
                 ..Default::default()
             };
 
@@ -106,22 +118,25 @@ fn fork_namespace() {
 }
 
 #[test]
-fn admin_rejects_namespace_path_traversal_without_touching_outside_files() {
+fn admin_rejects_namespace_path_traversal() {
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(1000))
         .build();
     let tmp = tempdir().unwrap();
     make_primary(&mut sim, tmp.path().to_path_buf());
 
+    // These paths are outside dbs/<namespace>. In particular, deleting `..`
+    // must never recursively delete dbs and its other namespaces.
     let outside = tmp.path().join("outside");
     std::fs::create_dir(&outside).unwrap();
     std::fs::write(outside.join("sentinel"), b"keep me").unwrap();
     let dbs = tmp.path().join("dbs");
+    let client_dbs = dbs.clone();
+    // Form encoding uses `+` for spaces, but path parameters require `%20`.
     let absolute_victim =
         url::form_urlencoded::byte_serialize(outside.to_str().unwrap().as_bytes())
             .collect::<String>()
             .replace('+', "%20");
-    let dbs_for_client = dbs.clone();
 
     sim.client("client", async move {
         let client = Client::new();
@@ -133,54 +148,40 @@ fn admin_rejects_namespace_path_traversal_without_touching_outside_files() {
             .await?
             .status()
             .is_success());
-        std::fs::create_dir_all(dbs_for_client.join("sentinel"))?;
-        std::fs::write(dbs_for_client.join("sentinel/marker"), b"keep me too")?;
+        std::fs::create_dir_all(client_dbs.join("sentinel"))?;
+        std::fs::write(client_dbs.join("sentinel/marker"), b"keep me too")?;
+
         for name in [
-            "%2e%2e".to_owned(),
-            "%2e%2e%2foutside".to_owned(),
+            "%2e%2e".to_string(),
+            "%2e%2e%2foutside".to_string(),
             absolute_victim,
-            "bad%5cname".to_owned(),
+            "bad%5cname".to_string(),
         ] {
-            assert_eq!(
-                client
-                    .post(
-                        &format!("http://primary:9090/v1/namespaces/{name}/create"),
-                        json!({})
-                    )
-                    .await?
-                    .status(),
-                hyper::StatusCode::BAD_REQUEST,
+            let create = format!("http://primary:9090/v1/namespaces/{name}/create");
+            assert!(
+                client.post(&create, json!({})).await?.status() == hyper::StatusCode::BAD_REQUEST,
                 "create {name}"
             );
-            assert_eq!(
-                client
-                    .delete(
-                        &format!("http://primary:9090/v1/namespaces/{name}"),
-                        json!({})
-                    )
-                    .await?
-                    .status(),
-                hyper::StatusCode::BAD_REQUEST,
+
+            let delete = format!("http://primary:9090/v1/namespaces/{name}");
+            assert!(
+                client.delete(&delete, json!({})).await?.status() == hyper::StatusCode::BAD_REQUEST,
                 "delete {name}"
             );
-            assert_eq!(
-                client
-                    .post(
-                        &format!("http://primary:9090/v1/namespaces/safe-1.example/fork/{name}"),
-                        ()
-                    )
-                    .await?
-                    .status(),
-                hyper::StatusCode::BAD_REQUEST,
+
+            let fork = format!("http://primary:9090/v1/namespaces/safe-1.example/fork/{name}");
+            assert!(
+                client.post(&fork, ()).await?.status() == hyper::StatusCode::BAD_REQUEST,
                 "fork {name}"
             );
         }
-        assert_eq!(
+        // Also reject traversal in the source namespace of a fork.
+        assert!(
             client
                 .post("http://primary:9090/v1/namespaces/%2e%2e/fork/target", ())
                 .await?
-                .status(),
-            hyper::StatusCode::BAD_REQUEST
+                .status()
+                == hyper::StatusCode::BAD_REQUEST
         );
         Ok(())
     });

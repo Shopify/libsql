@@ -470,7 +470,7 @@ pub(crate) async fn run_storage_monitor<M: MakeConnection>(
     }
 }
 
-pub(super) async fn cleanup_primary(
+pub(super) async fn prepare_primary_cleanup(
     base: &BaseNamespaceConfig,
     primary_config: &PrimaryConfig,
     namespace: &NamespaceName,
@@ -500,11 +500,6 @@ pub(super) async fn cleanup_primary(
             // for soft delete make sure that local db is fully backed up
             replicator.savepoint().confirmed().await?;
         }
-    }
-
-    if ns_path.try_exists()? {
-        tracing::debug!("removing database directory: {}", ns_path.display());
-        tokio::fs::remove_dir_all(ns_path).await?;
     }
 
     Ok(())

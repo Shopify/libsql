@@ -19,6 +19,7 @@ pub use self::name::NamespaceName;
 pub use self::store::NamespaceStore;
 
 pub mod broadcasters;
+mod cleanup_guard;
 pub(crate) mod configurator;
 pub mod meta_store;
 mod name;

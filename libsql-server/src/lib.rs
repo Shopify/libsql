@@ -57,7 +57,7 @@ use self::namespace::configurator::{
     BaseNamespaceConfig, NamespaceConfigurators, PrimaryConfig, PrimaryConfigurator,
     ReplicaConfigurator, SchemaConfigurator,
 };
-use self::namespace::NamespaceStore;
+pub use self::namespace::{NamespaceStore, RestoreOption};
 use self::net::AddrIncoming;
 use self::replication::script_backup_manager::{CommandHandler, ScriptBackupManager};
 use self::schema::SchedulerHandle;
@@ -139,6 +139,9 @@ pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpCo
     pub heartbeat_config: Option<HeartbeatConfig>,
     pub disable_namespaces: bool,
     pub shutdown: Arc<Notify>,
+    /// Optional in-process lifecycle hook. The caller can observe and
+    /// coordinate the namespace store on the server's runtime (e.g. tests).
+    pub namespace_store_ready: Option<tokio::sync::oneshot::Sender<NamespaceStore>>,
     pub max_active_namespaces: usize,
     pub meta_store_config: MetaStoreConfig,
     pub max_concurrent_connections: usize,
@@ -168,6 +171,7 @@ impl<C, A, D> Default for Server<C, A, D> {
             heartbeat_config: Default::default(),
             disable_namespaces: true,
             shutdown: Default::default(),
+            namespace_store_ready: None,
             max_active_namespaces: 100,
             meta_store_config: Default::default(),
             max_concurrent_connections: 128,
@@ -634,8 +638,12 @@ where
             meta_store,
             configurators,
             db_kind,
+            &self.path,
         )
         .await?;
+        if let Some(ready) = self.namespace_store_ready.take() {
+            let _ = ready.send(namespace_store.clone());
+        }
 
         self.spawn_monitoring_tasks(&mut task_manager, stats_receiver)?;
 
@@ -695,13 +703,7 @@ where
                 });
 
                 if self.disable_namespaces {
-                    namespace_store
-                        .create(
-                            NamespaceName::default(),
-                            namespace::RestoreOption::Latest,
-                            Default::default(),
-                        )
-                        .await?;
+                    namespace_store.ensure_default_namespace().await?;
                 }
 
                 let replication_svc = make_replication_svc(

@@ -37,6 +37,14 @@ pub static STREAM_HANDLES_COUNT: Lazy<Gauge> = Lazy::new(|| {
     describe_gauge!(NAME, "amount of in-memory stream handles");
     register_gauge!(NAME)
 });
+pub static NAMESPACE_QUARANTINE_COUNT: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_namespace_quarantine_total";
+    describe_counter!(
+        NAME,
+        "namespace data retained or moved to quarantine, including incomplete moves"
+    );
+    register_counter!(NAME)
+});
 pub static NAMESPACE_LOAD_LATENCY: Lazy<Histogram> = Lazy::new(|| {
     const NAME: &str = "libsql_server_namespace_load_latency";
     describe_histogram!(NAME, "latency is us when loading a namespace");

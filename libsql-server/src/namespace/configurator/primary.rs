@@ -21,7 +21,7 @@ use crate::namespace::{
 use crate::run_periodic_checkpoint;
 use crate::schema::{has_pending_migration_task, setup_migration_table};
 
-use super::helpers::cleanup_primary;
+use super::helpers::prepare_primary_cleanup;
 use super::{BaseNamespaceConfig, ConfigureNamespace, PrimaryConfig};
 
 pub struct PrimaryConfigurator {
@@ -129,36 +129,23 @@ impl ConfigureNamespace for PrimaryConfigurator {
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
         Box::pin(async move {
             let db_path: Arc<Path> = self.base.base_path.join("dbs").join(name.as_str()).into();
-            let fresh_namespace = !db_path.try_exists()?;
-            // FIXME: make that truly atomic. explore the idea of using temp directories, and it's implications
-            match self
-                .try_new_primary(
-                    name.clone(),
-                    meta_store_handle,
-                    restore_option,
-                    resolve_attach_path,
-                    db_path.clone(),
-                    broadcaster,
-                    self.base.encryption_config.clone(),
-                )
-                .await
-            {
-                Ok(this) => Ok(this),
-                Err(e) if fresh_namespace => {
-                    tracing::error!(
-                        "an error occured while deleting creating namespace, cleaning..."
-                    );
-                    if let Err(e) = tokio::fs::remove_dir_all(&db_path).await {
-                        tracing::error!("failed to remove dirty namespace directory: {e}")
-                    }
-                    Err(e)
-                }
-                Err(e) => Err(e),
-            }
+            // A failed setup must not delete by path: a concurrent alias or
+            // replacement could own it. The store's reservation/cleanup guard
+            // decides whether the directory can safely be removed.
+            self.try_new_primary(
+                name.clone(),
+                meta_store_handle,
+                restore_option,
+                resolve_attach_path,
+                db_path,
+                broadcaster,
+                self.base.encryption_config.clone(),
+            )
+            .await
         })
     }
 
-    fn cleanup<'a>(
+    fn prepare_cleanup<'a>(
         &'a self,
         namespace: &'a NamespaceName,
         db_config: &'a DatabaseConfig,
@@ -166,7 +153,7 @@ impl ConfigureNamespace for PrimaryConfigurator {
         bottomless_db_id_init: NamespaceBottomlessDbIdInit,
     ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            cleanup_primary(
+            prepare_primary_cleanup(
                 &self.base,
                 &self.primary_config,
                 namespace,
