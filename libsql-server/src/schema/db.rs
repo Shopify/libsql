@@ -58,6 +58,13 @@ pub(super) fn setup_schema(conn: &mut rusqlite::Connection) -> Result<(), Error>
         ),
         (),
     )?;
+    // Keep invalid jobs out of this scheduler's queue without changing their persisted
+    // status. After a restart they are checked again, allowing explicit repair.
+    txn.execute(
+        "CREATE TEMPORARY TABLE IF NOT EXISTS blocked_migration_jobs (job_id INTEGER PRIMARY KEY)",
+        (),
+    )?;
+
     // This temporary table hold the list of tasks that are currently being processed
     txn.execute(
         "
@@ -328,6 +335,8 @@ pub(super) fn get_next_pending_migration_job(
             "SELECT job_id, status, migration, schema
             FROM jobs
             WHERE status != ? AND status != ?
+              AND job_id NOT IN (SELECT job_id FROM blocked_migration_jobs)
+            ORDER BY job_id
             LIMIT 1",
             (
                 MigrationJobStatus::RunSuccess as u64,

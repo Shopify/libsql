@@ -24,9 +24,11 @@ invalid shared-schema names) prevent startup instead of being treated as absent
 or allowing their rows to be overwritten; this holds even
 with `--meta-store-destroy-on-error`. Filesystem recovery skips invalid and
 symlinked directory entries without deleting them. An invalid persisted
-migration job/task stops its scheduler without marking that work complete.
-Back up and inspect
-metastore and namespace files before repairing these entries explicitly.
+migration job/task is left unfinished and isolated in the scheduler: unrelated
+schema migrations continue, but the affected schema cannot accept another
+migration until its job is repaired. On restart, the scheduler checks the row
+again. Back up and inspect metastore and namespace files before repairing
+these entries explicitly.
 
 This validation prevents path traversal *through a namespace string*. It does
 not establish ownership of existing directories or protect against symlinks,
