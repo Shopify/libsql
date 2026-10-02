@@ -252,6 +252,8 @@ mod tests {
 
     const IDLE: Duration = Duration::from_millis(50);
     const PAST_IDLE: Duration = Duration::from_millis(150);
+    /// Samples recorded per production histogram after its eviction.
+    const BURST: u64 = 10;
 
     /// `metrics` 0.21 only has a process-global recorder, installable once; every test in this
     /// module shares it. Mirrors the production configuration (same builder, same mask, global
@@ -269,7 +271,8 @@ mod tests {
     /// The tests in this module run serially. Two concurrent `render()` calls race inside the
     /// exporter (one render can re-insert the recency entry of a key the other has just evicted,
     /// recreating a distribution nobody visits again), which would make eviction assertions flaky.
-    /// Production has a single scraper per pod; other unit tests only record, never render.
+    /// Other unit tests only record, never render; production render concurrency is a separate
+    /// exporter limitation.
     static SERIAL: Mutex<()> = Mutex::new(());
 
     fn setup() -> (MutexGuard<'static, ()>, &'static PrometheusHandle) {
@@ -378,22 +381,35 @@ mod tests {
 
             evict(handle, name, 20);
 
-            record();
-            record();
-            let rendered = handle.render();
-            let after = count_of(&rendered, name)
+            // Re-registration: samples recorded after the eviction are rendered again.
+            for _ in 0..BURST {
+                record();
+            }
+            let after = count_of(&handle.render(), name)
                 .unwrap_or_else(|| panic!("{name} did not reappear after idle eviction"));
             assert!(
-                after >= 2,
-                "{name}: expected >= 2 samples after re-registration, got {after}"
+                after >= BURST,
+                "{name}: expected >= {BURST} samples after re-registration, got {after}"
             );
-            // Drained: a further sample advances the count by at least what we recorded (not
-            // exactly, because other unit tests may record the production metric concurrently).
+
+            // Drain: an immediate render with no new samples from this test must not count the
+            // burst again. If the bucket were not cleared, re-reading it would add >= BURST.
+            // (Exact equality is not asserted because other unit tests in this process may
+            // record the same production metric concurrently; they cannot plausibly add BURST
+            // samples between two back-to-back renders. The exact-count drain check for the
+            // macro path is `cached_histogram_handle_is_orphaned_..._macro_path_recovers`.)
+            let idle = count_of(&handle.render(), name).unwrap();
+            assert!(
+                idle - after < BURST,
+                "{name}: samples were re-counted on an idle render ({after} -> {idle}): not drained"
+            );
+
+            // Continued recording: one more sample still lands in the registered bucket.
             record();
             let next = count_of(&handle.render(), name).unwrap();
             assert!(
-                next > after,
-                "{name}: count did not advance ({after} -> {next})"
+                next > idle,
+                "{name}: count did not advance ({idle} -> {next})"
             );
         }
     }
