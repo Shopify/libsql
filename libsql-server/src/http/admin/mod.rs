@@ -59,6 +59,15 @@ impl<C> FromRef<Arc<AppState<C>>> for Metrics {
 
 static PROM_HANDLE: Mutex<OnceCell<PrometheusHandle>> = Mutex::new(OnceCell::new());
 
+/// Prometheus recorder configuration shared by the admin server and the metrics tests.
+///
+/// Idle metrics (any kind) are evicted `idle_timeout` after their last update. Histograms are
+/// therefore recorded through the `metrics` macros (see `crate::metrics`), never through cached
+/// handles, so that an evicted histogram is re-registered on its next sample instead of leaking.
+pub(crate) fn prometheus_builder(idle_timeout: Duration) -> PrometheusBuilder {
+    PrometheusBuilder::new().idle_timeout(metrics_util::MetricKindMask::ALL, Some(idle_timeout))
+}
+
 pub async fn run<A, C>(
     acceptor: A,
     user_http_server: Arc<hrana::http::Server>,
@@ -80,19 +89,18 @@ where
         let lock = PROM_HANDLE.lock();
         let prom_handle = lock.get_or_init(|| {
             tracing::info!("initializing prometheus metrics");
-            let b = PrometheusBuilder::new().idle_timeout(
-                metrics_util::MetricKindMask::ALL,
-                Some(Duration::from_secs(120)),
-            );
+            let b = prometheus_builder(Duration::from_secs(120));
 
-            if let Some(app_label) = app_label {
+            let handle = if let Some(app_label) = app_label {
                 b.add_global_label("app", app_label)
                     .add_global_label("version", ver)
                     .install_recorder()
                     .unwrap()
             } else {
                 b.install_recorder().unwrap()
-            }
+            };
+            crate::metrics::describe_histograms();
+            handle
         });
 
         tokio::task::spawn(async move {
