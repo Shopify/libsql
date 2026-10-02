@@ -81,11 +81,15 @@ impl Scheduler {
                     tracing::info!("all scheduler handles dropped: exiting.");
                     break;
                 }
-                Err(e @ Error::InvalidPersistedNamespace { .. }) => {
+                Err(
+                    e @ (Error::InvalidPersistedNamespace { .. }
+                    | Error::InvalidPersistedMigration { .. }),
+                ) => {
                     let job_id = match &e {
                         Error::InvalidPersistedNamespace {
                             kind: "job", id, ..
                         } => *id,
+                        Error::InvalidPersistedMigration { job_id, .. } => *job_id,
                         Error::InvalidPersistedNamespace { kind: "task", .. } => self
                             .current_job
                             .as_ref()
@@ -969,7 +973,14 @@ mod test {
         assert!(!block_write.load(std::sync::atomic::Ordering::Relaxed));
     }
 
-    async fn assert_invalid_job_is_isolated(invalid_task: bool) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InvalidJobRow {
+        SchemaName,
+        TaskName,
+        MigrationProgram,
+    }
+
+    async fn assert_invalid_job_is_isolated(invalid_row: InvalidJobRow) {
         let tmp = tempdir().unwrap();
         let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
         let meta_store = MetaStore::new(
@@ -1018,7 +1029,7 @@ mod test {
             )
             .await
             .unwrap();
-        if invalid_task {
+        if invalid_row != InvalidJobRow::SchemaName {
             store
                 .create(
                     "bad-task-schema".into(),
@@ -1036,15 +1047,18 @@ mod test {
         let healthy_job_id;
         {
             let mut conn = scheduler.migration_db.lock();
-            let migration =
-                serde_json::to_string(&Program::seq(&["CREATE TABLE example (id)"])).unwrap();
+            let migration = if invalid_row == InvalidJobRow::MigrationProgram {
+                "not json".to_owned()
+            } else {
+                serde_json::to_string(&Program::seq(&["CREATE TABLE example (id)"])).unwrap()
+            };
             conn.execute(
                 "INSERT INTO jobs (schema, migration, status) VALUES (?1, ?2, ?3)",
                 (
-                    if invalid_task {
-                        "bad-task-schema"
-                    } else {
+                    if invalid_row == InvalidJobRow::SchemaName {
                         "../bad-schema"
+                    } else {
+                        "bad-task-schema"
                     },
                     &migration,
                     MigrationJobStatus::WaitingDryRun as u64,
@@ -1052,7 +1066,7 @@ mod test {
             )
             .unwrap();
             bad_job_id = conn.last_insert_rowid();
-            if invalid_task {
+            if invalid_row == InvalidJobRow::TaskName {
                 conn.execute(
                     "INSERT INTO pending_tasks (job_id, target_namespace, status) VALUES (?1, '../bad-target', ?2)",
                     (bad_job_id, MigrationTaskStatus::Enqueued as u64),
@@ -1094,7 +1108,7 @@ mod test {
             )
             .unwrap();
         assert_eq!(bad_status, MigrationJobStatus::WaitingDryRun as u64);
-        if invalid_task {
+        if invalid_row == InvalidJobRow::TaskName {
             let target: String = conn
                 .query_row(
                     "SELECT target_namespace FROM pending_tasks WHERE job_id = ?",
@@ -1103,6 +1117,8 @@ mod test {
                 )
                 .unwrap();
             assert_eq!(target, "../bad-target");
+        }
+        if invalid_row != InvalidJobRow::SchemaName {
             assert!(matches!(
                 handle
                     .register_migration_task(
@@ -1118,12 +1134,17 @@ mod test {
 
     #[tokio::test]
     async fn invalid_persisted_job_does_not_stop_independent_migrations() {
-        assert_invalid_job_is_isolated(false).await;
+        assert_invalid_job_is_isolated(InvalidJobRow::SchemaName).await;
     }
 
     #[tokio::test]
     async fn invalid_persisted_task_does_not_stop_independent_migrations() {
-        assert_invalid_job_is_isolated(true).await;
+        assert_invalid_job_is_isolated(InvalidJobRow::TaskName).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_program_does_not_stop_independent_migrations() {
+        assert_invalid_job_is_isolated(InvalidJobRow::MigrationProgram).await;
     }
 
     fn make_config(migration_scheduler: SchedulerHandle, path: &Path) -> NamespaceConfigurators {

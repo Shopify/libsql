@@ -360,8 +360,16 @@ pub(super) fn get_next_pending_migration_job(
                 name,
             }
         })?;
-        let mut migration = serde_json::from_str(&migration).unwrap();
-        let disable_foreign_key = validate_migration(&mut migration).unwrap();
+        let mut migration =
+            serde_json::from_str(&migration).map_err(|e| Error::InvalidPersistedMigration {
+                job_id,
+                reason: e.to_string(),
+            })?;
+        let disable_foreign_key =
+            validate_migration(&mut migration).map_err(|e| Error::InvalidPersistedMigration {
+                job_id,
+                reason: e.to_string(),
+            })?;
         Some(MigrationJob {
             schema,
             job_id,

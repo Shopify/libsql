@@ -191,8 +191,8 @@ fn parse_snapshot_path(path: PathBuf) -> Result<SnapshotEntry> {
         return Err(Error::InvalidSnapshotPath(path.clone()));
     };
 
-    // we reverse split because the namespace name is allowed any char
-    let mut split = name.rsplit(":");
+    // Split only the two suffix separators: a Unix namespace may contain ':'.
+    let mut split = name.rsplitn(3, ':');
     let Some(range) = split.next() else {
         return Err(Error::InvalidSnapshotPath(path.clone()));
     };
@@ -309,6 +309,15 @@ mod test {
             parse_snapshot_path(path),
             Err(Error::InvalidSnapshotPath(_))
         ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn snapshot_namespace_with_colon_round_trips() {
+        let namespace = NamespaceName::from_string("tenant:1:archive".into()).unwrap();
+        let path = make_snapshot_path("/test", &namespace, 1, 2, Uuid::nil());
+        let entry = parse_snapshot_path(path).unwrap();
+        assert_eq!(entry.namespace, namespace);
     }
 
     proptest! {
