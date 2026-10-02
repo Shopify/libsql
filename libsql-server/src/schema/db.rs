@@ -110,6 +110,23 @@ pub(crate) fn schema_has_linked_dbs(
     Ok(has_linked)
 }
 
+/// The namespaces linked to `schema`.
+pub(crate) fn linked_namespaces(
+    conn: &rusqlite::Connection,
+    schema: &NamespaceName,
+) -> Result<Vec<NamespaceName>, Error> {
+    let mut stmt =
+        conn.prepare("SELECT namespace FROM shared_schema_links WHERE shared_schema_name = ?")?;
+    let names = stmt
+        .query_map([schema.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // A link whose name does not decode cannot name a fenced namespace.
+    Ok(names
+        .into_iter()
+        .filter_map(|name| NamespaceName::from_string(name).ok())
+        .collect())
+}
+
 /// Create a migration job, and returns the job_id
 pub(super) fn register_schema_migration_job(
     conn: &mut rusqlite::Connection,
@@ -486,6 +503,7 @@ mod test {
         meta_store
             .handle(schema.into())
             .await
+            .unwrap()
             .store(DatabaseConfig {
                 is_shared_schema: true,
                 ..Default::default()
@@ -502,6 +520,7 @@ mod test {
         meta_store
             .handle(name.into())
             .await
+            .unwrap()
             .store(DatabaseConfig {
                 shared_schema_name: Some(schema.into()),
                 ..Default::default()
@@ -579,6 +598,7 @@ mod test {
         assert!(meta_store
             .handle("ns1".into())
             .await
+            .unwrap()
             .store(DatabaseConfig {
                 shared_schema_name: Some("schema1".into()),
                 ..Default::default()

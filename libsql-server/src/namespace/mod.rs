@@ -14,21 +14,34 @@ use crate::connection::Connection as _;
 use crate::database::Database;
 use crate::stats::Stats;
 
+use self::fence::controller::FenceController;
 use self::meta_store::MetaStoreHandle;
 pub use self::name::NamespaceName;
 pub use self::store::NamespaceStore;
 
 pub mod broadcasters;
 pub(crate) mod configurator;
+pub mod fence;
 pub mod meta_store;
 mod name;
 pub mod replication_wal;
 mod schema_lock;
 mod store;
 
+#[cfg(test)]
+pub(crate) use store::fence_tests::open_store as open_test_store;
+
 pub type ResetCb = Box<dyn Fn(ResetOp) + Send + Sync + 'static>;
+/// Resolves a namespace that a program ATTACHes: its directory, and its fence controller, which
+/// admits the attachment as a read of that namespace (`docs/NAMESPACE_FENCE.md` section 9).
 pub type ResolveNamespacePathFn =
-    Arc<dyn Fn(&NamespaceName) -> crate::Result<Arc<Path>> + Sync + Send + 'static>;
+    Arc<dyn Fn(&NamespaceName) -> crate::Result<AttachTarget> + Sync + Send + 'static>;
+
+/// A namespace resolved for ATTACH.
+pub struct AttachTarget {
+    pub path: Arc<Path>,
+    pub fence: Arc<fence::controller::FenceController>,
+}
 
 pub enum ResetOp {
     Reset(NamespaceName),
@@ -65,6 +78,10 @@ pub struct Namespace {
     stats: Arc<Stats>,
     db_config_store: MetaStoreHandle,
     path: Arc<Path>,
+    /// The namespace's fence controller, from the store's registry. Every connection, and the
+    /// dump and replication services that reach the namespace through the store, read its
+    /// gate.
+    fence: Arc<FenceController>,
 }
 
 impl Namespace {
@@ -95,6 +112,10 @@ impl Namespace {
             tracing::error!("unable to remove .sentinel file: {}", e);
         }
         Ok(())
+    }
+
+    pub(crate) fn fence(&self) -> &Arc<FenceController> {
+        &self.fence
     }
 
     pub fn config(&self) -> Arc<DatabaseConfig> {

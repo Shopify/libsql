@@ -1,0 +1,62 @@
+//! Namespace fence: a durable, operation-owned control record that an external operation (for
+//! example, moving a database between servers) uses as the data-plane authority boundary for
+//! one namespace.
+//!
+//! `docs/NAMESPACE_FENCE.md` is the contract and the design. This module holds the states and
+//! permission matrix ([`state`]), the stable outcome codes and their protocol mappings
+//! ([`outcome`]), commands and their canonical fingerprint ([`command`]), records, receipts and
+//! markers with their strict durable encoding ([`record`]), the pure transition function
+//! ([`transition`]), the metastore tables, compare-and-swap and marker file that persist them
+//! ([`store`], driven by `MetaStore::apply_fence_command`), and the in-memory authority built
+//! on them: the per-namespace [`controller`] with its gate and read leases, the positive write
+//! [`drain`], the source [`read`] fence and its [`stream`] leases for dump and replication,
+//! quarantined migration [`target`]s with their [`capability`]-scoped [`import`] sessions and
+//! seal drain, the [`registry`] that holds the controllers outside the namespace cache, the
+//! [`replica`]-server view of a primary's fence, the [`audit`] log, and the test [`hooks`] on
+//! their paths.
+
+pub mod audit;
+pub mod capability;
+pub mod command;
+pub mod controller;
+pub mod drain;
+pub mod hooks;
+pub mod import;
+pub mod outcome;
+pub mod read;
+pub mod record;
+pub mod registry;
+pub mod replica;
+pub mod state;
+pub mod store;
+pub mod stream;
+pub mod target;
+pub mod transition;
+
+#[cfg(test)]
+mod tests;
+
+#[allow(clippy::all)]
+pub(crate) mod proto {
+    include!("../../generated/namespace_fence.rs");
+}
+
+/// Version of the fence admin protocol reported by capability discovery.
+pub const FENCE_PROTOCOL_VERSION: u32 = 1;
+
+/// Whether this server fills the proxy protocol's additive `Error.stable_code` field and maps
+/// it on the replica side (`docs/NAMESPACE_FENCE.md` section 6.1). Reported by capability
+/// discovery so that deployment tooling can check every server before fences are used.
+pub const PROXY_STABLE_CODE: bool = true;
+
+/// The identity of this server process: its build and an id generated once per process. It is
+/// written into records and receipts, and reported by the admin API.
+pub fn server_identity() -> record::ServerIdentity {
+    static IDENTITY: std::sync::OnceLock<record::ServerIdentity> = std::sync::OnceLock::new();
+    IDENTITY
+        .get_or_init(|| record::ServerIdentity {
+            build: crate::version::version(),
+            instance_id: uuid::Uuid::new_v4(),
+        })
+        .clone()
+}

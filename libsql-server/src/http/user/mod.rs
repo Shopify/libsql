@@ -1,15 +1,16 @@
 pub mod db_factory;
-mod dump;
+pub(crate) mod dump;
 mod extract;
 mod hrana_over_http_1;
 mod listen;
-mod result_builder;
+pub(crate) mod result_builder;
 mod trace;
 mod types;
 #[macro_use]
 pub mod timing;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::{FromRef, FromRequest, FromRequestParts, Path as AxumPath, State as AxumState};
@@ -142,9 +143,12 @@ async fn handle_query(
     let db = connection_maker.create().await?;
 
     let builder = JsonHttpPayloadBuilder::new();
-    let builder = db
+    let mut builder = db
         .execute_batch_or_rollback(batch, ctx, builder, query.replication_index)
         .await?;
+    if let Some(denial) = builder.take_fence_denial() {
+        return Err(Error::NamespaceFence(denial));
+    }
 
     let res = (
         [(header::CONTENT_TYPE, "application/json")],
@@ -256,6 +260,8 @@ pub struct UserApi<A, P, S> {
     pub enable_console: bool,
     pub self_url: Option<String>,
     pub primary_url: Option<String>,
+    /// HTTP/2 keepalive interval (see `Server::http2_keepalive_interval`).
+    pub http2_keepalive_interval: Option<Duration>,
 }
 
 impl<A, P, S> UserApi<A, P, S>
@@ -443,14 +449,18 @@ where
                 );
 
             let router = router.fallback(handle_fallback);
-            let h2c = crate::h2c::H2cMaker::new(router);
+            let keepalive = self.http2_keepalive_interval;
+            let h2c = crate::h2c::H2cMaker::new(router).with_http2_keepalive(keepalive);
 
             task_manager.spawn_with_shutdown_notify(|shutdown| async move {
-                hyper::server::Server::builder(acceptor)
-                    .serve(h2c)
-                    .with_graceful_shutdown(shutdown.notified())
-                    .await
-                    .context("http server")?;
+                crate::h2c::with_http2_keepalive(
+                    hyper::server::Server::builder(acceptor),
+                    keepalive,
+                )
+                .serve(h2c)
+                .with_graceful_shutdown(shutdown.notified())
+                .await
+                .context("http server")?;
                 Ok(())
             });
         }

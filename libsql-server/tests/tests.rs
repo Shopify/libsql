@@ -6,6 +6,7 @@ mod common;
 mod auth;
 mod cluster;
 mod embedded_replica;
+mod fence;
 mod hrana;
 mod namespaces;
 mod standalone;

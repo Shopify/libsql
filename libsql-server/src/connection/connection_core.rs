@@ -11,6 +11,9 @@ use crate::connection::legacy::open_conn_active_checkpoint;
 use crate::error::Error;
 use crate::metrics::{PROGRAM_EXEC_COUNT, QUERY_CANCELED, VACUUM_COUNT, WAL_CHECKPOINT_COUNT};
 use crate::namespace::broadcasters::BroadcasterHandle;
+use crate::namespace::fence::controller::{FenceConnState, LeaseKind};
+use crate::namespace::fence::outcome::{FenceError, FenceOutcome};
+use crate::namespace::fence::state::OperationClass;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::ResolveNamespacePathFn;
 use crate::query_analysis::StmtKind;
@@ -23,6 +26,15 @@ use super::config::DatabaseConfig;
 use super::program::{DescribeCol, DescribeParam, DescribeResponse, Program, Vm};
 
 pub type GetCurrentFrameNo = Arc<dyn Fn() -> Option<FrameNo> + Send + Sync + 'static>;
+
+/// What [`CoreConnection::vacuum_if_needed_above`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VacuumOutcome {
+    Vacuumed,
+    NotNeeded,
+    /// Skipped because the namespace fence denies normal writes.
+    Fenced,
+}
 
 /// The base connection type, shared between legacy and libsql-wal implementations
 pub(super) struct CoreConnection<W> {
@@ -37,6 +49,8 @@ pub(super) struct CoreConnection<W> {
     broadcaster: BroadcasterHandle,
     hooked: bool,
     canceled: Arc<AtomicBool>,
+    /// Shared with this connection's WAL wrapper (`docs/NAMESPACE_FENCE.md` section 7.4).
+    fence: Arc<FenceConnState>,
 }
 
 fn update_stats(
@@ -68,6 +82,7 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         get_current_frame_no: GetCurrentFrameNo,
         block_writes: Arc<AtomicBool>,
         resolve_attach_path: ResolveNamespacePathFn,
+        fence: Arc<FenceConnState>,
     ) -> Result<Self> {
         let conn = open_conn_active_checkpoint(
             path,
@@ -88,6 +103,8 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         );
 
         let canceled = Arc::new(AtomicBool::new(false));
+        // The read drain cancels a running program at its deadline through the same flag.
+        fence.set_cancel_flag(canceled.clone());
 
         conn.progress_handler(100, {
             let canceled = canceled.clone();
@@ -113,6 +130,7 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
             hooked: false,
             canceled,
             get_current_frame_no,
+            fence,
         };
 
         for ext in extensions.iter() {
@@ -188,16 +206,36 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
         pgm: Program,
         mut builder: B,
     ) -> Result<B> {
-        let (config, stats, block_writes, resolve_attach_path) = {
+        let (config, stats, block_writes, resolve_attach_path, fence) = {
             let mut lock = this.lock();
             let config = lock.config_store.get();
             let stats = lock.stats.clone();
             let block_writes = lock.block_writes.clone();
             let resolve_attach_path = lock.resolve_attach_path.clone();
+            let fence = lock.fence.clone();
 
             lock.update_hooks();
 
-            (config, stats, block_writes, resolve_attach_path)
+            (config, stats, block_writes, resolve_attach_path, fence)
+        };
+        // The program is admitted under the gate's current write generation; a write
+        // transaction it opens must start under the same one (section 8.1).
+        fence.begin_program();
+        // ...and admitted for reading, holding a read lease for as long as it runs, including
+        // while a cursor is still producing rows (section 9). A connection left idle in a
+        // transaction held no lease; its next program is refused here and its transaction is
+        // rolled back.
+        let read_lease = {
+            let lock = this.lock();
+            match fence.begin_read_program(|| attached_schemas(lock.raw())) {
+                Ok(lease) => lease,
+                Err(e) => {
+                    if !lock.conn.is_autocommit() {
+                        lock.rollback();
+                    }
+                    return Err(Error::NamespaceFence(e));
+                }
+            }
         };
 
         builder.init(&this.lock().builder_config)?;
@@ -229,7 +267,8 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
                 update_stats(&stats, sql, rows_read, rows_written, mem_used, elapsed)
             },
             resolve_attach_path,
-        );
+        )
+        .with_fence(fence);
 
         let mut has_timeout = false;
         while !vm.finished() {
@@ -252,14 +291,38 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
             vm.step(&conn.raw())?;
         }
 
+        if read_lease.cancelled_by_fence() {
+            // The read drain reached its deadline and interrupted the program: report the fence,
+            // not the interruption, and leave no transaction behind.
+            let lock = this.lock();
+            if !lock.conn.is_autocommit() {
+                lock.rollback();
+            }
+            return Err(Error::NamespaceFence(FenceError::new(
+                FenceOutcome::MigrationReadFenced,
+                "the program was cancelled by the namespace read fence",
+            )));
+        }
+
         {
             let lock = this.lock();
             let is_autocommit = lock.conn.is_autocommit();
             let current_fno = (lock.get_current_frame_no)();
             vm.builder().finish(current_fno, is_autocommit)?;
         }
+        drop(read_lease);
 
         Ok(vm.into_builder())
+    }
+
+    pub(super) fn describe_admitted(&self, sql: &str) -> crate::Result<DescribeResponse> {
+        // Describing prepares the statement, which reads the schema: it is a read.
+        let _lease = self.fence.controller().acquire_read_lease(
+            self.fence.read_class(),
+            LeaseKind::Sql,
+            || (),
+        )?;
+        self.describe(sql)
     }
 
     fn rollback(&self) {
@@ -296,21 +359,45 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
     }
 
     pub(super) fn vacuum_if_needed(&self) -> Result<()> {
+        // NOTICE: don't bother vacuuming if we don't have at least 256MiB of data
+        self.vacuum_if_needed_above(65536).map(|_| ())
+    }
+
+    /// `VACUUM` if the database has at least `min_pages` pages and more than half of them are
+    /// free. `VACUUM` is not maintenance: it takes a write transaction and produces replicated
+    /// frames, so it is skipped whenever the namespace fence denies normal writes
+    /// (`docs/NAMESPACE_FENCE.md` section 7.3), including when the fence closes between the
+    /// check and the `VACUUM` itself.
+    pub(super) fn vacuum_if_needed_above(&self, min_pages: i64) -> Result<VacuumOutcome> {
+        self.fence.begin_program();
+        if let Err(e) = self.fence.controller().permits(OperationClass::Vacuum) {
+            tracing::debug!("skipping vacuum: {e}");
+            return Ok(VacuumOutcome::Fenced);
+        }
         let page_count = self
             .conn
             .query_row("PRAGMA page_count", (), |row| row.get::<_, i64>(0))?;
         let freelist_count = self
             .conn
             .query_row("PRAGMA freelist_count", (), |row| row.get::<_, i64>(0))?;
-        // NOTICE: don't bother vacuuming if we don't have at least 256MiB of data
-        if page_count >= 65536 && freelist_count * 2 > page_count {
+        let outcome = if page_count >= min_pages && freelist_count * 2 > page_count {
             tracing::info!("Vacuuming: pages={page_count} freelist={freelist_count}");
-            self.conn.execute("VACUUM", ())?;
+            if let Err(e) = self.conn.execute("VACUUM", ()) {
+                return match self.fence.take_denial() {
+                    Some(denial) => {
+                        tracing::debug!("skipping vacuum: {denial}");
+                        Ok(VacuumOutcome::Fenced)
+                    }
+                    None => Err(e.into()),
+                };
+            }
+            VacuumOutcome::Vacuumed
         } else {
             tracing::trace!("Not vacuuming: pages={page_count} freelist={freelist_count}");
-        }
+            VacuumOutcome::NotNeeded
+        };
         VACUUM_COUNT.increment(1);
-        Ok(())
+        Ok(outcome)
     }
 
     pub(super) fn describe(&self, sql: &str) -> crate::Result<DescribeResponse> {
@@ -381,6 +468,28 @@ impl<W: Wal + Send + 'static> CoreConnection<W> {
     }
 }
 
+/// The schema aliases attached on `conn` (other than `main` and `temp`).
+/// `None` when they cannot be listed.
+fn attached_schemas<W: Wal>(conn: &libsql_sys::Connection<W>) -> Option<Vec<String>> {
+    let mut aliases = Vec::new();
+    let result = conn.prepare("PRAGMA database_list").and_then(|mut stmt| {
+        let mut rows = stmt.query(())?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name != "main" && name != "temp" {
+                aliases.push(name);
+            }
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        // Keep every recorded attachment: over-leasing is safe, missing one is not.
+        tracing::warn!("could not list attached schemas: {e}");
+        return None;
+    }
+    Some(aliases)
+}
+
 #[cfg(test)]
 mod test {
     use itertools::Itertools;
@@ -394,6 +503,7 @@ mod test {
     use crate::auth::Authenticated;
     use crate::connection::legacy::MakeLegacyConnection;
     use crate::connection::{Connection as _, RequestContext, TXN_TIMEOUT};
+    use crate::namespace::fence::controller::FenceController;
     use crate::namespace::meta_store::{metastore_connection_maker, MetaStore};
     use crate::namespace::NamespaceName;
     use crate::query_result_builder::test::{test_driver, TestBuilder};
@@ -415,6 +525,10 @@ mod test {
             hooked: false,
             canceled: Arc::new(false.into()),
             get_current_frame_no: Arc::new(|| None),
+            fence: FenceConnState::new(
+                FenceController::unfenced(Default::default()),
+                crate::namespace::fence::state::OperationClass::NormalWrite,
+            ),
         };
 
         let conn = Arc::new(Mutex::new(conn));
@@ -454,6 +568,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -500,6 +615,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -551,6 +667,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -634,6 +751,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();
@@ -727,6 +845,7 @@ mod test {
             Default::default(),
             Arc::new(|_| unreachable!()),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceController::unfenced(Default::default()),
         )
         .await
         .unwrap();

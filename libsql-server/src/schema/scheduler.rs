@@ -410,6 +410,24 @@ impl Scheduler {
             .schema_locks()
             .acquire_exlusive(schema.clone())
             .await;
+        // Schema migration is lifecycle work on the schema and on every namespace linked to it.
+        // Fences refuse shared schemas and linked namespaces, and linking a fenced namespace is
+        // refused, so this finds nothing in normal operation; if it does (a link made by a binary
+        // that does not know fences), no job is registered rather than a migration step being
+        // refused at a fenced namespace's WAL.
+        self.namespace_store
+            .check_lifecycle(&schema)
+            .map_err(fence_error)?;
+        let linked = with_conn_async(self.migration_db.clone(), {
+            let schema = schema.clone();
+            move |conn| super::db::linked_namespaces(conn, &schema)
+        })
+        .await?;
+        for namespace in &linked {
+            self.namespace_store
+                .check_lifecycle(namespace)
+                .map_err(fence_error)?;
+        }
         with_conn_async(self.migration_db.clone(), move |conn| {
             register_schema_migration_job(conn, &schema, &migration)
         })
@@ -424,6 +442,14 @@ impl Scheduler {
             super::db::get_job_status(conn, job_id)
         })
         .await
+    }
+}
+
+/// The schema error for a fence refusal returned by `NamespaceStore::check_lifecycle`.
+fn fence_error(e: crate::Error) -> Error {
+    match e {
+        crate::Error::NamespaceFence(e) => Error::NamespaceFence(e),
+        e => Error::Registration(e.into()),
     }
 }
 
@@ -1227,6 +1253,238 @@ mod test {
             assert!(tokio::time::timeout(std::time::Duration::from_secs(1), fut)
                 .await
                 .is_err());
+        }
+    }
+
+    /// Namespace fences and shared schemas (`docs/NAMESPACE_FENCE.md` section 13.4).
+    mod fence {
+        use uuid::Uuid;
+
+        use super::*;
+        use crate::config::MetaStoreConfig;
+        use crate::namespace::fence::command::{FenceCommand, FenceRequest};
+        use crate::namespace::fence::outcome::{FenceDetail, FenceOutcome};
+        use crate::namespace::fence::record::ServerIdentity;
+        use crate::namespace::fence::state::FenceState;
+        use crate::namespace::meta_store::FenceContext;
+
+        const LOG: Uuid = Uuid::from_u128(0x10);
+        const OP: Uuid = Uuid::from_u128(0xa);
+
+        fn server() -> ServerIdentity {
+            ServerIdentity {
+                build: "test".into(),
+                instance_id: Uuid::from_u128(0x99),
+            }
+        }
+
+        fn acquire(ns: &'static str, command_id: u128) -> FenceRequest {
+            FenceRequest {
+                namespace: ns.into(),
+                operation_id: OP,
+                command_id: Uuid::from_u128(command_id),
+                expected_state: FenceState::Unfenced,
+                expected_revision: 0,
+                command: FenceCommand::AcquireSourceWriteFence {
+                    expected_log_id: LOG,
+                    drain_policy: None,
+                },
+            }
+        }
+
+        fn release(ns: &'static str, command_id: u128) -> FenceRequest {
+            FenceRequest {
+                namespace: ns.into(),
+                operation_id: OP,
+                command_id: Uuid::from_u128(command_id),
+                expected_state: FenceState::SourceDraining,
+                expected_revision: 1,
+                command: FenceCommand::ReleaseSourceWriteFence,
+            }
+        }
+
+        /// A primary store with fences enabled and a shared schema `schema` with one linked
+        /// namespace `linked`.
+        async fn setup(
+            path: &Path,
+        ) -> (NamespaceStore, Scheduler, mpsc::Receiver<SchedulerMessage>) {
+            let (maker, manager) = metastore_connection_maker(None, path).await.unwrap();
+            let meta_store = MetaStore::new(
+                MetaStoreConfig {
+                    namespace_fence: true,
+                    ..Default::default()
+                },
+                path,
+                maker().unwrap(),
+                manager,
+                DatabaseKind::Primary,
+            )
+            .await
+            .unwrap();
+            let (sender, receiver) = mpsc::channel(100);
+            let config = make_config(sender.into(), path);
+            let store =
+                NamespaceStore::new(false, false, 10, meta_store, config, DatabaseKind::Primary)
+                    .await
+                    .unwrap();
+            let scheduler = Scheduler::new(store.clone(), maker().unwrap())
+                .await
+                .unwrap();
+            store
+                .create(
+                    "schema".into(),
+                    RestoreOption::Latest,
+                    DatabaseConfig {
+                        is_shared_schema: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .create(
+                    "linked".into(),
+                    RestoreOption::Latest,
+                    DatabaseConfig {
+                        shared_schema_name: Some("schema".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            (store, scheduler, receiver)
+        }
+
+        /// Fence `ns` at the metastore (`SOURCE_DRAINING`, write admission closed).
+        async fn fence(store: &NamespaceStore, ns: &'static str) {
+            store
+                .fence_controller(&ns.into())
+                .apply_command(
+                    store.meta_store(),
+                    acquire(ns, 1),
+                    FenceContext::now(server(), Some(LOG)),
+                )
+                .await
+                .unwrap();
+        }
+
+        #[track_caller]
+        fn assert_fence_error(result: crate::Result<()>, outcome: FenceOutcome) {
+            match result {
+                Err(crate::Error::NamespaceFence(e)) => assert_eq!(e.outcome(), outcome, "{e}"),
+                other => panic!("expected {outcome}, got {other:?}"),
+            }
+        }
+
+        /// A shared schema and a namespace linked to one cannot be fenced, and a fenced
+        /// namespace cannot be linked to a shared schema.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn acquire_rejects_shared_schema() {
+            let tmp = tempdir().unwrap();
+            let (store, scheduler, _receiver) = setup(tmp.path()).await;
+
+            for ns in ["schema", "linked"] {
+                match store.execute_fence_command(acquire(ns, 1), server()).await {
+                    Err(crate::Error::NamespaceFence(e)) => {
+                        assert_eq!(e.outcome(), FenceOutcome::FencePreconditionFailed, "{e}");
+                        assert_eq!(e.detail(), Some(FenceDetail::SharedSchemaUnsupported));
+                    }
+                    other => panic!("{ns}: expected shared_schema_unsupported, got {other:?}"),
+                }
+                // The refused acquisition left the namespace unfenced and writable.
+                let gate = store.fence_controller(&ns.into()).gate();
+                assert_eq!(gate.state(), FenceState::Unfenced);
+                assert!(gate.write().is_open());
+            }
+
+            // A fenced namespace is not linked to the schema, whether by creating it with a
+            // shared schema or by changing its config.
+            store
+                .create("plain".into(), RestoreOption::Latest, Default::default())
+                .await
+                .unwrap();
+            fence(&store, "plain").await;
+            let linked_config = || DatabaseConfig {
+                shared_schema_name: Some("schema".into()),
+                ..Default::default()
+            };
+            assert_fence_error(
+                store
+                    .create("plain".into(), RestoreOption::Latest, linked_config())
+                    .await,
+                FenceOutcome::MigrationWriteFenced,
+            );
+            let handle = store.config_store("plain".into()).await.unwrap();
+            assert_fence_error(
+                handle.store(linked_config()).await,
+                FenceOutcome::MigrationWriteFenced,
+            );
+            assert!(handle.get().shared_schema_name.is_none());
+            let links = super::super::super::db::linked_namespaces(
+                &scheduler.migration_db.lock(),
+                &"schema".into(),
+            )
+            .unwrap();
+            assert_eq!(links, vec![NamespaceName::from("linked")]);
+        }
+
+        /// A schema migration is lifecycle work on every linked namespace: if a fenced namespace
+        /// is linked to the schema (here by writing the link directly, as a binary that does not
+        /// know fences could), no migration job is registered until the fence is released.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn migration_not_registered_while_linked_namespace_fenced() {
+            let tmp = tempdir().unwrap();
+            let (store, scheduler, _receiver) = setup(tmp.path()).await;
+            store
+                .create("plain".into(), RestoreOption::Latest, Default::default())
+                .await
+                .unwrap();
+            fence(&store, "plain").await;
+            scheduler
+                .migration_db
+                .lock()
+                .execute(
+                    "INSERT INTO shared_schema_links (shared_schema_name, namespace) \
+                     VALUES ('schema', 'plain')",
+                    (),
+                )
+                .unwrap();
+
+            let migration = || Program::seq(&["create table test (c)"]).into();
+            match scheduler
+                .register_migration_job("schema".into(), migration())
+                .await
+            {
+                Err(Error::NamespaceFence(e)) => {
+                    assert_eq!(e.outcome(), FenceOutcome::MigrationWriteFenced, "{e}")
+                }
+                other => panic!("expected MIGRATION_WRITE_FENCED, got {other:?}"),
+            }
+            assert!(!super::super::super::db::has_pending_migration_jobs(
+                &scheduler.migration_db.lock(),
+                &"schema".into(),
+            )
+            .unwrap());
+
+            // Released, the namespace is ordinary again and the migration is registered.
+            store
+                .fence_controller(&"plain".into())
+                .apply_command(
+                    store.meta_store(),
+                    release("plain", 2),
+                    FenceContext::now(server(), Some(LOG)),
+                )
+                .await
+                .unwrap();
+            scheduler
+                .register_migration_job("schema".into(), migration())
+                .await
+                .unwrap();
+            assert!(super::super::super::db::has_pending_migration_jobs(
+                &scheduler.migration_db.lock(),
+                &"schema".into(),
+            )
+            .unwrap());
         }
     }
 }

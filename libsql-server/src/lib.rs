@@ -11,7 +11,7 @@ use crate::connection::{Connection, MakeConnection};
 use crate::database::DatabaseKind;
 use crate::error::Error;
 use crate::migration::maybe_migrate;
-use crate::namespace::meta_store::{metastore_connection_maker, MetaStore};
+use crate::namespace::meta_store::{metastore_connection_maker_with_provenance, MetaStore};
 use crate::net::Accept;
 use crate::pager::{make_pager, PAGER_CACHE_SIZE};
 use crate::rpc::proxy::rpc::proxy_server::Proxy;
@@ -151,6 +151,10 @@ pub struct Server<C = HttpConnector, A = AddrIncoming, D = HttpsConnector<HttpCo
     pub force_load_wals: bool,
     pub sync_conccurency: usize,
     pub set_log_level: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static>>,
+    /// HTTP/2 keepalive interval of the RPC server and the user-port gRPC services, set when
+    /// namespace fences are enabled so that the streams of dead peers are detected
+    /// (`docs/NAMESPACE_FENCE.md` section 9). `None` keeps hyper's default (no keepalive).
+    pub http2_keepalive_interval: Option<Duration>,
 }
 
 impl<C, A, D> Default for Server<C, A, D> {
@@ -180,6 +184,7 @@ impl<C, A, D> Default for Server<C, A, D> {
             force_load_wals: false,
             sync_conccurency: 8,
             set_log_level: None,
+            http2_keepalive_interval: None,
         }
     }
 }
@@ -196,6 +201,7 @@ struct Services<A, P, S, C> {
     db_config: DbConfig,
     user_auth_strategy: Auth,
     pub set_log_level: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync + 'static>>,
+    http2_keepalive_interval: Option<Duration>,
 }
 
 struct TaskManager {
@@ -290,6 +296,7 @@ where
             enable_console: self.user_api_config.enable_http_console,
             self_url: self.user_api_config.self_url,
             primary_url: self.user_api_config.primary_url,
+            http2_keepalive_interval: self.http2_keepalive_interval,
         };
 
         let user_http_service = user_http.configure(task_manager);
@@ -529,6 +536,7 @@ where
             db_config: self.db_config,
             user_auth_strategy,
             set_log_level: self.set_log_level.take(),
+            http2_keepalive_interval: self.http2_keepalive_interval,
         }
     }
 
@@ -603,9 +611,12 @@ where
             connection_creation_timeout: self.db_config.connection_creation_timeout,
         };
 
-        let (metastore_conn_maker, meta_store_wal_manager) =
-            metastore_connection_maker(self.meta_store_config.bottomless.clone(), &self.path)
-                .await?;
+        let (metastore_conn_maker, meta_store_wal_manager, metastore_provenance) =
+            metastore_connection_maker_with_provenance(
+                self.meta_store_config.bottomless.clone(),
+                &self.path,
+            )
+            .await?;
         let meta_conn = metastore_conn_maker()?;
         let meta_store = MetaStore::new(
             self.meta_store_config.clone(),
@@ -615,6 +626,7 @@ where
             db_kind,
         )
         .await?;
+        meta_store.record_restore_provenance(metastore_provenance);
 
         let (configurators, make_replication_svc) = self
             .make_configurators_and_replication_svc(
@@ -677,6 +689,7 @@ where
                 config.tls_config,
                 idle_shutdown_kicker.clone(),
                 replication_service, // internal replicaton service
+                self.http2_keepalive_interval,
             ));
         }
 

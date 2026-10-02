@@ -16,8 +16,8 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 use libsql_server::config::{
-    AdminApiConfig, BottomlessConfig, DbConfig, HeartbeatConfig, MetaStoreConfig, RpcClientConfig,
-    RpcServerConfig, TlsConfig, UserApiConfig,
+    AdminApiConfig, BottomlessConfig, DbConfig, FenceAdoptionKey, HeartbeatConfig, MetaStoreConfig,
+    RpcClientConfig, RpcServerConfig, TlsConfig, UserApiConfig,
 };
 use libsql_server::net::AddrIncoming;
 use libsql_server::version::Version;
@@ -257,6 +257,46 @@ struct Cli {
     /// empty on startup
     #[clap(long, env = "SQLD_ALLOW_METASTORE_RECOVERY")]
     allow_metastore_recovery: bool,
+
+    /// Allow namespace fences to be used (see `docs/NAMESPACE_FENCE.md`). Off by default.
+    /// Fences that already exist in the metastore are enforced either way.
+    #[clap(long, env = "SQLD_ENABLE_NAMESPACE_FENCE")]
+    enable_namespace_fence: bool,
+
+    /// How long, in seconds, receipts of finished namespace-fence operations are kept.
+    /// Defaults to 30 days.
+    #[clap(long, env = "SQLD_NAMESPACE_FENCE_RECEIPT_RETENTION_S")]
+    namespace_fence_receipt_retention_s: Option<u64>,
+
+    /// How long, in milliseconds, acquiring a namespace write fence waits for active writers
+    /// when the request names no drain policy (the deadline then answers `DRAINING`).
+    /// Defaults to 30 seconds.
+    #[clap(long, env = "SQLD_NAMESPACE_FENCE_DEFAULT_WRITE_DRAIN_MS")]
+    namespace_fence_default_write_drain_ms: Option<u64>,
+
+    /// How long, in milliseconds, setting a namespace read fence waits for running reads and
+    /// streams when the request names no drain policy, before it cancels them. Defaults to 30
+    /// seconds.
+    #[clap(long, env = "SQLD_NAMESPACE_FENCE_DEFAULT_READ_DRAIN_MS")]
+    namespace_fence_default_read_drain_ms: Option<u64>,
+
+    /// HTTP/2 keepalive interval, in seconds, of the RPC server and the user-port gRPC
+    /// services when namespace fences are enabled, so that replication streams of dead peers
+    /// are detected (a ping unanswered for 20 seconds closes the connection). Defaults to 30
+    /// seconds; ignored unless `--enable-namespace-fence` is set.
+    #[clap(long, env = "SQLD_NAMESPACE_FENCE_KEEPALIVE_INTERVAL_S")]
+    namespace_fence_keepalive_interval_s: Option<u64>,
+
+    /// The separate secret that authorises namespace fence adoption (incident recovery of an
+    /// unfinished operation whose owner was lost), presented in the
+    /// `x-libsql-fence-adoption-key` header beside the admin credential. Adoption is disabled
+    /// when this is not set.
+    #[clap(
+        long,
+        env = "SQLD_NAMESPACE_FENCE_ADOPTION_KEY",
+        hide_env_values = true
+    )]
+    namespace_fence_adoption_key: Option<String>,
 
     /// Shutdown timeout duration in seconds, defaults to 30 seconds.
     #[clap(long, env = "SQLD_SHUTDOWN_TIMEOUT")]
@@ -650,6 +690,23 @@ fn make_meta_store_config(config: &Cli) -> anyhow::Result<MetaStoreConfig> {
         bottomless,
         allow_recover_from_fs: config.allow_metastore_recovery,
         destroy_on_error: config.meta_store_destroy_on_error,
+        namespace_fence: config.enable_namespace_fence,
+        namespace_fence_receipt_retention: config
+            .namespace_fence_receipt_retention_s
+            .map(Duration::from_secs),
+        namespace_fence_default_write_drain: config
+            .namespace_fence_default_write_drain_ms
+            .map(Duration::from_millis),
+        namespace_fence_default_read_drain: config
+            .namespace_fence_default_read_drain_ms
+            .map(Duration::from_millis),
+        namespace_fence_adoption_key: match config.namespace_fence_adoption_key.as_deref() {
+            None => None,
+            Some(key) => Some(
+                FenceAdoptionKey::new(key)
+                    .context("--namespace-fence-adoption-key must not be empty")?,
+            ),
+        },
     })
 }
 
@@ -724,6 +781,9 @@ async fn build_server(
         force_load_wals: config.force_load_wals,
         sync_conccurency: config.sync_conccurency,
         set_log_level: Some(Box::new(set_log_level)),
+        http2_keepalive_interval: config.enable_namespace_fence.then(|| {
+            Duration::from_secs(config.namespace_fence_keepalive_interval_s.unwrap_or(30))
+        }),
     })
 }
 

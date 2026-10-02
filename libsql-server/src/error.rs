@@ -128,6 +128,8 @@ pub enum Error {
     RuntimeTaskJoinError(#[from] tokio::task::JoinError),
     #[error("database is not a primary")]
     NotAPrimary,
+    #[error(transparent)]
+    NamespaceFence(#[from] crate::namespace::fence::outcome::FenceError),
 }
 
 impl AsRef<Self> for Error {
@@ -148,6 +150,68 @@ pub trait ResponseError: std::error::Error {
 }
 
 impl ResponseError for Error {}
+
+impl Error {
+    /// The fence denial this error carries, looking through the wrappers it can arrive in.
+    pub(crate) fn fence_error(&self) -> Option<&crate::namespace::fence::outcome::FenceError> {
+        match self {
+            Error::NamespaceFence(e) => Some(e),
+            Error::Migration(crate::schema::Error::NamespaceFence(e)) => Some(e),
+            Error::Ref(this) => this.fence_error(),
+            Error::Anyhow(e) => e.downcast_ref::<Error>().and_then(Error::fence_error),
+            _ => None,
+        }
+    }
+
+    /// A step or program error the primary returned through the write proxy. A fence denial
+    /// from a primary that fills the additive `stable_code` field
+    /// (`docs/NAMESPACE_FENCE.md` section 6.1) becomes the same [`Error::NamespaceFence`] a
+    /// local denial is, so the replica answers its client exactly as the primary would. Any
+    /// other error, and every error from a primary that does not fill the field, stays
+    /// [`Error::RpcQueryError`].
+    pub(crate) fn from_proxy_error(e: crate::rpc::proxy::rpc::Error) -> Self {
+        let fence = e.stable_code.as_deref().and_then(|code| {
+            crate::namespace::fence::outcome::FenceError::from_proxy_stable_code(code, &e.message)
+        });
+        match fence {
+            Some(fence) => {
+                crate::namespace::fence::audit::denied(
+                    &fence,
+                    crate::namespace::fence::audit::DenialSurface::Proxy,
+                );
+                Error::NamespaceFence(fence)
+            }
+            None => Error::RpcQueryError(e),
+        }
+    }
+
+    /// A gRPC status from the primary's proxy service: its typed fence denial
+    /// (`FAILED_PRECONDITION` with the stable code, section 6.1) as [`Error::NamespaceFence`],
+    /// anything else unchanged.
+    pub(crate) fn from_proxy_status(status: tonic::Status) -> Self {
+        match crate::namespace::fence::outcome::FenceError::from_grpc_status(&status) {
+            Some(fence) => {
+                crate::namespace::fence::audit::denied(
+                    &fence,
+                    crate::namespace::fence::audit::DenialSurface::Proxy,
+                );
+                Error::NamespaceFence(fence)
+            }
+            None => Error::RpcQueryExecutionError(status),
+        }
+    }
+}
+
+/// The HTTP response for a fence denial (`docs/NAMESPACE_FENCE.md` section 6): the fence status
+/// and the JSON error body with the additive `code` (and `detail`) fields.
+pub(crate) fn fence_error_response(
+    e: &crate::namespace::fence::outcome::FenceError,
+) -> axum::response::Response {
+    crate::namespace::fence::audit::denied(e, crate::namespace::fence::audit::DenialSurface::Http);
+    let status = e.http_status();
+    tracing::debug!("HTTP API: {status}, {e}");
+    (status, axum::Json(e.http_error_body())).into_response()
+}
 
 impl IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
@@ -224,6 +288,7 @@ impl IntoResponse for &Error {
             AttachInMigration => self.format_err(StatusCode::BAD_REQUEST),
             RuntimeTaskJoinError(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             NotAPrimary => self.format_err(StatusCode::BAD_REQUEST),
+            NamespaceFence(e) => fence_error_response(e),
         }
     }
 }
@@ -333,5 +398,65 @@ impl IntoResponse for &ForkError {
             ForkError::ForkReplica => self.format_err(StatusCode::BAD_REQUEST),
             ForkError::ForkNoStorage => self.format_err(StatusCode::BAD_REQUEST),
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+    use crate::namespace::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
+
+    async fn response(e: &Error) -> (StatusCode, serde_json::Value) {
+        let response = e.into_response();
+        let status = response.status();
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Section 6: a fence denial is `423` with the additive `code` (and `detail`) field, found
+    /// through every wrapper the error can arrive in; other errors keep their shape.
+    #[tokio::test]
+    async fn fence_errors_carry_code() {
+        for outcome in [
+            FenceOutcome::MigrationWriteFenced,
+            FenceOutcome::MigrationReadFenced,
+            FenceOutcome::MigrationTargetQuarantined,
+            FenceOutcome::FenceStateUnavailable,
+        ] {
+            let fence = FenceError::new(outcome, "denied");
+            let wrapped = [
+                Error::NamespaceFence(fence.clone()),
+                Error::Ref(std::sync::Arc::new(Error::NamespaceFence(fence.clone()))),
+                Error::Anyhow(anyhow::anyhow!(Error::NamespaceFence(fence.clone()))),
+                Error::Migration(crate::schema::Error::NamespaceFence(fence.clone())),
+            ];
+            for e in &wrapped {
+                assert_eq!(e.fence_error(), Some(&fence), "{e:?}");
+                let (status, body) = response(e).await;
+                assert_eq!(status, StatusCode::LOCKED, "{e:?}");
+                assert_eq!(body["code"], outcome.as_str(), "{e:?}");
+                assert_eq!(body["error"], fence.to_string(), "{e:?}");
+                assert!(body.get("detail").is_none(), "{body}");
+            }
+        }
+
+        let unavailable = FenceError::new(FenceOutcome::FenceStateUnavailable, "corrupt")
+            .with_detail(FenceDetail::CorruptRecord);
+        let (_, body) = response(&Error::NamespaceFence(unavailable)).await;
+        assert_eq!(body["detail"], "corrupt_record");
+
+        let precondition = FenceError::new(FenceOutcome::FencePreconditionFailed, "no")
+            .with_detail(FenceDetail::NotPrimary);
+        let (status, body) = response(&Error::NamespaceFence(precondition)).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["code"], "FENCE_PRECONDITION_FAILED");
+        assert_eq!(body["detail"], "not_primary");
+
+        // The legacy `block_*` refusal keeps its mapping and has no code.
+        let blocked = Error::Blocked(Some("maintenance".into()));
+        assert_eq!(blocked.fence_error(), None);
+        let (status, body) = response(&blocked).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.get("code").is_none(), "{body}");
     }
 }

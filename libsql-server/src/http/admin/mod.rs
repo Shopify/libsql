@@ -30,6 +30,7 @@ use crate::namespace::{DumpStream, NamespaceName, NamespaceStore, RestoreOption}
 use crate::net::Connector;
 use crate::LIBSQL_PAGE_SIZE;
 
+pub mod fence;
 pub mod stats;
 
 #[derive(Clone)]
@@ -49,6 +50,9 @@ struct AppState<C> {
     connector: C,
     metrics: Metrics,
     set_env_filter: Option<Box<dyn Fn(&str) -> anyhow::Result<()> + Sync + Send + 'static>>,
+    /// Whether an admin auth key is configured. Namespace fence commands refuse to run without
+    /// one (`docs/NAMESPACE_FENCE.md` section 4.1).
+    admin_auth_configured: bool,
 }
 
 impl<C> FromRef<Arc<AppState<C>>> for Metrics {
@@ -170,12 +174,14 @@ where
         .route("/profile/heap/disable/:id", post(disable_profile_heap))
         .route("/profile/heap/:id", delete(delete_profile_heap))
         .route("/log-filter", post(handle_set_log_filter))
+        .merge(fence::routes())
         .with_state(Arc::new(AppState {
             namespaces: namespaces.clone(),
             connector,
             user_http_server,
             metrics,
             set_env_filter,
+            admin_auth_configured: auth.is_some(),
         }))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
@@ -242,8 +248,10 @@ async fn handle_get_index() -> &'static str {
     "Welcome to the sqld admin API"
 }
 
-async fn handle_metrics(State(metrics): State<Metrics>) -> String {
-    metrics.render()
+async fn handle_metrics<C>(State(app_state): State<Arc<AppState<C>>>) -> String {
+    // The fence gauges are computed from the registry when they are read.
+    app_state.namespaces.update_fence_gauges();
+    app_state.metrics.render()
 }
 
 async fn handle_get_config<C: Connector>(
@@ -326,10 +334,11 @@ async fn handle_post_config<C>(
         // Check that the jwt keys are correct
         parse_jwt_keys(jwt_key)?;
     }
-    let store = app_state
-        .namespaces
-        .config_store(NamespaceName::from_string(namespace.clone())?)
-        .await?;
+    let namespace_name = NamespaceName::from_string(namespace.clone())?;
+    // Config mutation is lifecycle work: refused while a fence denies it, before the namespace
+    // is loaded (and again in the metastore transaction that would store it).
+    app_state.namespaces.check_lifecycle(&namespace_name)?;
+    let store = app_state.namespaces.config_store(namespace_name).await?;
     let original = (*store.get()).clone();
     let mut updated = original.clone();
     updated.block_reads = req.block_reads;
@@ -395,6 +404,10 @@ async fn handle_create_namespace<C: Connector>(
     Json(req): Json<CreateNamespaceReq>,
 ) -> crate::Result<()> {
     let mut config = DatabaseConfig::default();
+
+    // Creating over a name whose fence denies lifecycle work is refused before a dump is
+    // fetched or anything is stored.
+    app_state.namespaces.check_lifecycle(&namespace)?;
 
     if let Some(jwt_key) = req.jwt_key {
         // Check that the jwt keys are correct

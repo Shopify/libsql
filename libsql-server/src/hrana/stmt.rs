@@ -49,6 +49,10 @@ pub enum StmtError {
     ResponseTooLarge,
     #[error("error executing a request on the primary: {0}")]
     Proxy(String),
+    /// A denial by the namespace fence (`docs/NAMESPACE_FENCE.md` section 6). Its Hrana code is
+    /// the fence's stable code.
+    #[error(transparent)]
+    Fence(crate::namespace::fence::outcome::FenceError),
 }
 
 pub async fn execute_stmt(
@@ -216,6 +220,13 @@ pub fn stmt_error_from_sqld_error(sqld_error: SqldError) -> Result<StmtError, Sq
         }
         SqldError::Blocked(reason) => Ok(StmtError::Blocked { reason }),
         SqldError::RpcQueryError(e) => Ok(StmtError::Proxy(e.message)),
+        SqldError::NamespaceFence(e) => {
+            crate::namespace::fence::audit::denied(
+                &e,
+                crate::namespace::fence::audit::DenialSurface::Hrana,
+            );
+            Ok(StmtError::Fence(e))
+        }
         SqldError::RusqliteError(rusqlite_error)
         | SqldError::RusqliteErrorExtended(rusqlite_error, _) => match rusqlite_error {
             rusqlite::Error::SqliteFailure(sqlite_error, Some(message)) => {
@@ -271,6 +282,7 @@ impl StmtError {
             Self::Blocked { .. } => "BLOCKED",
             Self::ResponseTooLarge => "RESPONSE_TOO_LARGE",
             Self::Proxy(_) => "PROXY_ERROR",
+            Self::Fence(e) => e.outcome().as_str(),
         }
     }
 }

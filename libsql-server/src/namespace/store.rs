@@ -13,7 +13,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::auth::Authenticated;
 use crate::broadcaster::BroadcastMsg;
 use crate::connection::config::DatabaseConfig;
-use crate::database::DatabaseKind;
+use crate::database::{Database, DatabaseKind, PrimaryConnectionMaker};
 use crate::error::Error;
 use crate::metrics::NAMESPACE_LOAD_LATENCY;
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
@@ -21,7 +21,19 @@ use crate::stats::Stats;
 
 use super::broadcasters::{BroadcasterHandle, BroadcasterRegistry};
 use super::configurator::{DynConfigurator, NamespaceConfigurators};
-use super::meta_store::{MetaStore, MetaStoreHandle};
+use super::fence::audit::CommandAudit;
+use super::fence::capability::CapabilityPurpose;
+use super::fence::command::{FenceCommand, FenceRequest};
+use super::fence::controller::{FenceController, Transition};
+use super::fence::hooks::HookPoint;
+use super::fence::import::{self, ImportSession};
+use super::fence::outcome::FenceOutcome;
+use super::fence::record::ServerIdentity;
+use super::fence::registry::FenceRegistry;
+use super::fence::state::{FenceState, Role};
+use super::fence::store::StoredFence;
+use super::fence::target::{self, CreateTargetRequest, ValidationSession};
+use super::meta_store::{FenceCommit, FenceContext, FenceInspection, MetaStore, MetaStoreHandle};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
@@ -50,6 +62,9 @@ pub struct NamespaceStoreInner {
     broadcasters: BroadcasterRegistry,
     configurators: NamespaceConfigurators,
     db_kind: DatabaseKind,
+    /// Fence controllers, outside the cache: a namespace that is evicted and reloaded gets the
+    /// controller it had.
+    fences: FenceRegistry,
 }
 
 impl NamespaceStore {
@@ -84,6 +99,14 @@ impl NamespaceStore {
             .time_to_idle(Duration::from_secs(86400))
             .build();
 
+        // Every namespace with fence state gets its controller before anything is served
+        // (section 8.5).
+        super::fence::audit::describe_metrics();
+        let fences = FenceRegistry::seeded(metadata.load_fences().await?);
+        if fences.len() > 0 {
+            tracing::info!("loaded {} namespace fence controllers", fences.len());
+        }
+
         Ok(Self {
             inner: Arc::new(NamespaceStoreInner {
                 store,
@@ -95,6 +118,7 @@ impl NamespaceStore {
                 broadcasters: Default::default(),
                 configurators,
                 db_kind,
+                fences,
             }),
         })
     }
@@ -120,6 +144,8 @@ impl NamespaceStore {
             }
         })
         .await??;
+        // The namespace's fence state went with it.
+        self.inner.fences.remove(&namespace);
 
         let mut bottomless_db_id_init = NamespaceBottomlessDbIdInit::FetchFromConfig;
         if let Some(ns) = self.inner.store.remove(&namespace).await {
@@ -158,6 +184,17 @@ impl NamespaceStore {
         namespace: NamespaceName,
         restore_option: RestoreOption,
     ) -> anyhow::Result<()> {
+        // Reset destroys the namespace's data and writes nothing to the metastore, so the fence
+        // check is made here, under the namespace's transition lock: a fence command either
+        // finished before this check or starts after the reset (section 3.3, lifecycle).
+        let _transition = self
+            .inner
+            .fences
+            .controller(&namespace)
+            .begin_transition()
+            .await;
+        self.check_lifecycle(&namespace)?;
+
         // The process for reseting is as follow:
         // - get a lock on the namespace entry, if the entry exists, then it's a lock on the entry,
         // if it doesn't exist, insert an empty entry and take a lock on it
@@ -173,7 +210,7 @@ impl NamespaceStore {
             ns.destroy().await?;
         }
 
-        let db_config = self.inner.metadata.handle(namespace.clone()).await;
+        let db_config = self.inner.metadata.handle(namespace.clone()).await?;
         // destroy on-disk database
         self.cleanup(
             &namespace,
@@ -197,16 +234,24 @@ impl NamespaceStore {
         Box::new(move |op| {
             let this = this.clone();
             tokio::spawn(async move {
-                match op {
-                    ResetOp::Reset(ns) => {
-                        tracing::info!("received reset signal for: {ns}");
-                        if let Err(e) = this.reset(ns.clone(), RestoreOption::Latest).await {
-                            tracing::error!("error resetting namespace `{ns}`: {e}");
-                        }
-                    }
-                }
+                let _ = this.handle_reset_op(op).await;
             });
         })
+    }
+
+    /// A reset requested by a replica's replicator. A namespace whose fence denies lifecycle
+    /// work is not reset: the refusal is logged and returned.
+    async fn handle_reset_op(&self, op: ResetOp) -> anyhow::Result<()> {
+        match op {
+            ResetOp::Reset(ns) => {
+                tracing::info!("received reset signal for: {ns}");
+                let result = self.reset(ns.clone(), RestoreOption::Latest).await;
+                if let Err(e) = &result {
+                    tracing::error!("error resetting namespace `{ns}`: {e}");
+                }
+                result
+            }
+        }
     }
 
     pub async fn fork(
@@ -220,10 +265,23 @@ impl NamespaceStore {
             return Err(Error::NamespaceStoreShutdown);
         }
 
+        // The destination is refused before anything is stored for it when it is being created
+        // as a migration target, its fence state is unknown, or its fence denies lifecycle work
+        // (an existing fenced namespace, whose directory the fork would otherwise replace).
+        self.inner.fences.check_available(&to)?;
+        self.check_lifecycle(&to)?;
+
         // check that the source namespace exists
         if !self.inner.metadata.exists(&from).await {
             return Err(crate::error::Error::NamespaceDoesntExist(from.to_string()));
         }
+
+        // A fork reads the source's data without a read lease, so it runs under the source's
+        // transition lock and checks the source's gate under it: a fence command on the source
+        // (a write or read fence) either finished before this check, and the fork is refused,
+        // or waits for the fork to finish (section 3.3, fork as source).
+        let _from_transition = self.inner.fences.controller(&from).begin_transition().await;
+        self.check_lifecycle(&from)?;
 
         let to_entry = self
             .inner
@@ -234,13 +292,18 @@ impl NamespaceStore {
         if to_lock.is_some() {
             return Err(crate::error::Error::NamespaceAlreadyExist(to.to_string()));
         }
+        // With the destination's entry held, a fence command cannot load the destination, so
+        // the check cannot go stale before the fork has stored and flushed its config.
+        self.check_lifecycle(&to)?;
 
         // FIXME: we could potentially delete the namespace while trying to fork it
         if !self.inner.metadata.exists(&from).await {
             return Err(crate::Error::NamespaceDoesntExist(from.to_string()));
         }
 
-        let from_config = self.inner.metadata.handle(from.clone()).await;
+        let Some(from_config) = self.inner.metadata.lookup(&from).await? else {
+            return Err(crate::Error::NamespaceDoesntExist(from.to_string()));
+        };
         let from_entry = self
             .load_namespace(&from, from_config.clone(), RestoreOption::Latest)
             .await?;
@@ -275,7 +338,7 @@ impl NamespaceStore {
             should_delete: true,
         };
 
-        let handle = self.inner.metadata.handle(to.clone()).await;
+        let handle = self.inner.metadata.handle(to.clone()).await?;
         handle
             .store_and_maybe_flush(Some(to_config.into()), false)
             .await?;
@@ -322,13 +385,6 @@ impl NamespaceStore {
     where
         Fun: FnOnce(&Namespace) -> R,
     {
-        if namespace != NamespaceName::default()
-            && !self.inner.metadata.exists(&namespace).await
-            && !self.inner.allow_lazy_creation
-        {
-            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
-        }
-
         let f = {
             let name = namespace.clone();
             move |ns: NamespaceEntry| async move {
@@ -341,11 +397,51 @@ impl NamespaceStore {
             }
         };
 
-        let handle = self.inner.metadata.handle(namespace.to_owned()).await;
-        f(self
+        // A namespace whose fence state is unavailable is refused before any setup work.
+        self.inner.fences.check_available(&namespace)?;
+
+        // A lookup that cannot create: only the default namespace and lazy creation create a
+        // namespace here, and those refuse a name whose fence state is not established.
+        let (handle, created) = match self.inner.metadata.lookup(&namespace).await? {
+            Some(handle) => (handle, false),
+            None if namespace == NamespaceName::default() || self.inner.allow_lazy_creation => {
+                (self.inner.metadata.handle(namespace.clone()).await?, true)
+            }
+            None => return Err(Error::NamespaceDoesntExist(namespace.to_string())),
+        };
+        let entry = match self
             .load_namespace(&namespace, handle, RestoreOption::Latest)
-            .await?)
-        .await
+            .await
+        {
+            Ok(entry) => entry,
+            Err(e) => {
+                if created && e.fence_error().is_some() {
+                    self.forget_refused_creation(&namespace).await;
+                }
+                return Err(e);
+            }
+        };
+        f(entry).await
+    }
+
+    /// Undo what a lazy creation that a fence refused left in memory (on a replica server, the
+    /// primary refused to replicate the name; `docs/NAMESPACE_FENCE.md` section 13.3): the
+    /// metastore entry [`MetaStore::handle`] added, which would otherwise make the name look
+    /// like an existing namespace, and the controller the attempt created. Both are kept when
+    /// they hold anything durable or are in use by another attempt.
+    async fn forget_refused_creation(&self, namespace: &NamespaceName) {
+        match self.inner.metadata.forget_unstored(namespace.clone()).await {
+            Ok(forgotten) => {
+                let controller = self.inner.fences.forget_idle(namespace);
+                tracing::debug!(
+                    "refused creation of {namespace}: metastore entry forgotten: {forgotten}, \
+                     controller forgotten: {controller}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to forget the refused creation of {namespace}: {e}")
+            }
+        }
     }
 
     fn resolve_attach_fn(&self) -> ResolveNamespacePathFn {
@@ -354,8 +450,12 @@ impl NamespaceStore {
             Arc::new({
                 let store = self.clone();
                 move |ns: &NamespaceName| {
-                    tokio::runtime::Handle::current()
-                        .block_on(store.with(ns.clone(), |ns| ns.path.clone()))
+                    tokio::runtime::Handle::current().block_on(store.with(ns.clone(), |ns| {
+                        super::AttachTarget {
+                            path: ns.path.clone(),
+                            fence: ns.fence().clone(),
+                        }
+                    }))
                 }
             })
         })
@@ -368,6 +468,10 @@ impl NamespaceStore {
         config: MetaStoreHandle,
         restore_option: RestoreOption,
     ) -> crate::Result<Namespace> {
+        // The controller is handed to the namespace before its first connection exists, so no
+        // connection is ever opened without a gate (section 8.5).
+        self.inner.fences.check_available(namespace)?;
+        let fence = self.inner.fences.controller(namespace);
         let ns = self
             .get_configurator(&config.get())
             .setup(
@@ -378,6 +482,7 @@ impl NamespaceStore {
                 self.resolve_attach_fn(),
                 self.clone(),
                 self.broadcaster(namespace.clone()),
+                fence,
             )
             .await?;
 
@@ -418,6 +523,11 @@ impl NamespaceStore {
         restore_option: RestoreOption,
         db_config: DatabaseConfig,
     ) -> crate::Result<()> {
+        // A name that is being created as a migration target, or whose fence state is unknown,
+        // is refused before anything is stored for it; so is a name whose fence denies lifecycle
+        // work (creating over an existing record, with or without a restore).
+        self.inner.fences.check_available(&namespace)?;
+        self.check_lifecycle(&namespace)?;
         if let Some(shared_schema_name) = &db_config.shared_schema_name {
             // we hold a lock for the duration of the namespace creation
             let _lock = self
@@ -440,7 +550,7 @@ impl NamespaceStore {
         }
 
         let db_config = Arc::new(db_config);
-        let handle = self.inner.metadata.handle(namespace.clone()).await;
+        let handle = self.inner.metadata.handle(namespace.clone()).await?;
         tracing::debug!("storing db config");
         handle.store(db_config).await?;
         tracing::debug!("completed storing db config, loading namespace");
@@ -506,6 +616,405 @@ impl NamespaceStore {
         &self.inner.metadata
     }
 
+    /// Refuse generic lifecycle and configuration work on `namespace` (config mutation,
+    /// delete, reset, fork on either side, create over an existing record, restore, dump load,
+    /// shared-schema linking, schema migration) while its fence denies it
+    /// (`docs/NAMESPACE_FENCE.md` section 3.3), without loading the namespace. A name without
+    /// fence state is not refused here: the existing checks apply to it. Paths that persist
+    /// through the metastore are refused again inside its transaction.
+    pub(crate) fn check_lifecycle(&self, namespace: &NamespaceName) -> crate::Result<()> {
+        Ok(self.inner.fences.check_lifecycle(namespace)?)
+    }
+
+    /// Run one fence command on its namespace, including the drain it starts
+    /// (`docs/NAMESPACE_FENCE.md` sections 5.3 and 8). `AcquireSourceWriteFence` loads the
+    /// namespace first, so that its connection manager and replication log are registered with
+    /// the namespace's controller before the drain needs them.
+    pub(crate) async fn execute_fence_command(
+        &self,
+        request: FenceRequest,
+        server: ServerIdentity,
+    ) -> crate::Result<FenceCommit> {
+        self.execute_fence_command_authorised(request, server, false)
+            .await
+    }
+
+    /// [`execute_fence_command`](Self::execute_fence_command) for a request that may carry
+    /// the adoption key: `adoption_authorised` says whether it did (section 12). Only
+    /// `AdoptFence` looks at it. Like every command, a committed adoption is written to the
+    /// audit log (target `libsql_server::fence::audit`), with its approvers, incident reference
+    /// and reason.
+    pub(crate) async fn execute_fence_command_authorised(
+        &self,
+        request: FenceRequest,
+        server: ServerIdentity,
+        adoption_authorised: bool,
+    ) -> crate::Result<FenceCommit> {
+        if let FenceCommand::AdoptFence(_) = &request.command {
+            let namespace = request.namespace.clone();
+            let controller = self.inner.fences.controller(&namespace);
+            let mut ctx = FenceContext::now(server, None);
+            ctx.adoption_authorised = adoption_authorised;
+            return controller.execute(&self.inner.metadata, request, ctx).await;
+        }
+        let controller = match request.command {
+            FenceCommand::CreateTargetQuarantined { .. } => {
+                return self.run_create_target(request, server).await
+            }
+            FenceCommand::AcquireSourceWriteFence { .. } => {
+                self.with(request.namespace.clone(), |ns| ns.fence().clone())
+                    .await?
+            }
+            _ => self.inner.fences.controller(&request.namespace),
+        };
+        let mut ctx = FenceContext::now(server, None);
+        // A new validation receipt records what this server observes of the sealed target. Do
+        // this only when the live gate exactly matches the request: an exact replay after the
+        // revision or state has advanced must reach the metastore's replay check without first
+        // trying to issue a now-invalid validation capability.
+        if matches!(
+            &request.command,
+            FenceCommand::RecordTargetValidation { .. }
+        ) {
+            let needs_snapshot = {
+                let gate = controller.gate();
+                gate.state() == FenceState::TargetValidating
+                    && gate.operation_id() == Some(request.operation_id)
+                    && gate.revision() == request.expected_revision
+            };
+            if needs_snapshot && !self.validation_command_recorded(&request).await? {
+                let snapshot = async {
+                    let mut session = self
+                        .open_validation_session(
+                            request.namespace.clone(),
+                            request.operation_id,
+                            request.expected_revision,
+                        )
+                        .await?;
+                    session.snapshot().await
+                }
+                .await;
+                match snapshot {
+                    Ok(snapshot) => ctx.validation_snapshot = Some(snapshot),
+                    // A concurrent copy of this command can commit between the gate check and
+                    // the capability call. Once its receipt exists, let execute take the
+                    // transition lock and perform the authoritative replay/fingerprint check.
+                    Err(_) if self.validation_command_recorded(&request).await? => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        controller.execute(&self.inner.metadata, request, ctx).await
+    }
+
+    async fn validation_command_recorded(&self, request: &FenceRequest) -> crate::Result<bool> {
+        let operation_id = request.operation_id.to_string();
+        let command_id = request.command_id.to_string();
+        let inspected = self
+            .inner
+            .metadata
+            .inspect_fence(request.namespace.clone())
+            .await?;
+        Ok(inspected
+            .receipts
+            .iter()
+            .any(|stored| stored.operation_id == operation_id && stored.command_id == command_id))
+    }
+
+    /// `CreateTargetQuarantined`, atomic with namespace creation (`docs/NAMESPACE_FENCE.md`
+    /// sections 10.1 and 11): the namespace is quarantined from the first instant it can be
+    /// observed, and is loaded behind the quarantine gate before this returns `APPLIED`.
+    ///
+    /// Fence refusals are [`Error::NamespaceFence`] with their stable outcome code. The work
+    /// runs on its own task under the namespace's transition lock, so a caller that goes away
+    /// does not interrupt it; replaying the same request returns the stored result, completes
+    /// the publication and load of a target whose commit was not acknowledged, and completes a
+    /// creation interrupted between its marker and its commit.
+    pub async fn create_target_quarantined(
+        &self,
+        request: CreateTargetRequest,
+        server: ServerIdentity,
+    ) -> crate::Result<FenceCommit> {
+        self.run_create_target(request.into(), server).await
+    }
+
+    async fn run_create_target(
+        &self,
+        request: FenceRequest,
+        server: ServerIdentity,
+    ) -> crate::Result<FenceCommit> {
+        if self.inner.has_shutdown.load(Ordering::Relaxed) {
+            return Err(Error::NamespaceStoreShutdown);
+        }
+        let controller = self.inner.fences.controller(&request.namespace);
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut transition = controller.begin_transition().await;
+            let audit = CommandAudit::new(&request, controller.gate().state());
+            let ctx = FenceContext::now(server, None);
+            let result = this
+                .create_target_under(&mut transition, request, ctx)
+                .await;
+            super::fence::audit::command_finished(&audit, &result, &transition.report);
+            result
+        })
+        .await?
+    }
+
+    /// Section 10.1, steps 1 to 5, under `transition`.
+    async fn create_target_under(
+        &self,
+        transition: &mut Transition,
+        request: FenceRequest,
+        ctx: FenceContext,
+    ) -> crate::Result<FenceCommit> {
+        let controller = transition.controller().clone();
+        let namespace = request.namespace.clone();
+        let key = (request.operation_id, request.command_id);
+
+        // A name with no fence state gets the target-creation gate before the metastore
+        // transaction writes the marker, so nothing can set the name up, serve it or store a
+        // config for it from before the commit to the load. A name that already has fence
+        // state (a replay, a creation interrupted after its marker, or a refusal) already has
+        // the gate its state implies. A name the server already knows is refused without
+        // touching its gate; it is checked again once the gate is in place, which closes the
+        // race with a create or fork that has not stored anything yet.
+        let fresh = {
+            let gate = controller.gate();
+            matches!(gate.fence, StoredFence::None { .. }) && gate.indeterminate.is_none()
+        };
+        if fresh {
+            if self.name_in_use(&namespace).await {
+                return Err(target::name_in_use(&namespace).into());
+            }
+            transition.install_creating_target(key);
+            let _ = controller.hook(HookPoint::AfterInstallingGate).await;
+            if self.name_in_use(&namespace).await {
+                transition.remove_creating_target();
+                return Err(target::name_in_use(&namespace).into());
+            }
+        }
+
+        // Steps 2 and 3: the marker, then the rows in one transaction. The commit publishes the
+        // quarantined record in place of the creation gate. A command proven not to have
+        // committed removes the creation gate; one whose commit is unknown keeps it, with the
+        // indeterminate flag, until the same command is replayed.
+        let commit = match transition.apply(&self.inner.metadata, request, ctx).await {
+            Ok(commit) => commit,
+            Err(e) => {
+                if controller.gate().indeterminate != Some(key) {
+                    transition.remove_creating_target();
+                }
+                return Err(e);
+            }
+        };
+        let _ = controller.hook(HookPoint::AfterTargetRowsCommitted).await;
+
+        // Steps 4 and 5: the gate is the target's; now make the config visible and load the
+        // namespace, whose first connection is created behind that gate. A replay does the same,
+        // which completes a creation whose commit was not acknowledged.
+        let is_target = commit
+            .record
+            .as_ref()
+            .is_some_and(|r| r.role == Role::Target && r.namespace == namespace);
+        if is_target {
+            self.inner
+                .metadata
+                .publish_target_config(namespace.clone())
+                .await?;
+            self.clear_empty_entry(&namespace).await;
+            let loaded = self
+                .with(namespace.clone(), |ns| ns.fence().clone())
+                .await?;
+            debug_assert!(Arc::ptr_eq(&loaded, &controller));
+        }
+        if commit.receipt.outcome == FenceOutcome::Applied && commit.created_config.is_some() {
+            tracing::info!(
+                namespace = %namespace,
+                operation_id = %key.0,
+                command_id = %key.1,
+                "created namespace as a quarantined migration target"
+            );
+        }
+        Ok(commit)
+    }
+
+    /// Issue an import capability to `operation_id` and open a connection that works under it
+    /// (`docs/NAMESPACE_FENCE.md` section 11): the only way to write into a quarantined target.
+    /// Valid only while the target is `TARGET_QUARANTINED`, owned by `operation_id`, at
+    /// `expected_revision`; the target is loaded if it is not. Fence refusals are
+    /// [`Error::NamespaceFence`] with their stable outcome code (`OPERATION_CAPABILITY_REQUIRED`
+    /// in any other state, `FENCE_OWNED_BY_ANOTHER_OPERATION`, `FENCE_REVISION_MISMATCH`).
+    pub async fn open_import_session(
+        &self,
+        namespace: NamespaceName,
+        operation_id: uuid::Uuid,
+        expected_revision: u64,
+    ) -> crate::Result<ImportSession> {
+        let (controller, maker) = self.primary_maker(&namespace).await?;
+        let capability = controller.issue_capability(
+            CapabilityPurpose::Import,
+            operation_id,
+            expected_revision,
+        )?;
+        match maker
+            .inner()
+            .make_capability_connection(capability.clone())
+            .await
+        {
+            Ok(conn) => Ok(ImportSession::new(capability, controller, conn)),
+            Err(e) => {
+                controller.revoke_capability(capability.id());
+                Err(e)
+            }
+        }
+    }
+
+    /// Issue a read-only validation capability to `operation_id` and open a `query_only`
+    /// connection under it (`docs/NAMESPACE_FENCE.md` sections 10.3 and 11). Valid only while
+    /// the target is `TARGET_VALIDATING` or `TARGET_WRITE_FENCED`, owned by the operation at
+    /// `expected_revision`; the target is loaded if it is not.
+    pub async fn open_validation_session(
+        &self,
+        namespace: NamespaceName,
+        operation_id: uuid::Uuid,
+        expected_revision: u64,
+    ) -> crate::Result<ValidationSession> {
+        let (controller, maker) = self.primary_maker(&namespace).await?;
+        let capability = controller.issue_capability(
+            CapabilityPurpose::Validate,
+            operation_id,
+            expected_revision,
+        )?;
+        let conn = match maker
+            .inner()
+            .make_capability_connection(capability.clone())
+            .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                controller.revoke_capability(capability.id());
+                return Err(e);
+            }
+        };
+        ValidationSession::new(capability, controller, conn).await
+    }
+
+    /// The fence controller and connection maker of the primary `namespace`, loading it.
+    async fn primary_maker(
+        &self,
+        namespace: &NamespaceName,
+    ) -> crate::Result<(Arc<FenceController>, Arc<PrimaryConnectionMaker>)> {
+        let (controller, maker) = self
+            .with(namespace.clone(), |ns| {
+                let maker = match &ns.db {
+                    Database::Primary(p) => Some(p.connection_maker()),
+                    _ => None,
+                };
+                (ns.fence().clone(), maker)
+            })
+            .await?;
+        match maker {
+            Some(maker) => Ok((controller, maker)),
+            None => Err(import::not_importable(namespace)),
+        }
+    }
+
+    /// A connection to `namespace` that works under `capability`, whether or not this server
+    /// issued it: for tests that prove the WAL refuses a capability that is not the valid one.
+    #[cfg(test)]
+    pub(crate) async fn capability_connection(
+        &self,
+        namespace: &NamespaceName,
+        capability: super::fence::capability::MigrationCapability,
+    ) -> crate::Result<
+        crate::connection::legacy::LegacyConnection<super::replication_wal::ReplicationWalWrapper>,
+    > {
+        let (_, maker) = self.primary_maker(namespace).await?;
+        maker.inner().make_capability_connection(capability).await
+    }
+
+    /// Whether the server already knows `namespace`: its config is in memory, or the namespace
+    /// cache holds it (a loaded namespace, or a fork in flight, which holds its entry locked).
+    async fn name_in_use(&self, namespace: &NamespaceName) -> bool {
+        if self.inner.metadata.exists(namespace).await {
+            return true;
+        }
+        match self.inner.store.get(namespace).await {
+            Some(entry) => entry.read().await.is_some(),
+            None => false,
+        }
+    }
+
+    /// Drop an empty namespace-cache entry for `namespace`, which a refused fork or a checkpoint
+    /// of a name that did not exist leaves behind, so that loading the namespace creates it.
+    async fn clear_empty_entry(&self, namespace: &NamespaceName) {
+        if let Some(entry) = self.inner.store.get(namespace).await {
+            if entry.read().await.is_none() {
+                self.inner.store.invalidate(namespace).await;
+            }
+        }
+    }
+
+    /// The fence controller of `namespace`, creating an `UNFENCED` one if it has none.
+    #[cfg(test)]
+    pub(crate) fn fence_controller(&self, namespace: &NamespaceName) -> Arc<FenceController> {
+        self.inner.fences.controller(namespace)
+    }
+
+    /// The fence controller that admits reads of `namespace` without loading it: `None` when
+    /// the namespace does not exist (and has no fence state). A namespace whose fence state is
+    /// unavailable is refused.
+    pub(crate) async fn fence_gate(
+        &self,
+        namespace: &NamespaceName,
+    ) -> crate::Result<Option<Arc<FenceController>>> {
+        self.inner.fences.check_available(namespace)?;
+        if let Some(controller) = self.inner.fences.get(namespace) {
+            return Ok(Some(controller));
+        }
+        if self.inner.metadata.exists(namespace).await {
+            return Ok(Some(self.inner.fences.controller(namespace)));
+        }
+        Ok(None)
+    }
+
+    /// Whether this store serves primary namespaces. Fences live on the primary that owns the
+    /// WAL; a replica-kind server refuses every fence route (`docs/NAMESPACE_FENCE.md` 4.1).
+    pub(crate) fn is_primary(&self) -> bool {
+        !self.inner.db_kind.is_replica()
+    }
+
+    /// The fence controller `namespace` already has, without creating one.
+    pub(crate) fn existing_fence_controller(
+        &self,
+        namespace: &NamespaceName,
+    ) -> Option<Arc<FenceController>> {
+        self.inner.fences.get(namespace)
+    }
+
+    /// `InspectFence`: the durable fence and receipts of `namespace` as the metastore holds
+    /// them, and the namespace's controller if it has one (for the live gate and drain
+    /// counters). Read-only: it neither loads the namespace nor creates a controller.
+    pub(crate) async fn inspect_fence(
+        &self,
+        namespace: &NamespaceName,
+    ) -> crate::Result<(FenceInspection, Option<Arc<FenceController>>)> {
+        let inspection = self.inner.metadata.inspect_fence(namespace.clone()).await?;
+        Ok((inspection, self.inner.fences.get(namespace)))
+    }
+
+    /// How many namespaces on this server have an active fence (capability discovery).
+    pub(crate) fn active_fences(&self) -> usize {
+        self.inner.fences.active_count()
+    }
+
+    /// Set the fence gauges (`docs/NAMESPACE_FENCE.md` section 15) from the registry, before
+    /// `/metrics` is rendered.
+    pub(crate) fn update_fence_gauges(&self) {
+        super::fence::audit::update_gauges(&self.inner.fences, super::fence::drain::now_ms());
+    }
+
     pub(crate) fn schema_locks(&self) -> &SchemaLocksRegistry {
         &self.inner.schema_locks
     }
@@ -530,5 +1039,424 @@ impl NamespaceStore {
         self.get_configurator(db_config)
             .cleanup(namespace, db_config, prune_all, bottomless_db_id_init)
             .await
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fence_tests {
+    use std::path::Path;
+
+    use libsql_sys::wal::Sqlite3WalManager;
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::config::MetaStoreConfig;
+    use crate::connection::Connection as _;
+    use crate::namespace::configurator::{BaseNamespaceConfig, PrimaryConfig, PrimaryConfigurator};
+    use crate::namespace::fence::command::{FenceCommand, FenceRequest};
+    use crate::namespace::fence::outcome::{FenceDetail, FenceOutcome};
+    use crate::namespace::fence::record::ServerIdentity;
+    use crate::namespace::fence::state::{FenceState, OperationClass};
+    use crate::namespace::fence::store as fence_store;
+    use crate::namespace::meta_store::{metastore_connection_maker, FenceContext};
+
+    const LOG: Uuid = Uuid::from_u128(0x10);
+    const OP: Uuid = Uuid::from_u128(0xa);
+
+    pub(crate) async fn open_store(dir: &Path) -> NamespaceStore {
+        open_store_with_max_log_size(dir, 1_000_000_000).await
+    }
+
+    pub(crate) async fn open_store_with_max_log_size(
+        dir: &Path,
+        max_log_size: u64,
+    ) -> NamespaceStore {
+        let (maker, manager) = metastore_connection_maker(None, dir).await.unwrap();
+        let meta = MetaStore::new(
+            MetaStoreConfig {
+                namespace_fence: true,
+                ..Default::default()
+            },
+            dir,
+            maker().unwrap(),
+            manager,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        let mut configurators = NamespaceConfigurators::empty();
+        configurators.with_primary(PrimaryConfigurator::new(
+            BaseNamespaceConfig {
+                base_path: dir.to_path_buf().into(),
+                extensions: Arc::new([]),
+                stats_sender: tokio::sync::mpsc::channel(1).0,
+                max_response_size: 100_000_000,
+                max_total_response_size: 100_000_000,
+                max_concurrent_connections: Arc::new(Semaphore::new(10)),
+                max_concurrent_requests: 10_000,
+                encryption_config: None,
+                connection_creation_timeout: None,
+                disable_intelligent_throttling: false,
+            },
+            PrimaryConfig {
+                max_log_size,
+                max_log_duration: None,
+                bottomless_replication: None,
+                scripted_backup: None,
+                checkpoint_interval: None,
+            },
+            Arc::new(|| Sqlite3WalManager::default()),
+        ));
+        NamespaceStore::new(false, false, 10, meta, configurators, DatabaseKind::Primary)
+            .await
+            .unwrap()
+    }
+
+    fn acquire(ns: &'static str) -> FenceRequest {
+        FenceRequest {
+            namespace: ns.into(),
+            operation_id: OP,
+            command_id: Uuid::from_u128(1),
+            expected_state: FenceState::Unfenced,
+            expected_revision: 0,
+            command: FenceCommand::AcquireSourceWriteFence {
+                expected_log_id: LOG,
+                drain_policy: None,
+            },
+        }
+    }
+
+    fn ctx() -> FenceContext {
+        FenceContext::now(
+            ServerIdentity {
+                build: "test".into(),
+                instance_id: Uuid::from_u128(0x99),
+            },
+            Some(LOG),
+        )
+    }
+
+    #[tokio::test]
+    async fn evicted_namespace_reloads_with_the_same_controller() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        store
+            .create("ns".into(), RestoreOption::Latest, Default::default())
+            .await
+            .unwrap();
+        let (fence, stats) = store
+            .with("ns".into(), |ns| (ns.fence().clone(), ns.stats()))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &fence,
+            &store.inner.fences.get(&"ns".into()).unwrap()
+        ));
+        fence
+            .apply_command(store.meta_store(), acquire("ns"), ctx())
+            .await
+            .unwrap();
+        let gate = fence.gate();
+        assert_eq!(gate.state(), FenceState::SourceDraining);
+
+        // Evict the namespace, as idle or capacity eviction does, and let it shut down.
+        store
+            .inner
+            .store
+            .invalidate(&NamespaceName::from("ns"))
+            .await;
+        store.inner.store.run_pending_tasks().await;
+        assert!(store
+            .inner
+            .store
+            .get(&NamespaceName::from("ns"))
+            .await
+            .is_none());
+
+        let (reloaded, reloaded_stats) = store
+            .with("ns".into(), |ns| (ns.fence().clone(), ns.stats()))
+            .await
+            .unwrap();
+        // A new namespace instance, the same controller and gate.
+        assert!(!Arc::ptr_eq(&stats, &reloaded_stats));
+        assert!(Arc::ptr_eq(&fence, &reloaded));
+        assert_eq!(reloaded.gate(), gate);
+        assert!(reloaded.permits(OperationClass::NormalWrite).is_err());
+    }
+
+    #[tokio::test]
+    async fn restart_installs_the_durable_gate_before_serving() {
+        let tmp = tempdir().unwrap();
+        {
+            let store = open_store(tmp.path()).await;
+            store
+                .create("ns".into(), RestoreOption::Latest, Default::default())
+                .await
+                .unwrap();
+            let fence = store.inner.fences.controller(&"ns".into());
+            fence
+                .apply_command(store.meta_store(), acquire("ns"), ctx())
+                .await
+                .unwrap();
+            store.shutdown().await.unwrap();
+        }
+
+        let store = open_store(tmp.path()).await;
+        // The registry holds the durable gate before the namespace is loaded.
+        let fence = store.inner.fences.get(&"ns".into()).unwrap();
+        assert_eq!(fence.gate().state(), FenceState::SourceDraining);
+        assert_eq!(fence.gate().revision(), 1);
+        let loaded = store
+            .with("ns".into(), |ns| ns.fence().clone())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&fence, &loaded));
+    }
+
+    #[tokio::test]
+    async fn unavailable_namespace_is_refused_before_setup() {
+        let tmp = tempdir().unwrap();
+        // An unreadable marker in a directory with no config: the fence state cannot be
+        // established.
+        let dir = tmp.path().join("dbs").join("lost");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(fence_store::MARKER_FILE_NAME), b"garbage").unwrap();
+
+        let store = open_store(tmp.path()).await;
+        let r = store.with("lost".into(), |_| ()).await;
+        match r {
+            Err(Error::NamespaceFence(e)) => {
+                assert_eq!(e.outcome(), FenceOutcome::FenceStateUnavailable);
+                assert_eq!(e.detail(), Some(FenceDetail::CorruptRecord));
+            }
+            other => panic!("expected a fence error, got {other:?}"),
+        }
+        // Nothing was set up: no database file, and the namespace is not cached.
+        assert!(!dir.join("data").exists());
+        assert!(store
+            .inner
+            .store
+            .get(&NamespaceName::from("lost"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn destroy_forgets_the_controller() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        store
+            .create("ns".into(), RestoreOption::Latest, Default::default())
+            .await
+            .unwrap();
+        assert!(store.inner.fences.get(&"ns".into()).is_some());
+        store.destroy("ns".into(), false).await.unwrap();
+        assert!(store.inner.fences.get(&"ns".into()).is_none());
+    }
+
+    fn release(ns: &'static str, command_id: u128) -> FenceRequest {
+        FenceRequest {
+            namespace: ns.into(),
+            operation_id: OP,
+            command_id: Uuid::from_u128(command_id),
+            expected_state: FenceState::SourceDraining,
+            expected_revision: 1,
+            command: FenceCommand::ReleaseSourceWriteFence,
+        }
+    }
+
+    /// Create `ns` holding a table `t` with one row.
+    async fn create_with_row(store: &NamespaceStore, ns: &'static str) {
+        store
+            .create(ns.into(), RestoreOption::Latest, Default::default())
+            .await
+            .unwrap();
+        let conn = store
+            .with(ns.into(), |ns| ns.db.connection_maker())
+            .await
+            .unwrap()
+            .create()
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            conn.with_raw(|c| c.execute_batch("create table t (x); insert into t values (1);"))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    /// The number of rows in `ns`'s table `t`, or the error reading it.
+    async fn rows(store: &NamespaceStore, ns: &'static str) -> rusqlite::Result<i64> {
+        let conn = store
+            .with(ns.into(), |ns| ns.db.connection_maker())
+            .await
+            .unwrap()
+            .create()
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            conn.with_raw(|c| c.query_row("select count(*) from t", (), |r| r.get(0)))
+        })
+        .await
+        .unwrap()
+    }
+
+    #[track_caller]
+    fn assert_fenced(result: crate::Result<()>, outcome: FenceOutcome) {
+        match result {
+            Err(Error::NamespaceFence(e)) => assert_eq!(e.outcome(), outcome, "{e}"),
+            other => panic!("expected {outcome}, got {other:?}"),
+        }
+    }
+
+    #[track_caller]
+    fn assert_fenced_anyhow(result: anyhow::Result<()>, outcome: FenceOutcome) {
+        match result {
+            Err(e) => match e.downcast_ref::<Error>() {
+                Some(Error::NamespaceFence(e)) => assert_eq!(e.outcome(), outcome, "{e}"),
+                _ => panic!("expected {outcome}, got {e:?}"),
+            },
+            Ok(()) => panic!("expected {outcome}, got Ok"),
+        }
+    }
+
+    /// Reset, which destroys the namespace's data and recreates it, is refused while the
+    /// namespace is fenced, both called directly and as the replicator's reset callback does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_refused_while_fenced() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        create_with_row(&store, "ns").await;
+        let fence = store.inner.fences.controller(&"ns".into());
+        fence
+            .apply_command(store.meta_store(), acquire("ns"), ctx())
+            .await
+            .unwrap();
+
+        assert_fenced_anyhow(
+            store.reset("ns".into(), RestoreOption::Latest).await,
+            FenceOutcome::MigrationWriteFenced,
+        );
+        assert_fenced_anyhow(
+            store.handle_reset_op(ResetOp::Reset("ns".into())).await,
+            FenceOutcome::MigrationWriteFenced,
+        );
+        // The namespace was not touched and still serves reads.
+        assert_eq!(rows(&store, "ns").await.unwrap(), 1);
+
+        // Once the fence is released, reset works as before, and its data is gone.
+        fence
+            .apply_command(store.meta_store(), release("ns", 2), ctx())
+            .await
+            .unwrap();
+        assert_eq!(fence.gate().state(), FenceState::Released);
+        store
+            .handle_reset_op(ResetOp::Reset("ns".into()))
+            .await
+            .unwrap();
+        assert!(rows(&store, "ns").await.is_err());
+    }
+
+    /// Fork is lifecycle work on both sides: a fenced source is not copied, and a fenced
+    /// destination (whose directory a fork would replace) is not overwritten. Create over a
+    /// fenced name, delete and config mutation, including linking the namespace to a shared
+    /// schema, are refused too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lifecycle_refused_while_fenced() {
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        create_with_row(&store, "src").await;
+        create_with_row(&store, "other").await;
+        let fence = store.inner.fences.controller(&"src".into());
+        fence
+            .apply_command(store.meta_store(), acquire("src"), ctx())
+            .await
+            .unwrap();
+        let write_fenced = FenceOutcome::MigrationWriteFenced;
+
+        // Fork with the fenced namespace as the source: nothing is created.
+        assert_fenced(
+            store
+                .fork("src".into(), "copy".into(), Default::default(), None)
+                .await,
+            write_fenced,
+        );
+        assert!(!store.exists(&"copy".into()).await);
+        assert!(!tmp.path().join("dbs").join("copy").exists());
+        // Fork onto the fenced namespace: its data and config are untouched.
+        let config_before = store.config_store("src".into()).await.unwrap().get();
+        assert_fenced(
+            store
+                .fork(
+                    "other".into(),
+                    "src".into(),
+                    DatabaseConfig {
+                        block_reason: Some("fork".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await,
+            write_fenced,
+        );
+        assert_eq!(rows(&store, "src").await.unwrap(), 1);
+        let config_after = store.config_store("src".into()).await.unwrap().get();
+        assert_eq!(config_after.block_reason, config_before.block_reason);
+        assert_eq!(config_after.block_writes, config_before.block_writes);
+
+        // Create over it, with or without a restore, and delete.
+        assert_fenced(
+            store
+                .create("src".into(), RestoreOption::Latest, Default::default())
+                .await,
+            write_fenced,
+        );
+        assert_fenced(store.destroy("src".into(), false).await, write_fenced);
+
+        // Config mutation, including linking the namespace to a shared schema, is refused in the
+        // metastore transaction that would store it.
+        let handle = store.config_store("src".into()).await.unwrap();
+        assert_fenced(
+            handle
+                .store(DatabaseConfig {
+                    block_reason: Some("changed".into()),
+                    ..Default::default()
+                })
+                .await,
+            write_fenced,
+        );
+        assert_fenced(
+            handle
+                .store(DatabaseConfig {
+                    shared_schema_name: Some("other".into()),
+                    ..Default::default()
+                })
+                .await,
+            write_fenced,
+        );
+        assert_eq!(handle.get().block_reason, config_before.block_reason);
+        assert!(handle.get().shared_schema_name.is_none());
+        assert_eq!(rows(&store, "src").await.unwrap(), 1);
+
+        // After release the same operations follow the existing policy again.
+        fence
+            .apply_command(store.meta_store(), release("src", 2), ctx())
+            .await
+            .unwrap();
+        store
+            .fork("src".into(), "copy".into(), Default::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(rows(&store, "copy").await.unwrap(), 1);
+        assert!(matches!(
+            store
+                .create("src".into(), RestoreOption::Latest, Default::default())
+                .await,
+            Err(Error::NamespaceAlreadyExist(_))
+        ));
+        store.destroy("src".into(), false).await.unwrap();
     }
 }

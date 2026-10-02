@@ -45,6 +45,8 @@ pub enum Error {
     InteractiveTxnNotAllowed,
     #[error("Connection left in transaction state")]
     ConnectionInTxnState,
+    #[error("{0}")]
+    NamespaceFence(#[from] crate::namespace::fence::outcome::FenceError),
 }
 
 impl ResponseError for Error {}
@@ -58,6 +60,7 @@ impl IntoResponse for &Error {
                 self.format_err(StatusCode::BAD_REQUEST)
             }
             Error::MigrationExecuteError(e) => e.as_ref().into_response(),
+            Error::NamespaceFence(e) => crate::error::fence_error_response(e),
             _ => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }

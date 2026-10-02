@@ -13,6 +13,7 @@ use crate::replication::script_backup_manager::ScriptBackupManager;
 use crate::StatsSender;
 
 use super::broadcasters::BroadcasterHandle;
+use super::fence::controller::FenceController;
 use super::meta_store::MetaStoreHandle;
 use super::{
     Namespace, NamespaceBottomlessDbIdInit, NamespaceName, NamespaceStore, ResetCb,
@@ -25,6 +26,7 @@ mod primary;
 mod replica;
 mod schema;
 
+pub(crate) use helpers::{load_dump_sql, read_dump};
 pub use primary::PrimaryConfigurator;
 pub use replica::ReplicaConfigurator;
 pub use schema::SchemaConfigurator;
@@ -119,6 +121,7 @@ pub trait ConfigureNamespace {
         resolve_attach_path: ResolveNamespacePathFn,
         store: NamespaceStore,
         broadcaster: BroadcasterHandle,
+        fence: Arc<FenceController>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>>;
 
     fn cleanup<'a>(

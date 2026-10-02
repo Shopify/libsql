@@ -187,6 +187,62 @@ pub struct MetaStoreConfig {
     pub allow_recover_from_fs: bool,
     /// Destroy the metastore if there is a restore error
     pub destroy_on_error: bool,
+    /// Allow namespace fences to be used: creates the fence tables. Fences that already exist
+    /// are loaded and enforced whether or not this is set.
+    pub namespace_fence: bool,
+    /// How long receipts of finished fence operations are kept. `None` is the default of
+    /// 30 days.
+    pub namespace_fence_receipt_retention: Option<Duration>,
+    /// How long `AcquireSourceWriteFence` waits for active writers when the request names no
+    /// drain policy. `None` is the default of 30 seconds.
+    pub namespace_fence_default_write_drain: Option<Duration>,
+    /// How long `SetSourceReadFence` waits for running reads and streams before it cancels
+    /// them, when the request names no drain policy. `None` is the default of 30 seconds.
+    pub namespace_fence_default_read_drain: Option<Duration>,
+    /// The separate secret that authorises namespace fence adoption (`AdoptFence`), presented
+    /// in the `x-libsql-fence-adoption-key` header beside the admin credential. `None`
+    /// disables adoption.
+    pub namespace_fence_adoption_key: Option<FenceAdoptionKey>,
+}
+
+/// The secret that authorises namespace fence adoption (`docs/NAMESPACE_FENCE.md` section 12).
+///
+/// Only its SHA-256 digest is kept, and a presented key is compared digest to digest without
+/// an early exit, so the comparison takes the same time whatever the presented key is. `Debug`
+/// never prints it.
+#[derive(Clone)]
+pub struct FenceAdoptionKey(Arc<[u8; 32]>);
+
+impl FenceAdoptionKey {
+    /// `None` for an empty key, which would authorise nothing.
+    pub fn new(key: &str) -> Option<Self> {
+        if key.is_empty() {
+            return None;
+        }
+        Some(Self(Arc::new(Self::digest(key.as_bytes()))))
+    }
+
+    /// Whether `presented` is the configured key.
+    pub fn matches(&self, presented: &[u8]) -> bool {
+        let presented = Self::digest(presented);
+        let difference = self
+            .0
+            .iter()
+            .zip(presented.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        difference == 0
+    }
+
+    fn digest(bytes: &[u8]) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes).into()
+    }
+}
+
+impl std::fmt::Debug for FenceAdoptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FenceAdoptionKey(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone)]

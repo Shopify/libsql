@@ -40,7 +40,20 @@ pub mod rpc {
 
     impl From<SqldError> for Error {
         fn from(other: SqldError) -> Self {
+            // A fence denial is an ordinary SQL error to an older replica, and carries its
+            // stable code in the additive `stable_code` field for one that maps it
+            // (`docs/NAMESPACE_FENCE.md` section 6.1).
+            let stable_code = other
+                .fence_error()
+                .and_then(|e| e.outcome().proxy_stable_code());
+            if let Some(fence) = other.fence_error().filter(|_| stable_code.is_some()) {
+                crate::namespace::fence::audit::denied(
+                    fence,
+                    crate::namespace::fence::audit::DenialSurface::Rpc,
+                );
+            }
             let code = match other {
+                _ if stable_code.is_some() => ErrorCode::SqlError,
                 SqldError::LibSqlInvalidQueryParams(_) => ErrorCode::SqlError,
                 SqldError::LibSqlTxTimeout => ErrorCode::TxTimeout,
                 SqldError::LibSqlTxBusy => ErrorCode::TxBusy,
@@ -57,6 +70,7 @@ pub mod rpc {
                 message: other.to_string(),
                 code: code as i32,
                 extended_code,
+                stable_code: stable_code.map(Into::into),
             }
         }
     }
@@ -64,6 +78,7 @@ pub mod rpc {
     impl From<SqldError> for ErrorCode {
         fn from(other: SqldError) -> Self {
             match other {
+                _ if other.fence_error().is_some() => ErrorCode::SqlError,
                 SqldError::LibSqlInvalidQueryParams(_) => ErrorCode::SqlError,
                 SqldError::LibSqlTxTimeout => ErrorCode::TxTimeout,
                 SqldError::LibSqlTxBusy => ErrorCode::TxBusy,
@@ -315,10 +330,14 @@ impl ProxyService {
             Ok(Ok(None)) => self.user_auth_strategy.clone(),
             Err(e) => match e.as_ref() {
                 crate::error::Error::NamespaceDoesntExist(_) => None,
-                _ => Err(tonic::Status::internal(format!(
-                    "Error fetching jwt key for a namespace: {}",
-                    e
-                )))?,
+                // A namespace the fence refuses is refused with the typed status, never
+                // retried by the write proxy (`docs/NAMESPACE_FENCE.md` section 6.1).
+                e => Err(fence_status(e).unwrap_or_else(|| {
+                    tonic::Status::internal(format!(
+                        "Error fetching jwt key for a namespace: {}",
+                        e
+                    ))
+                }))?,
             },
             Ok(Err(e)) => Err(tonic::Status::internal(format!(
                 "Error fetching jwt key for a namespace: {}",
@@ -567,6 +586,31 @@ pub async fn garbage_collect(clients: &mut HashMap<Uuid, Arc<TimeoutConnection>>
     }
 }
 
+/// The typed status of a fence denial on the proxy service (`docs/NAMESPACE_FENCE.md` section
+/// 6.1): `FAILED_PRECONDITION` with the stable code, never `UNAVAILABLE`, which the write
+/// proxy retries without bound.
+/// Counted as a denial on the `rpc` surface when it is one.
+fn fence_status(e: &crate::error::Error) -> Option<tonic::Status> {
+    let fence = e.fence_error()?;
+    let status = fence.to_grpc_status()?;
+    crate::namespace::fence::audit::denied(
+        fence,
+        crate::namespace::fence::audit::DenialSurface::Rpc,
+    );
+    Some(status)
+}
+
+/// The status for an error looking up the namespace a proxy request names.
+fn namespace_status(e: crate::error::Error) -> tonic::Status {
+    if let crate::error::Error::NamespaceDoesntExist(_) = e {
+        tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
+    } else if let Some(status) = fence_status(&e) {
+        status
+    } else {
+        tonic::Status::internal(e.to_string())
+    }
+}
+
 #[tonic::async_trait]
 impl Proxy for ProxyService {
     type StreamExecStream = Pin<Box<dyn Stream<Item = Result<ExecResp, tonic::Status>> + Send>>;
@@ -585,18 +629,13 @@ impl Proxy for ProxyService {
                 (connection_maker, notifier)
             })
             .await
-            .map_err(|e| {
-                if let crate::error::Error::NamespaceDoesntExist(_) = e {
-                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
-                } else {
-                    tonic::Status::internal(e.to_string())
-                }
-            })?;
+            .map_err(namespace_status)?;
 
-        let conn = connection_maker
-            .create()
-            .await
-            .map_err(|e| tonic::Status::unavailable(format!("Unable to create DB: {:?}", e)))?;
+        let conn = connection_maker.create().await.map_err(|e| {
+            fence_status(&e).unwrap_or_else(|| {
+                tonic::Status::unavailable(format!("Unable to create DB: {:?}", e))
+            })
+        })?;
 
         let stream = make_proxy_stream(conn, ctx, req.into_inner());
 
@@ -617,13 +656,7 @@ impl Proxy for ProxyService {
             .namespaces
             .with(ctx.namespace().clone(), |ns| ns.db.connection_maker())
             .await
-            .map_err(|e| {
-                if let crate::error::Error::NamespaceDoesntExist(_) = e {
-                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
-                } else {
-                    tonic::Status::internal(e.to_string())
-                }
-            })?;
+            .map_err(namespace_status)?;
 
         let conn = {
             let lock = self.clients.upgradable_read().await;
@@ -645,7 +678,9 @@ impl Proxy for ProxyService {
                             conn
                         }
                         Err(e) => {
-                            return Err(tonic::Status::new(tonic::Code::Internal, e.to_string()))
+                            return Err(fence_status(&e).unwrap_or_else(|| {
+                                tonic::Status::new(tonic::Code::Internal, e.to_string())
+                            }))
                         }
                     }
                 }
@@ -659,7 +694,11 @@ impl Proxy for ProxyService {
             .execute_program(pgm, ctx, builder, None)
             .await
             // TODO: this is no necessarily a permission denied error!
-            .map_err(|e| tonic::Status::new(tonic::Code::PermissionDenied, e.to_string()))?;
+            .map_err(|e| {
+                fence_status(&e).unwrap_or_else(|| {
+                    tonic::Status::new(tonic::Code::PermissionDenied, e.to_string())
+                })
+            })?;
 
         Ok(tonic::Response::new(builder.into_ret()))
     }
@@ -691,13 +730,7 @@ impl Proxy for ProxyService {
             .namespaces
             .with(ctx.namespace().clone(), |ns| ns.db.connection_maker())
             .await
-            .map_err(|e| {
-                if let crate::error::Error::NamespaceDoesntExist(_) = e {
-                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
-                } else {
-                    tonic::Status::internal(e.to_string())
-                }
-            })?;
+            .map_err(namespace_status)?;
 
         let DescribeRequest { client_id, stmt } = req.into_inner();
         let client_id = Uuid::from_str(&client_id).unwrap();
@@ -719,7 +752,11 @@ impl Proxy for ProxyService {
                         lock.insert(client_id, conn.clone());
                         conn
                     }
-                    Err(e) => return Err(tonic::Status::new(tonic::Code::Internal, e.to_string())),
+                    Err(e) => {
+                        return Err(fence_status(&e).unwrap_or_else(|| {
+                            tonic::Status::new(tonic::Code::Internal, e.to_string())
+                        }))
+                    }
                 }
             }
         };
@@ -753,5 +790,291 @@ impl Proxy for ProxyService {
                 param_count,
             })),
         }))
+    }
+}
+
+/// Fence denials on the proxy protocol (`docs/NAMESPACE_FENCE.md` section 6.1): the primary
+/// fills the additive `stable_code` of a step or program error and answers a namespace it
+/// refuses with the typed `FAILED_PRECONDITION` status; the replica side turns both back into
+/// the same fence denial, and an older primary's errors keep their untyped mapping.
+#[cfg(test)]
+mod fence_tests {
+    use libsql_replication::rpc::proxy::error::ErrorCode;
+    use libsql_replication::rpc::proxy::exec_resp;
+    use libsql_replication::rpc::proxy::{
+        resp_step, ExecReq, ProgramResp, RespStep, StepError, StreamProgramReq,
+    };
+    use libsql_replication::rpc::replication::NAMESPACE_METADATA_KEY;
+    use tempfile::tempdir;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_stream::StreamExt as _;
+    use tonic::metadata::BinaryMetadataValue;
+
+    use super::*;
+    use crate::connection::program::Program;
+    use crate::error::Error;
+    use crate::namespace::fence::drain::tests::{fence_outcome, Source, LONG};
+    use crate::namespace::fence::outcome::{FenceError, FenceOutcome, GRPC_FENCE_CODE_METADATA};
+    use crate::namespace::fence::read::tests::{fenced_source, read_fence};
+    use crate::namespace::fence::store as fence_store;
+    use crate::query_result_builder::QueryBuilderConfig;
+
+    const WRITE: &str = "insert into t values (3)";
+    const READ: &str = "select count(*) from t";
+
+    fn service(s: &NamespaceStore) -> ProxyService {
+        ProxyService::new(s.clone(), None, false)
+    }
+
+    fn request<T>(ns: &str, msg: T) -> tonic::Request<T> {
+        let mut req = tonic::Request::new(msg);
+        req.metadata_mut().insert_bin(
+            NAMESPACE_METADATA_KEY,
+            BinaryMetadataValue::from_bytes(ns.as_bytes()),
+        );
+        Authenticated::FullAccess.upgrade_grpc_request(&mut req);
+        req
+    }
+
+    fn program_req(sql: &str) -> rpc::ProgramReq {
+        rpc::ProgramReq {
+            client_id: Uuid::new_v4().to_string(),
+            pgm: Some(Program::seq(&[sql]).into()),
+        }
+    }
+
+    #[track_caller]
+    fn assert_fence_status(status: &tonic::Status, outcome: FenceOutcome) {
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert_eq!(
+            status
+                .metadata()
+                .get(GRPC_FENCE_CODE_METADATA)
+                .and_then(|v| v.to_str().ok()),
+            Some(outcome.as_str()),
+            "{status:?}"
+        );
+        assert_eq!(
+            FenceError::outcome_from_grpc_status(status),
+            Some(outcome),
+            "{status:?}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_proxy_error(error: &rpc::Error, outcome: FenceOutcome) {
+        assert_eq!(error.code, ErrorCode::SqlError as i32, "{error:?}");
+        assert_eq!(error.stable_code.as_deref(), Some(outcome.as_str()));
+        assert!(error.message.starts_with(outcome.as_str()), "{error:?}");
+    }
+
+    /// The step errors of a streamed program, run on `ns` through the primary's proxy stream.
+    async fn stream_program(s: &Source, sql: &str) -> Vec<exec_resp::Response> {
+        let conn = s
+            .store
+            .with("ns".into(), |ns| ns.db.connection_maker())
+            .await
+            .unwrap()
+            .create()
+            .await
+            .unwrap();
+        let ctx = RequestContext::new(
+            Authenticated::FullAccess,
+            "ns".into(),
+            s.store.meta_store().clone(),
+        );
+        let (snd, rcv) = tokio::sync::mpsc::channel(1);
+        let stream = make_proxy_stream(conn, ctx, ReceiverStream::new(rcv));
+        tokio::pin!(stream);
+        snd.send(Ok(ExecReq {
+            request_id: 0,
+            request: Some(libsql_replication::rpc::proxy::exec_req::Request::Execute(
+                StreamProgramReq {
+                    pgm: Some(Program::seq(&[sql]).into()),
+                },
+            )),
+        }))
+        .await
+        .unwrap();
+        // The request stream stays open until the program is answered: a closed request stream
+        // ends the proxy stream.
+        let mut responses = Vec::new();
+        while let Some(resp) = stream.next().await {
+            let resp = resp.unwrap().response.unwrap();
+            let last = match &resp {
+                exec_resp::Response::ProgramResp(p) => p
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s.step, Some(resp_step::Step::Finish(_)))),
+                _ => true,
+            };
+            responses.push(resp);
+            if last {
+                break;
+            }
+        }
+        drop(snd);
+        responses
+    }
+
+    fn step_errors(responses: &[exec_resp::Response]) -> Vec<&rpc::Error> {
+        responses
+            .iter()
+            .filter_map(|r| match r {
+                exec_resp::Response::ProgramResp(p) => Some(p),
+                _ => None,
+            })
+            .flat_map(|p| &p.steps)
+            .filter_map(|s| match &s.step {
+                Some(resp_step::Step::StepError(StepError { error: Some(e) })) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Section 6.1 on the primary: a write refused at the WAL gate is a step error with the
+    /// stable code, a read refused by the read fence is a program error with it (streamed) or
+    /// the typed status (unary), and a namespace whose fence state is unknown is refused with
+    /// the typed status before any connection is made.
+    #[tokio::test]
+    async fn rpc_codes() {
+        let s = fenced_source().await;
+
+        // Write-fenced: the write step carries MIGRATION_WRITE_FENCED, reads are served.
+        let streamed = stream_program(&s, WRITE).await;
+        let errors = step_errors(&streamed);
+        assert_eq!(errors.len(), 1, "{streamed:?}");
+        assert_proxy_error(errors[0], FenceOutcome::MigrationWriteFenced);
+        assert!(step_errors(&stream_program(&s, READ).await).is_empty());
+
+        let unary = service(&s.store)
+            .execute(request("ns", program_req(WRITE)))
+            .await
+            .unwrap()
+            .into_inner();
+        match &unary.results[..] {
+            [QueryResult {
+                row_result: Some(RowResult::Error(e)),
+            }] => assert_proxy_error(e, FenceOutcome::MigrationWriteFenced),
+            other => panic!("{other:?}"),
+        }
+
+        // Read-fenced: the whole program is refused.
+        let fenced = s.execute(read_fence(&s, 2, LONG)).await.unwrap();
+        assert_eq!(fence_outcome(&fenced), FenceOutcome::Applied);
+        match &stream_program(&s, READ).await[..] {
+            [exec_resp::Response::Error(e)] => {
+                assert_proxy_error(e, FenceOutcome::MigrationReadFenced)
+            }
+            other => panic!("{other:?}"),
+        }
+        let status = service(&s.store)
+            .execute(request("ns", program_req(READ)))
+            .await
+            .unwrap_err();
+        assert_fence_status(&status, FenceOutcome::MigrationReadFenced);
+
+        // A namespace whose fence state cannot be established.
+        let tmp = tempdir().unwrap();
+        let broken = tmp.path().join("dbs").join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(fence_store::MARKER_FILE_NAME), b"garbage").unwrap();
+        let store = crate::namespace::open_test_store(tmp.path()).await;
+        let status = service(&store)
+            .execute(request("broken", program_req(READ)))
+            .await
+            .unwrap_err();
+        assert_fence_status(&status, FenceOutcome::FenceStateUnavailable);
+        assert_eq!(
+            namespace_status(Error::NamespaceFence(
+                store
+                    .with("broken".into(), |_| ())
+                    .await
+                    .unwrap_err()
+                    .fence_error()
+                    .unwrap()
+                    .clone()
+            ))
+            .code(),
+            tonic::Code::FailedPrecondition
+        );
+        // A connection a fence refuses is never reported as `UNAVAILABLE`.
+        let e = Error::NamespaceFence(FenceError::new(FenceOutcome::MigrationWriteFenced, "x"));
+        assert_fence_status(
+            &fence_status(&e).unwrap(),
+            FenceOutcome::MigrationWriteFenced,
+        );
+        assert!(fence_status(&Error::LibSqlTxBusy).is_none());
+    }
+
+    /// Section 6.1 on the replica: a proxied fence denial becomes the fence error the replica
+    /// answers its client with, whether it arrives as a step error, a program error or a
+    /// status; an older primary's errors (no `stable_code`) keep their untyped mapping.
+    #[tokio::test]
+    async fn replica_maps_proxied_denials() {
+        let denial = FenceError::new(FenceOutcome::MigrationWriteFenced, "writes are fenced");
+        let proxied: rpc::Error = Error::NamespaceFence(denial.clone()).into();
+        assert_eq!(proxied.code, ErrorCode::SqlError as i32);
+        match Error::from_proxy_error(proxied.clone()) {
+            Error::NamespaceFence(e) => assert_eq!(e, denial),
+            other => panic!("{other:?}"),
+        }
+        // An older primary: same error without the additive field.
+        let old = rpc::Error {
+            stable_code: None,
+            ..proxied.clone()
+        };
+        assert!(matches!(
+            Error::from_proxy_error(old.clone()),
+            Error::RpcQueryError(e) if e == old
+        ));
+        // A code this server does not know stays untyped too.
+        let unknown = rpc::Error {
+            stable_code: Some("SOMETHING_NEW".into()),
+            ..proxied.clone()
+        };
+        assert!(matches!(
+            Error::from_proxy_error(unknown),
+            Error::RpcQueryError(_)
+        ));
+        // Other errors are unchanged.
+        let busy: rpc::Error = Error::LibSqlTxBusy.into();
+        assert_eq!(busy.stable_code, None);
+        assert_eq!(busy.code, ErrorCode::TxBusy as i32);
+
+        // Status at connection time: typed denial, not retried; anything else unchanged.
+        match Error::from_proxy_status(denial.to_grpc_status().unwrap()) {
+            Error::NamespaceFence(e) => assert_eq!(e, denial),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            Error::from_proxy_status(tonic::Status::failed_precondition("x")),
+            Error::RpcQueryExecutionError(_)
+        ));
+
+        // A step error applied to the replica's result builder.
+        let resp = ProgramResp {
+            steps: [
+                resp_step::Step::Init(Default::default()),
+                resp_step::Step::BeginStep(Default::default()),
+                resp_step::Step::StepError(StepError {
+                    error: Some(proxied),
+                }),
+                resp_step::Step::FinishStep(Default::default()),
+                resp_step::Step::Finish(Default::default()),
+            ]
+            .into_iter()
+            .map(|step| RespStep { step: Some(step) })
+            .collect(),
+        };
+        let mut builder = crate::http::user::result_builder::JsonHttpPayloadBuilder::new();
+        crate::rpc::streaming_exec::apply_program_resp_to_builder(
+            &QueryBuilderConfig::default(),
+            &mut builder,
+            resp,
+            |_, _| (),
+        )
+        .unwrap();
+        assert_eq!(builder.take_fence_denial(), Some(denial));
     }
 }
