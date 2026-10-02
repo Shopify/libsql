@@ -2,6 +2,7 @@ use std::future::Future;
 
 use super::rpc::replication::Frame as RpcFrame;
 pub use sqlite_injector::SqliteInjector;
+use tokio_util::sync::CancellationToken;
 
 use crate::frame::FrameNo;
 
@@ -17,6 +18,22 @@ pub trait Injector {
         &mut self,
         frame: RpcFrame,
     ) -> impl Future<Output = Result<Option<FrameNo>>> + Send;
+
+    /// Inject a singular frame, cooperatively observing terminal sync cancellation.
+    ///
+    /// Cancellation is a best-effort capability for injectors. The default
+    /// implementation preserves the base `Injector` contract and does not
+    /// interrupt in-flight work; injectors that can safely interrupt their
+    /// backend should override this method and return
+    /// [`Error::SyncCancelledForShutdown`] only for cancellation-caused
+    /// interruptions.
+    fn inject_frame_with_cancellation(
+        &mut self,
+        frame: RpcFrame,
+        _token: &CancellationToken,
+    ) -> impl Future<Output = Result<Option<FrameNo>>> + Send {
+        self.inject_frame(frame)
+    }
 
     /// Discard any uncommintted frames.
     fn rollback(&mut self) -> impl Future<Output = ()> + Send;
