@@ -12,8 +12,8 @@ use crate::auth::Authenticated;
 use crate::error::Error;
 use crate::http::user::timing::sample_time;
 use crate::metrics::{
-    CONCURRENT_CONNECTIONS_COUNT, CONNECTION_ALIVE_DURATION, CONNECTION_CREATE_TIME,
-    TOTAL_RESPONSE_SIZE_HIST,
+    record_connection_alive_duration, record_connection_create_time,
+    record_total_response_size_before_lock, CONCURRENT_CONNECTIONS_COUNT,
 };
 use crate::namespace::meta_store::MetaStore;
 use crate::namespace::NamespaceName;
@@ -360,8 +360,9 @@ impl<F: MakeConnection> MakeConnection for MakeThrottledConnection<F> {
             "Available semaphore units: {}",
             self.semaphore.available_permits()
         );
-        TOTAL_RESPONSE_SIZE_HIST
-            .record(TOTAL_RESPONSE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f64);
+        record_total_response_size_before_lock(
+            TOTAL_RESPONSE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f64,
+        );
         let units = self.units_to_take();
         let waiters_guard = WaitersGuard::new(&self.waiters);
         if (waiters_guard.waiters.load(Ordering::Relaxed) as u64) >= self.max_concurrent_requests {
@@ -389,7 +390,7 @@ impl<F: MakeConnection> MakeConnection for MakeThrottledConnection<F> {
         let inner = self.connection_maker.create().await?;
 
         CONCURRENT_CONNECTIONS_COUNT.increment(1.0);
-        CONNECTION_CREATE_TIME.record(before_create.elapsed());
+        record_connection_create_time(before_create.elapsed());
 
         Ok(TrackedConnection {
             permit,
@@ -411,7 +412,7 @@ impl<T> Drop for TrackedConnection<T> {
     fn drop(&mut self) {
         sample_time("connection-duration", self.created_at.elapsed());
         CONCURRENT_CONNECTIONS_COUNT.decrement(1.0);
-        CONNECTION_ALIVE_DURATION.record(self.created_at.elapsed());
+        record_connection_alive_duration(self.created_at.elapsed());
     }
 }
 
