@@ -106,6 +106,96 @@ fn fork_namespace() {
 }
 
 #[test]
+fn admin_rejects_namespace_path_traversal_without_touching_outside_files() {
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(1000))
+        .build();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("sentinel"), b"keep me").unwrap();
+    let dbs = tmp.path().join("dbs");
+    let absolute_victim =
+        url::form_urlencoded::byte_serialize(outside.to_str().unwrap().as_bytes())
+            .collect::<String>()
+            .replace('+', "%20");
+    let dbs_for_client = dbs.clone();
+
+    sim.client("client", async move {
+        let client = Client::new();
+        assert!(client
+            .post(
+                "http://primary:9090/v1/namespaces/safe-1.example/create",
+                json!({})
+            )
+            .await?
+            .status()
+            .is_success());
+        std::fs::create_dir_all(dbs_for_client.join("sentinel"))?;
+        std::fs::write(dbs_for_client.join("sentinel/marker"), b"keep me too")?;
+        for name in [
+            "%2e%2e".to_owned(),
+            "%2e%2e%2foutside".to_owned(),
+            absolute_victim,
+            "bad%5cname".to_owned(),
+        ] {
+            assert_eq!(
+                client
+                    .post(
+                        &format!("http://primary:9090/v1/namespaces/{name}/create"),
+                        json!({})
+                    )
+                    .await?
+                    .status(),
+                hyper::StatusCode::BAD_REQUEST,
+                "create {name}"
+            );
+            assert_eq!(
+                client
+                    .delete(
+                        &format!("http://primary:9090/v1/namespaces/{name}"),
+                        json!({})
+                    )
+                    .await?
+                    .status(),
+                hyper::StatusCode::BAD_REQUEST,
+                "delete {name}"
+            );
+            assert_eq!(
+                client
+                    .post(
+                        &format!("http://primary:9090/v1/namespaces/safe-1.example/fork/{name}"),
+                        ()
+                    )
+                    .await?
+                    .status(),
+                hyper::StatusCode::BAD_REQUEST,
+                "fork {name}"
+            );
+        }
+        assert_eq!(
+            client
+                .post("http://primary:9090/v1/namespaces/%2e%2e/fork/target", ())
+                .await?
+                .status(),
+            hyper::StatusCode::BAD_REQUEST
+        );
+        Ok(())
+    });
+
+    sim.run().unwrap();
+    assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"keep me");
+    assert_eq!(
+        std::fs::read(dbs.join("sentinel/marker")).unwrap(),
+        b"keep me too"
+    );
+    assert!(dbs.join("safe-1.example").exists());
+    assert!(!dbs.join("target").exists());
+}
+
+#[test]
 fn delete_namespace() {
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(1000))

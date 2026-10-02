@@ -81,6 +81,52 @@ impl Scheduler {
                     tracing::info!("all scheduler handles dropped: exiting.");
                     break;
                 }
+                Err(
+                    e @ (Error::InvalidPersistedNamespace { .. }
+                    | Error::InvalidPersistedMigration { .. }),
+                ) => {
+                    let job_id = match &e {
+                        Error::InvalidPersistedNamespace {
+                            kind: "job", id, ..
+                        } => *id,
+                        Error::InvalidPersistedMigration { job_id, .. } => *job_id,
+                        Error::InvalidPersistedNamespace { kind: "task", .. } => self
+                            .current_job
+                            .as_ref()
+                            .expect("invalid migration task without a current job")
+                            .job_id(),
+                        _ => unreachable!(),
+                    };
+                    tracing::error!(job_id, "isolating invalid migration job for repair: {e}");
+
+                    // Workers already started for this job may still update their task
+                    // statuses. Drain them before discarding the in-memory job state;
+                    // never mark the persisted job or its bad task complete.
+                    while let Some(result) = self.workers.join_next().await {
+                        if let Err(error) = result {
+                            tracing::error!(
+                                job_id,
+                                "migration worker failed while isolating job: {error}"
+                            );
+                        }
+                    }
+                    self.current_batch.clear();
+                    self.current_job = None;
+                    let result = with_conn_async(self.migration_db.clone(), move |conn| {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO blocked_migration_jobs (job_id) VALUES (?)",
+                            [job_id],
+                        )?;
+                        Ok(())
+                    })
+                    .await;
+                    if let Err(error) = result {
+                        tracing::error!(job_id, "could not isolate invalid migration job: {error}");
+                        break;
+                    }
+                    tries = 0;
+                    self.has_work = true;
+                }
                 Err(e) => {
                     if tries >= MAX_ERROR_RETRIES {
                         tracing::error!("scheduler could not make progress after {MAX_ERROR_RETRIES}, exiting: {e}");
@@ -925,6 +971,180 @@ mod test {
         }
 
         assert!(!block_write.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InvalidJobRow {
+        SchemaName,
+        TaskName,
+        MigrationProgram,
+    }
+
+    async fn assert_invalid_job_is_isolated(invalid_row: InvalidJobRow) {
+        let tmp = tempdir().unwrap();
+        let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            maker().unwrap(),
+            manager,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        let (sender, receiver) = mpsc::channel(100);
+        let store = NamespaceStore::new(
+            false,
+            false,
+            10,
+            meta_store,
+            make_config(sender.clone().into(), tmp.path()),
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        let scheduler = Scheduler::new(store.clone(), maker().unwrap())
+            .await
+            .unwrap();
+
+        store
+            .create(
+                "healthy-schema".into(),
+                RestoreOption::Latest,
+                DatabaseConfig {
+                    is_shared_schema: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                "healthy-tenant".into(),
+                RestoreOption::Latest,
+                DatabaseConfig {
+                    shared_schema_name: Some("healthy-schema".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        if invalid_row != InvalidJobRow::SchemaName {
+            store
+                .create(
+                    "bad-task-schema".into(),
+                    RestoreOption::Latest,
+                    DatabaseConfig {
+                        is_shared_schema: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let bad_job_id;
+        let healthy_job_id;
+        {
+            let mut conn = scheduler.migration_db.lock();
+            let migration = if invalid_row == InvalidJobRow::MigrationProgram {
+                "not json".to_owned()
+            } else {
+                serde_json::to_string(&Program::seq(&["CREATE TABLE example (id)"])).unwrap()
+            };
+            conn.execute(
+                "INSERT INTO jobs (schema, migration, status) VALUES (?1, ?2, ?3)",
+                (
+                    if invalid_row == InvalidJobRow::SchemaName {
+                        "../bad-schema"
+                    } else {
+                        "bad-task-schema"
+                    },
+                    &migration,
+                    MigrationJobStatus::WaitingDryRun as u64,
+                ),
+            )
+            .unwrap();
+            bad_job_id = conn.last_insert_rowid();
+            if invalid_row == InvalidJobRow::TaskName {
+                conn.execute(
+                    "INSERT INTO pending_tasks (job_id, target_namespace, status) VALUES (?1, '../bad-target', ?2)",
+                    (bad_job_id, MigrationTaskStatus::Enqueued as u64),
+                )
+                .unwrap();
+            }
+            healthy_job_id = register_schema_migration_job(
+                &mut conn,
+                &"healthy-schema".into(),
+                &Program::seq(&["CREATE TABLE example (id)"]),
+            )
+            .unwrap();
+        }
+
+        let scheduler_task = tokio::spawn(scheduler.run(receiver));
+        let handle = SchedulerHandle::from(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let (status, _) = handle.get_job_status(healthy_job_id).await.unwrap();
+                if status == MigrationJobStatus::RunSuccess {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("healthy schema migration stalled behind invalid job");
+
+        assert!(
+            !scheduler_task.is_finished(),
+            "scheduler exited after invalid job"
+        );
+        let conn = maker().unwrap();
+        let bad_status: u64 = conn
+            .query_row(
+                "SELECT status FROM jobs WHERE job_id = ?",
+                [bad_job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_status, MigrationJobStatus::WaitingDryRun as u64);
+        if invalid_row == InvalidJobRow::TaskName {
+            let target: String = conn
+                .query_row(
+                    "SELECT target_namespace FROM pending_tasks WHERE job_id = ?",
+                    [bad_job_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(target, "../bad-target");
+        }
+        if invalid_row != InvalidJobRow::SchemaName {
+            assert!(matches!(
+                handle
+                    .register_migration_task(
+                        "bad-task-schema".into(),
+                        Program::seq(&["CREATE TABLE another (id)"]).into(),
+                    )
+                    .await,
+                Err(Error::MigrationJobAlreadyInProgress(_))
+            ));
+        }
+        scheduler_task.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_job_does_not_stop_independent_migrations() {
+        assert_invalid_job_is_isolated(InvalidJobRow::SchemaName).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_task_does_not_stop_independent_migrations() {
+        assert_invalid_job_is_isolated(InvalidJobRow::TaskName).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_program_does_not_stop_independent_migrations() {
+        assert_invalid_job_is_isolated(InvalidJobRow::MigrationProgram).await;
     }
 
     fn make_config(migration_scheduler: SchedulerHandle, path: &Path) -> NamespaceConfigurators {

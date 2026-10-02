@@ -32,7 +32,8 @@ impl Authenticated {
             .transpose()
             .map_err(|_| Status::invalid_argument("missing authorization header"))?
         {
-            Some(s) => serde_json::from_str::<Authenticated>(s).unwrap(),
+            Some(s) => serde_json::from_str::<Authenticated>(s)
+                .map_err(|_| Status::invalid_argument("invalid x-proxy-authorization"))?,
             None => return Err(Status::invalid_argument("x-proxy-authorization not set")),
         };
 
@@ -98,6 +99,27 @@ impl Authenticated {
             _ => Err(crate::Error::Forbidden(format!(
                 "DDL statements not permitted on namespace {namespace}"
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_proxy_authorization_is_an_error_not_a_panic() {
+        for value in [
+            "not json",
+            r#"{"Legacy":{"namespace":"../escape","perm":"Read"}}"#,
+        ] {
+            let mut req = tonic::Request::new(());
+            req.metadata_mut().insert(
+                GRPC_PROXY_AUTH_HEADER,
+                tonic::metadata::AsciiMetadataValue::try_from(value).unwrap(),
+            );
+            let error = Authenticated::from_proxy_grpc_request(&req).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
         }
     }
 }

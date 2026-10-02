@@ -13,8 +13,16 @@ pub enum Error {
     SchedulerExited,
     #[error("corrupted job status: {0}")]
     CorruptedJobStatus(serde_json::Error),
+    #[error("invalid persisted migration program in job {job_id}: {reason}; repair the metastore entry before restarting the scheduler")]
+    InvalidPersistedMigration { job_id: i64, reason: String },
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("invalid persisted namespace in migration {kind} {id}: {name:?}; repair the metastore entry before restarting the scheduler")]
+    InvalidPersistedNamespace {
+        kind: &'static str,
+        id: i64,
+        name: String,
+    },
     #[error("`{0}` is not a schema database")]
     NotASchema(NamespaceName),
     #[error("schema `{0}` doesn't exist")]

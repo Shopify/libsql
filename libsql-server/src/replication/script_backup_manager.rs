@@ -191,8 +191,8 @@ fn parse_snapshot_path(path: PathBuf) -> Result<SnapshotEntry> {
         return Err(Error::InvalidSnapshotPath(path.clone()));
     };
 
-    // we reverse split because the namespace name is allowed any char
-    let mut split = name.rsplit(":");
+    // Split only the two suffix separators: a Unix namespace may contain ':'.
+    let mut split = name.rsplitn(3, ':');
     let Some(range) = split.next() else {
         return Err(Error::InvalidSnapshotPath(path.clone()));
     };
@@ -211,13 +211,16 @@ fn parse_snapshot_path(path: PathBuf) -> Result<SnapshotEntry> {
         return Err(Error::InvalidSnapshotPath(path.clone()));
     };
 
-    let start_frame_no = FrameNo::from_str_radix(start_str, 16).unwrap();
-    let end_frame_no = FrameNo::from_str_radix(end_str, 16).unwrap();
+    let start_frame_no = FrameNo::from_str_radix(start_str, 16)
+        .map_err(|_| Error::InvalidSnapshotPath(path.clone()))?;
+    let end_frame_no = FrameNo::from_str_radix(end_str, 16)
+        .map_err(|_| Error::InvalidSnapshotPath(path.clone()))?;
 
     let Ok(log_id) = Uuid::from_str(log_id) else {
         return Err(Error::InvalidSnapshotPath(path.clone()));
     };
-    let namespace = NamespaceName::from_string(namespace.to_string()).unwrap();
+    let namespace = NamespaceName::from_string(namespace.to_string())
+        .map_err(|_| Error::InvalidSnapshotPath(path.clone()))?;
 
     Ok(SnapshotEntry {
         namespace,
@@ -298,6 +301,24 @@ mod test {
     use proptest::prelude::*;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn invalid_legacy_snapshot_namespace_does_not_panic() {
+        let path = PathBuf::from("script_backup/bad\\name:550e8400-e29b-41d4-a716-446655440000:00000000000000000001-00000000000000000002.snap");
+        assert!(matches!(
+            parse_snapshot_path(path),
+            Err(Error::InvalidSnapshotPath(_))
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn snapshot_namespace_with_colon_round_trips() {
+        let namespace = NamespaceName::from_string("tenant:1:archive".into()).unwrap();
+        let path = make_snapshot_path("/test", &namespace, 1, 2, Uuid::nil());
+        let entry = parse_snapshot_path(path).unwrap();
+        assert_eq!(entry.namespace, namespace);
+    }
 
     proptest! {
         #[test]
