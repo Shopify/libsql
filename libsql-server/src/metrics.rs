@@ -1,7 +1,16 @@
 #![allow(dead_code)]
+//! Process-wide metrics.
+//!
+//! Counters and gauges are cached `Lazy` handles. Histograms MUST NOT be: the Prometheus exporter is
+//! configured with an idle timeout (`http::admin`), and when it evicts a histogram key a cached
+//! `metrics::Histogram` handle keeps pushing 16-byte samples into an `AtomicBucket` the exporter will
+//! never drain again (unbounded memory growth). Record histograms through the `record_*` functions
+//! below, which use the `histogram!` macro and therefore re-register the key on every call.
+use std::time::Duration;
+
 use metrics::{
-    describe_counter, describe_gauge, describe_histogram, register_counter, register_gauge,
-    register_histogram, Counter, Gauge, Histogram,
+    describe_counter, describe_gauge, describe_histogram, histogram, register_counter,
+    register_gauge, Counter, Gauge,
 };
 use once_cell::sync::Lazy;
 
@@ -27,66 +36,37 @@ pub static CONCURRENT_CONNECTIONS_COUNT: Lazy<Gauge> = Lazy::new(|| {
     describe_gauge!(NAME, "number of concurrent connections");
     register_gauge!(NAME)
 });
-pub static TOTAL_RESPONSE_SIZE_HIST: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_total_response_size_before_lock";
-    describe_histogram!(NAME, "total response size value before connection lock");
-    register_histogram!(NAME)
-});
+/// Total in-flight response size observed before a connection lock is taken.
+#[inline]
+pub fn record_total_response_size_before_lock(bytes: f64) {
+    histogram!("libsql_server_total_response_size_before_lock", bytes);
+}
 pub static STREAM_HANDLES_COUNT: Lazy<Gauge> = Lazy::new(|| {
     const NAME: &str = "libsql_server_stream_handles";
     describe_gauge!(NAME, "amount of in-memory stream handles");
     register_gauge!(NAME)
 });
-pub static NAMESPACE_LOAD_LATENCY: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_namespace_load_latency";
-    describe_histogram!(NAME, "latency is us when loading a namespace");
-    register_histogram!(NAME)
-});
-pub static CONNECTION_CREATE_TIME: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_connection_create_time";
-    describe_histogram!(NAME, "time to create a connection");
-    register_histogram!(NAME)
-});
-pub static CONNECTION_ALIVE_DURATION: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_connection_alive_duration";
-    describe_histogram!(NAME, "duration for which a connection was kept alive");
-    register_histogram!(NAME)
-});
-pub static WRITE_TXN_DURATION: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_write_txn_duration";
-    describe_histogram!(NAME, "duration for which a write transaction was kept open");
-    register_histogram!(NAME)
-});
-
-pub static STATEMENT_EXECUTION_TIME: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_statement_execution_time";
-    describe_histogram!(NAME, "time to execute a statement");
-    register_histogram!(NAME)
-});
+#[inline]
+pub fn record_namespace_load_latency(elapsed: Duration) {
+    histogram!("libsql_server_namespace_load_latency", elapsed);
+}
+#[inline]
+pub fn record_connection_create_time(elapsed: Duration) {
+    histogram!("libsql_server_connection_create_time", elapsed);
+}
+#[inline]
+pub fn record_connection_alive_duration(elapsed: Duration) {
+    histogram!("libsql_server_connection_alive_duration", elapsed);
+}
 pub static VACUUM_COUNT: Lazy<Counter> = Lazy::new(|| {
     const NAME: &str = "libsql_server_vacuum_count";
     describe_counter!(NAME, "number of vacuum operations");
     register_counter!(NAME)
 });
-pub static WAL_CHECKPOINT_TIME: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_wal_checkpoint_time";
-    describe_histogram!(NAME, "time to checkpoint the WAL");
-    register_histogram!(NAME)
-});
 pub static WAL_CHECKPOINT_COUNT: Lazy<Counter> = Lazy::new(|| {
     const NAME: &str = "libsql_server_wal_checkpoint_count";
     describe_counter!(NAME, "number of WAL checkpoints");
     register_counter!(NAME)
-});
-pub static STATEMENT_MEM_USED_BYTES: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_statement_mem_used_bytes";
-    describe_histogram!(NAME, "memory used by a prepared statement");
-    register_histogram!(NAME)
-});
-pub static RETURNED_BYTES: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_returned_bytes";
-    describe_histogram!(NAME, "number of bytes of values returned to the client");
-    register_histogram!(NAME)
 });
 pub static PROGRAM_EXEC_COUNT: Lazy<Counter> = Lazy::new(|| {
     const NAME: &str = "libsql_server_libsql_execute_program";
@@ -127,14 +107,10 @@ pub static DIRTY_STARTUP: Lazy<Counter> = Lazy::new(|| {
     );
     register_counter!(NAME)
 });
-pub static REPLICATION_LATENCY: Lazy<Histogram> = Lazy::new(|| {
-    const NAME: &str = "libsql_server_replication_latency";
-    describe_counter!(
-        NAME,
-        "Latency between the time a transaction was commited on the primary and the commit frame was received by the replica"
-    );
-    register_histogram!(NAME)
-});
+#[inline]
+pub fn record_replication_latency(latency: Duration) {
+    histogram!("libsql_server_replication_latency", latency);
+}
 pub static REPLICATION_LATENCY_OUT_OF_SYNC: Lazy<Counter> = Lazy::new(|| {
     const NAME: &str = "libsql_server_replication_latency_out_of_sync";
     describe_counter!(
@@ -222,3 +198,46 @@ pub static TOKIO_RUNTIME_REMOTE_SCHEDULE_COUNT: Lazy<Counter> = Lazy::new(|| {
     describe_gauge!(NAME, "tokio runtime remote_schedule_count");
     register_counter!(NAME)
 });
+
+/// Registers HELP text for every histogram. Must run after the global recorder is installed
+/// (`describe_histogram!` is a no-op when no recorder is set).
+pub(crate) fn describe_histograms() {
+    describe_histogram!(
+        "libsql_server_total_response_size_before_lock",
+        "total response size value before connection lock"
+    );
+    describe_histogram!(
+        "libsql_server_namespace_load_latency",
+        "latency is us when loading a namespace"
+    );
+    describe_histogram!(
+        "libsql_server_connection_create_time",
+        "time to create a connection"
+    );
+    describe_histogram!(
+        "libsql_server_connection_alive_duration",
+        "duration for which a connection was kept alive"
+    );
+    describe_histogram!(
+        "libsql_server_replication_latency",
+        "Latency between the time a transaction was commited on the primary and the commit frame was received by the replica"
+    );
+    // Names recorded via `histogram!` elsewhere whose old `Lazy` statics were never forced
+    // (so they never had HELP text); harmless to describe them here.
+    describe_histogram!(
+        "libsql_server_statement_execution_time",
+        "time to execute a statement"
+    );
+    describe_histogram!(
+        "libsql_server_statement_mem_used_bytes",
+        "memory used by a prepared statement"
+    );
+    describe_histogram!(
+        "libsql_server_wal_checkpoint_time",
+        "time to checkpoint the WAL"
+    );
+    describe_histogram!(
+        "libsql_server_returned_bytes",
+        "number of bytes of values returned to the client"
+    );
+}
