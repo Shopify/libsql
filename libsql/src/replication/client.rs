@@ -140,6 +140,7 @@ impl GrpcChannel {
             .pool_idle_timeout(None)
             .pool_max_idle_per_host(3)
             .build(connector);
+        let client = DiagnosticResponseService::new(client);
         let client = GrpcWebClientService::new(client);
 
         let classifier = GrpcErrorsAsFailures::new().with_success(GrpcCode::FailedPrecondition);
@@ -180,6 +181,76 @@ impl Service<http::Request<BoxBody>> for GrpcChannel {
     fn call(&mut self, req: http::Request<BoxBody>) -> Self::Future {
         let fut = self.client.call(req);
         Box::pin(fut)
+    }
+}
+
+/// Diagnostic middleware that intercepts raw HTTP responses before gRPC-web
+/// framing. When the response status is not 200 or the content-type is not
+/// grpc-web, it buffers and logs the response body so we can diagnose
+/// "Invalid header bit N" errors from tonic-web.
+#[derive(Clone)]
+struct DiagnosticResponseService<S> {
+    inner: S,
+}
+
+impl<S> DiagnosticResponseService<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S, ReqBody> Service<http::Request<ReqBody>> for DiagnosticResponseService<S>
+where
+    S: Service<http::Request<ReqBody>, Response = http::Response<hyper::Body>, Error = hyper::Error>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+{
+    type Response = http::Response<hyper::Body>;
+    type Error = hyper::Error;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+        let uri = req.uri().clone();
+        let fut = self.inner.call(req);
+        Box::pin(async move {
+            let resp = fut.await?;
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            let is_grpc = content_type.contains("grpc");
+
+            if status != http::StatusCode::OK || !is_grpc {
+                // Buffer the body to log it, then re-create the response
+                let (parts, body) = resp.into_parts();
+                let body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+                let preview_len = std::cmp::min(body_bytes.len(), 1024);
+                let body_preview = String::from_utf8_lossy(&body_bytes[..preview_len]);
+                tracing::warn!(
+                    status = %status,
+                    uri = %uri,
+                    content_type = %content_type,
+                    body_len = body_bytes.len(),
+                    body_preview = %body_preview,
+                    "[libsql diagnostic] non-gRPC HTTP response — will cause 'Invalid header bit' error"
+                );
+                Ok(http::Response::from_parts(parts, hyper::Body::from(body_bytes)))
+            } else {
+                tracing::trace!(status = %status, uri = %uri, "[libsql diagnostic] gRPC response OK");
+                Ok(resp)
+            }
+        })
     }
 }
 
