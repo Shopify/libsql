@@ -56,6 +56,9 @@ impl FenceController {
                 FenceCommand::AcquireSourceWriteFence { .. } => {
                     acquire_source_write_fence(&mut transition, &meta, request, ctx).await
                 }
+                FenceCommand::SetSourceReadFence { .. } => {
+                    super::read::set_source_read_fence(&mut transition, &meta, request, ctx).await
+                }
                 _ => transition.apply(&meta, request, ctx).await,
             }
         })
@@ -277,14 +280,14 @@ fn capture_boundary(
     Ok(FrozenBoundary { log_id, frame_no })
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -301,34 +304,40 @@ mod tests {
     use crate::namespace::fence::record::ServerIdentity;
     use crate::namespace::fence::state::FenceState;
     use crate::namespace::meta_store::FenceCommitKind;
-    use crate::namespace::store::fence_tests::open_store;
+    use crate::namespace::store::fence_tests::open_store_with_max_log_size;
     use crate::namespace::store::NamespaceStore;
     use crate::namespace::RestoreOption;
     use crate::replication::primary::logger::ReplicationLogger;
 
-    const OP: Uuid = Uuid::from_u128(0xa);
+    pub(crate) const OP: Uuid = Uuid::from_u128(0xa);
     const OTHER_OP: Uuid = Uuid::from_u128(0xb);
     /// Long enough that no test ever reaches it: a drain must never finish because of time.
-    const LONG: DrainPolicy = DrainPolicy {
+    pub(crate) const LONG: DrainPolicy = DrainPolicy {
         deadline_ms: 600_000,
         on_deadline: OnDeadline::Fail,
     };
-    const PROMPT: Duration = Duration::from_secs(30);
+    pub(crate) const PROMPT: Duration = Duration::from_secs(30);
 
     /// A primary namespace `ns` with a table `t`, served by a real `NamespaceStore`, so that the
     /// drain goes through the connection manager and replication logger the configurator
     /// registered.
-    struct Source {
+    pub(crate) struct Source {
         _dir: TempDir,
-        store: NamespaceStore,
-        fence: Arc<FenceController>,
-        logger: Arc<ReplicationLogger>,
+        pub(crate) store: NamespaceStore,
+        pub(crate) fence: Arc<FenceController>,
+        pub(crate) logger: Arc<ReplicationLogger>,
     }
 
     impl Source {
-        async fn new() -> Self {
+        pub(crate) async fn new() -> Self {
+            Self::with_max_log_size(1_000_000_000).await
+        }
+
+        /// A source whose replication log is compacted into a snapshot once it holds more than
+        /// `max_log_size` MB (`0`: at the next compaction).
+        pub(crate) async fn with_max_log_size(max_log_size: u64) -> Self {
             let dir = tempdir().unwrap();
-            let store = open_store(dir.path()).await;
+            let store = open_store_with_max_log_size(dir.path(), max_log_size).await;
             store
                 .create(
                     "ns".into(),
@@ -362,7 +371,7 @@ mod tests {
             this
         }
 
-        async fn conn(&self) -> Arc<Connection> {
+        pub(crate) async fn conn(&self) -> Arc<Connection> {
             let maker = self
                 .store
                 .with("ns".into(), |ns| ns.db.connection_maker())
@@ -380,7 +389,12 @@ mod tests {
             *self.logger.new_frame_notifier.borrow()
         }
 
-        fn acquire(&self, op: Uuid, command_id: u128, policy: DrainPolicy) -> FenceRequest {
+        pub(crate) fn acquire(
+            &self,
+            op: Uuid,
+            command_id: u128,
+            policy: DrainPolicy,
+        ) -> FenceRequest {
             FenceRequest {
                 namespace: "ns".into(),
                 operation_id: op,
@@ -395,7 +409,7 @@ mod tests {
         }
 
         /// Run `request` through the store, on a task of its own.
-        fn execute(
+        pub(crate) fn execute(
             &self,
             request: FenceRequest,
         ) -> tokio::task::JoinHandle<crate::Result<FenceCommit>> {
@@ -414,7 +428,7 @@ mod tests {
         }
 
         /// Wait until the published gate is in `state`.
-        async fn until_state(&self, state: FenceState) {
+        pub(crate) async fn until_state(&self, state: FenceState) {
             let mut rx = self.fence.subscribe();
             tokio::time::timeout(PROMPT, rx.wait_for(|g| g.state() == state))
                 .await
@@ -422,7 +436,7 @@ mod tests {
                 .unwrap();
         }
 
-        async fn count(&self) -> i64 {
+        pub(crate) async fn count(&self) -> i64 {
             let conn = self.conn().await;
             tokio::task::spawn_blocking(move || {
                 conn.with_raw(|c| c.query_row("select count(*) from t", (), |r| r.get(0)))
@@ -435,14 +449,14 @@ mod tests {
 
     /// Run `sql` as one raw program on `conn`, off the async runtime (it can block on the write
     /// slot).
-    async fn raw(conn: &Arc<Connection>, sql: &'static str) -> rusqlite::Result<()> {
+    pub(crate) async fn raw(conn: &Arc<Connection>, sql: &'static str) -> rusqlite::Result<()> {
         let conn = conn.clone();
         tokio::task::spawn_blocking(move || conn.with_raw(|c| c.execute_batch(sql)))
             .await
             .unwrap()
     }
 
-    fn assert_fenced(result: rusqlite::Result<()>) {
+    pub(crate) fn assert_fenced(result: rusqlite::Result<()>) {
         match result {
             Err(rusqlite::Error::SqliteFailure(e, _)) => {
                 assert_eq!(e.code, ErrorCode::AuthorizationForStatementDenied, "{e}")
@@ -451,7 +465,7 @@ mod tests {
         }
     }
 
-    fn fence_outcome(result: &crate::Result<FenceCommit>) -> FenceOutcome {
+    pub(crate) fn fence_outcome(result: &crate::Result<FenceCommit>) -> FenceOutcome {
         match result {
             Ok(c) => c.receipt.outcome,
             Err(Error::NamespaceFence(e)) => e.outcome(),

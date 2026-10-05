@@ -29,8 +29,16 @@ mod schema_lock;
 mod store;
 
 pub type ResetCb = Box<dyn Fn(ResetOp) + Send + Sync + 'static>;
+/// Resolves a namespace that a program ATTACHes: its directory, and its fence controller, which
+/// admits the attachment as a read of that namespace (`docs/NAMESPACE_FENCE.md` section 9).
 pub type ResolveNamespacePathFn =
-    Arc<dyn Fn(&NamespaceName) -> crate::Result<Arc<Path>> + Sync + Send + 'static>;
+    Arc<dyn Fn(&NamespaceName) -> crate::Result<AttachTarget> + Sync + Send + 'static>;
+
+/// A namespace resolved for ATTACH.
+pub struct AttachTarget {
+    pub path: Arc<Path>,
+    pub fence: Arc<fence::controller::FenceController>,
+}
 
 pub enum ResetOp {
     Reset(NamespaceName),
@@ -103,9 +111,6 @@ impl Namespace {
         Ok(())
     }
 
-    // Read by the protocol layers that consult the gate outside a connection (dump,
-    // replication, lifecycle), which land later in this series.
-    #[allow(dead_code)]
     pub(crate) fn fence(&self) -> &Arc<FenceController> {
         &self.fence
     }
