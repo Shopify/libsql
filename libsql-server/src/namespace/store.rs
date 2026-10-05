@@ -13,7 +13,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::auth::Authenticated;
 use crate::broadcaster::BroadcastMsg;
 use crate::connection::config::DatabaseConfig;
-use crate::database::DatabaseKind;
+use crate::database::{Database, DatabaseKind, PrimaryConnectionMaker};
 use crate::error::Error;
 use crate::metrics::NAMESPACE_LOAD_LATENCY;
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
@@ -21,10 +21,17 @@ use crate::stats::Stats;
 
 use super::broadcasters::{BroadcasterHandle, BroadcasterRegistry};
 use super::configurator::{DynConfigurator, NamespaceConfigurators};
+use super::fence::capability::CapabilityPurpose;
 use super::fence::command::{FenceCommand, FenceRequest};
-use super::fence::controller::FenceController;
+use super::fence::controller::{FenceController, Transition};
+use super::fence::hooks::HookPoint;
+use super::fence::import::{self, ImportSession};
+use super::fence::outcome::FenceOutcome;
 use super::fence::record::ServerIdentity;
 use super::fence::registry::FenceRegistry;
+use super::fence::state::{FenceState, Role};
+use super::fence::store::StoredFence;
+use super::fence::target::{self, CreateTargetRequest, ValidationSession};
 use super::meta_store::{FenceCommit, FenceContext, MetaStore, MetaStoreHandle};
 use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
@@ -236,6 +243,10 @@ impl NamespaceStore {
         if self.inner.has_shutdown.load(Ordering::Relaxed) {
             return Err(Error::NamespaceStoreShutdown);
         }
+
+        // The destination is refused before anything is stored for it when it is being created
+        // as a migration target or its fence state is unknown.
+        self.inner.fences.check_available(&to)?;
 
         // check that the source namespace exists
         if !self.inner.metadata.exists(&from).await {
@@ -450,6 +461,9 @@ impl NamespaceStore {
         restore_option: RestoreOption,
         db_config: DatabaseConfig,
     ) -> crate::Result<()> {
+        // A name that is being created as a migration target, or whose fence state is unknown,
+        // is refused before anything is stored for it.
+        self.inner.fences.check_available(&namespace)?;
         if let Some(shared_schema_name) = &db_config.shared_schema_name {
             // we hold a lock for the duration of the namespace creation
             let _lock = self
@@ -550,19 +564,304 @@ impl NamespaceStore {
         server: ServerIdentity,
     ) -> crate::Result<FenceCommit> {
         let controller = match request.command {
+            FenceCommand::CreateTargetQuarantined { .. } => {
+                return self.run_create_target(request, server).await
+            }
             FenceCommand::AcquireSourceWriteFence { .. } => {
                 self.with(request.namespace.clone(), |ns| ns.fence().clone())
                     .await?
             }
             _ => self.inner.fences.controller(&request.namespace),
         };
-        controller
-            .execute(
-                &self.inner.metadata,
-                request,
-                FenceContext::now(server, None),
-            )
+        let mut ctx = FenceContext::now(server, None);
+        // A new validation receipt records what this server observes of the sealed target. Do
+        // this only when the live gate exactly matches the request: an exact replay after the
+        // revision or state has advanced must reach the metastore's replay check without first
+        // trying to issue a now-invalid validation capability.
+        if matches!(
+            &request.command,
+            FenceCommand::RecordTargetValidation { .. }
+        ) {
+            let needs_snapshot = {
+                let gate = controller.gate();
+                gate.state() == FenceState::TargetValidating
+                    && gate.operation_id() == Some(request.operation_id)
+                    && gate.revision() == request.expected_revision
+            };
+            if needs_snapshot && !self.validation_command_recorded(&request).await? {
+                let snapshot = async {
+                    let mut session = self
+                        .open_validation_session(
+                            request.namespace.clone(),
+                            request.operation_id,
+                            request.expected_revision,
+                        )
+                        .await?;
+                    session.snapshot().await
+                }
+                .await;
+                match snapshot {
+                    Ok(snapshot) => ctx.validation_snapshot = Some(snapshot),
+                    // A concurrent copy of this command can commit between the gate check and
+                    // the capability call. Once its receipt exists, let execute take the
+                    // transition lock and perform the authoritative replay/fingerprint check.
+                    Err(_) if self.validation_command_recorded(&request).await? => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        controller.execute(&self.inner.metadata, request, ctx).await
+    }
+
+    async fn validation_command_recorded(&self, request: &FenceRequest) -> crate::Result<bool> {
+        let operation_id = request.operation_id.to_string();
+        let command_id = request.command_id.to_string();
+        let inspected = self
+            .inner
+            .metadata
+            .inspect_fence(request.namespace.clone())
+            .await?;
+        Ok(inspected
+            .receipts
+            .iter()
+            .any(|stored| stored.operation_id == operation_id && stored.command_id == command_id))
+    }
+
+    /// `CreateTargetQuarantined`, atomic with namespace creation (`docs/NAMESPACE_FENCE.md`
+    /// sections 10.1 and 11): the namespace is quarantined from the first instant it can be
+    /// observed, and is loaded behind the quarantine gate before this returns `APPLIED`.
+    ///
+    /// Fence refusals are [`Error::NamespaceFence`] with their stable outcome code. The work
+    /// runs on its own task under the namespace's transition lock, so a caller that goes away
+    /// does not interrupt it; replaying the same request returns the stored result, completes
+    /// the publication and load of a target whose commit was not acknowledged, and completes a
+    /// creation interrupted between its marker and its commit.
+    pub async fn create_target_quarantined(
+        &self,
+        request: CreateTargetRequest,
+        server: ServerIdentity,
+    ) -> crate::Result<FenceCommit> {
+        self.run_create_target(request.into(), server).await
+    }
+
+    async fn run_create_target(
+        &self,
+        request: FenceRequest,
+        server: ServerIdentity,
+    ) -> crate::Result<FenceCommit> {
+        if self.inner.has_shutdown.load(Ordering::Relaxed) {
+            return Err(Error::NamespaceStoreShutdown);
+        }
+        let controller = self.inner.fences.controller(&request.namespace);
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut transition = controller.begin_transition().await;
+            let ctx = FenceContext::now(server, None);
+            this.create_target_under(&mut transition, request, ctx)
+                .await
+        })
+        .await?
+    }
+
+    /// Section 10.1, steps 1 to 5, under `transition`.
+    async fn create_target_under(
+        &self,
+        transition: &mut Transition,
+        request: FenceRequest,
+        ctx: FenceContext,
+    ) -> crate::Result<FenceCommit> {
+        let controller = transition.controller().clone();
+        let namespace = request.namespace.clone();
+        let key = (request.operation_id, request.command_id);
+
+        // A name with no fence state gets the target-creation gate before the metastore
+        // transaction writes the marker, so nothing can set the name up, serve it or store a
+        // config for it from before the commit to the load. A name that already has fence
+        // state (a replay, a creation interrupted after its marker, or a refusal) already has
+        // the gate its state implies. A name the server already knows is refused without
+        // touching its gate; it is checked again once the gate is in place, which closes the
+        // race with a create or fork that has not stored anything yet.
+        let fresh = {
+            let gate = controller.gate();
+            matches!(gate.fence, StoredFence::None { .. }) && gate.indeterminate.is_none()
+        };
+        if fresh {
+            if self.name_in_use(&namespace).await {
+                return Err(target::name_in_use(&namespace).into());
+            }
+            transition.install_creating_target(key);
+            let _ = controller.hook(HookPoint::AfterInstallingGate).await;
+            if self.name_in_use(&namespace).await {
+                transition.remove_creating_target();
+                return Err(target::name_in_use(&namespace).into());
+            }
+        }
+
+        // Steps 2 and 3: the marker, then the rows in one transaction. The commit publishes the
+        // quarantined record in place of the creation gate. A command proven not to have
+        // committed removes the creation gate; one whose commit is unknown keeps it, with the
+        // indeterminate flag, until the same command is replayed.
+        let commit = match transition.apply(&self.inner.metadata, request, ctx).await {
+            Ok(commit) => commit,
+            Err(e) => {
+                if controller.gate().indeterminate != Some(key) {
+                    transition.remove_creating_target();
+                }
+                return Err(e);
+            }
+        };
+        let _ = controller.hook(HookPoint::AfterTargetRowsCommitted).await;
+
+        // Steps 4 and 5: the gate is the target's; now make the config visible and load the
+        // namespace, whose first connection is created behind that gate. A replay does the same,
+        // which completes a creation whose commit was not acknowledged.
+        let is_target = commit
+            .record
+            .as_ref()
+            .is_some_and(|r| r.role == Role::Target && r.namespace == namespace);
+        if is_target {
+            self.inner
+                .metadata
+                .publish_target_config(namespace.clone())
+                .await?;
+            self.clear_empty_entry(&namespace).await;
+            let loaded = self
+                .with(namespace.clone(), |ns| ns.fence().clone())
+                .await?;
+            debug_assert!(Arc::ptr_eq(&loaded, &controller));
+        }
+        if commit.receipt.outcome == FenceOutcome::Applied && commit.created_config.is_some() {
+            tracing::info!(
+                namespace = %namespace,
+                operation_id = %key.0,
+                command_id = %key.1,
+                "created namespace as a quarantined migration target"
+            );
+        }
+        Ok(commit)
+    }
+
+    /// Issue an import capability to `operation_id` and open a connection that works under it
+    /// (`docs/NAMESPACE_FENCE.md` section 11): the only way to write into a quarantined target.
+    /// Valid only while the target is `TARGET_QUARANTINED`, owned by `operation_id`, at
+    /// `expected_revision`; the target is loaded if it is not. Fence refusals are
+    /// [`Error::NamespaceFence`] with their stable outcome code (`OPERATION_CAPABILITY_REQUIRED`
+    /// in any other state, `FENCE_OWNED_BY_ANOTHER_OPERATION`, `FENCE_REVISION_MISMATCH`).
+    pub async fn open_import_session(
+        &self,
+        namespace: NamespaceName,
+        operation_id: uuid::Uuid,
+        expected_revision: u64,
+    ) -> crate::Result<ImportSession> {
+        let (controller, maker) = self.primary_maker(&namespace).await?;
+        let capability = controller.issue_capability(
+            CapabilityPurpose::Import,
+            operation_id,
+            expected_revision,
+        )?;
+        match maker
+            .inner()
+            .make_capability_connection(capability.clone())
             .await
+        {
+            Ok(conn) => Ok(ImportSession::new(capability, controller, conn)),
+            Err(e) => {
+                controller.revoke_capability(capability.id());
+                Err(e)
+            }
+        }
+    }
+
+    /// Issue a read-only validation capability to `operation_id` and open a `query_only`
+    /// connection under it (`docs/NAMESPACE_FENCE.md` sections 10.3 and 11). Valid only while
+    /// the target is `TARGET_VALIDATING` or `TARGET_WRITE_FENCED`, owned by the operation at
+    /// `expected_revision`; the target is loaded if it is not.
+    pub async fn open_validation_session(
+        &self,
+        namespace: NamespaceName,
+        operation_id: uuid::Uuid,
+        expected_revision: u64,
+    ) -> crate::Result<ValidationSession> {
+        let (controller, maker) = self.primary_maker(&namespace).await?;
+        let capability = controller.issue_capability(
+            CapabilityPurpose::Validate,
+            operation_id,
+            expected_revision,
+        )?;
+        let conn = match maker
+            .inner()
+            .make_capability_connection(capability.clone())
+            .await
+        {
+            Ok(conn) => conn,
+            Err(e) => {
+                controller.revoke_capability(capability.id());
+                return Err(e);
+            }
+        };
+        ValidationSession::new(capability, controller, conn).await
+    }
+
+    /// The fence controller and connection maker of the primary `namespace`, loading it.
+    async fn primary_maker(
+        &self,
+        namespace: &NamespaceName,
+    ) -> crate::Result<(Arc<FenceController>, Arc<PrimaryConnectionMaker>)> {
+        let (controller, maker) = self
+            .with(namespace.clone(), |ns| {
+                let maker = match &ns.db {
+                    Database::Primary(p) => Some(p.connection_maker()),
+                    _ => None,
+                };
+                (ns.fence().clone(), maker)
+            })
+            .await?;
+        match maker {
+            Some(maker) => Ok((controller, maker)),
+            None => Err(import::not_importable(namespace)),
+        }
+    }
+
+    /// A connection to `namespace` that works under `capability`, whether or not this server
+    /// issued it: for tests that prove the WAL refuses a capability that is not the valid one.
+    #[cfg(test)]
+    pub(crate) async fn capability_connection(
+        &self,
+        namespace: &NamespaceName,
+        capability: super::fence::capability::MigrationCapability,
+    ) -> crate::Result<
+        crate::connection::legacy::LegacyConnection<super::replication_wal::ReplicationWalWrapper>,
+    > {
+        let (_, maker) = self.primary_maker(namespace).await?;
+        maker.inner().make_capability_connection(capability).await
+    }
+
+    /// Whether the server already knows `namespace`: its config is in memory, or the namespace
+    /// cache holds it (a loaded namespace, or a fork in flight, which holds its entry locked).
+    async fn name_in_use(&self, namespace: &NamespaceName) -> bool {
+        if self.inner.metadata.exists(namespace).await {
+            return true;
+        }
+        match self.inner.store.get(namespace).await {
+            Some(entry) => entry.read().await.is_some(),
+            None => false,
+        }
+    }
+
+    /// Drop an empty namespace-cache entry for `namespace`, which a refused fork or a checkpoint
+    /// of a name that did not exist leaves behind, so that loading the namespace creates it.
+    async fn clear_empty_entry(&self, namespace: &NamespaceName) {
+        if let Some(entry) = self.inner.store.get(namespace).await {
+            if entry.read().await.is_none() {
+                self.inner.store.invalidate(namespace).await;
+            }
+        }
+    }
+
+    /// The fence controller of `namespace`, creating an `UNFENCED` one if it has none.
+    #[cfg(test)]
+    pub(crate) fn fence_controller(&self, namespace: &NamespaceName) -> Arc<FenceController> {
+        self.inner.fences.controller(namespace)
     }
 
     /// The fence controller that admits reads of `namespace` without loading it: `None` when

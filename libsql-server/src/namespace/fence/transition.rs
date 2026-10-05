@@ -10,8 +10,9 @@
 //! Checks run in this order, and the order is part of the contract:
 //!
 //! 1. **Replay.** A stored receipt with the same fingerprint is answered from the receipt
-//!    (`Replay`, or `Resume` for a drain still in progress), whatever has happened to the
-//!    record since. A stored receipt with a different fingerprint is `FENCE_COMMAND_CONFLICT`.
+//!    (`Resume` only while the record is still in that command's draining state and revision,
+//!    otherwise `Replay`), whatever has happened to the record since. A stored receipt with a
+//!    different fingerprint is `FENCE_COMMAND_CONFLICT`.
 //! 2. **Unavailable state.** A record the server cannot establish refuses everything with
 //!    `FENCE_STATE_UNAVAILABLE`, except the two commands that can reconcile it: a replay of the
 //!    `CreateTargetQuarantined` that left the marker, and an adoption after a metastore
@@ -260,10 +261,22 @@ pub fn apply(
                 ),
             ));
         }
-        return Ok(if existing.is_final() {
-            Decision::Replay(existing.clone())
-        } else {
+        // A DRAINING receipt resumes only while its exact drain is still the durable state.
+        // Release, clear-read and abort may supersede one, and a source may begin another read
+        // drain later under the same operation and state; the record revision distinguishes that
+        // later cycle. Replaying an older command must return its stored answer without running
+        // it against the newer record (and potentially cancelling newly admitted work).
+        let still_draining = matches!(
+            current,
+            CurrentFence::Record(record)
+                if record.operation_id == existing.operation_id
+                    && drain_state(existing.command) == Some(record.state)
+                    && existing.revision_after == record.revision
+        );
+        return Ok(if !existing.is_final() && still_draining {
             Decision::Resume(existing.clone())
+        } else {
+            Decision::Replay(existing.clone())
         });
     }
 
@@ -646,9 +659,12 @@ pub fn complete_drain(
     completion: DrainCompletion,
     env: &ApplyEnv,
 ) -> Result<(NamespaceFenceRecord, CommandReceipt), FenceError> {
-    if receipt.outcome != FenceOutcome::Draining || receipt.operation_id != record.operation_id {
+    if receipt.outcome != FenceOutcome::Draining
+        || receipt.operation_id != record.operation_id
+        || receipt.revision_after != record.revision
+    {
         return Err(invalid(
-            "there is no drain of the owning operation to complete",
+            "there is no matching drain of the owning operation to complete",
         ));
     }
 
@@ -1275,6 +1291,57 @@ mod tests {
     }
 
     #[test]
+    fn superseded_draining_receipt_is_replayed_without_resuming() {
+        let mut source = Harness::source();
+        let acquire = source.request(OP, command(CommandKind::AcquireSourceWriteFence));
+        source.run_request(&acquire, &env()).unwrap();
+        source
+            .run(OP, CommandKind::ReleaseSourceWriteFence)
+            .unwrap();
+        let replay = source.decide(&acquire, &env()).unwrap();
+        assert!(matches!(
+            replay,
+            Decision::Replay(ref receipt) if receipt.outcome == O::Draining
+        ));
+        assert_eq!(source.state(), S::Released);
+
+        let mut source = Harness::in_state(S::SourceWriteFenced);
+        let read_fence = source.request(OP, command(CommandKind::SetSourceReadFence));
+        source.run_request(&read_fence, &env()).unwrap();
+        source.run(OP, CommandKind::ClearSourceReadFence).unwrap();
+        let replay = source.decide(&read_fence, &env()).unwrap();
+        assert!(matches!(
+            replay,
+            Decision::Replay(ref receipt) if receipt.outcome == O::Draining
+        ));
+        assert_eq!(source.state(), S::SourceWriteFenced);
+
+        // Starting another read drain under the same operation and state does not make the
+        // earlier cycle live again: only receipts at the current drain revision may resume it.
+        let later_read_fence = source.request(OP, command(CommandKind::SetSourceReadFence));
+        source.run_request(&later_read_fence, &env()).unwrap();
+        assert!(matches!(
+            source.decide(&read_fence, &env()).unwrap(),
+            Decision::Replay(ref receipt) if receipt.outcome == O::Draining
+        ));
+        assert!(matches!(
+            source.decide(&later_read_fence, &env()).unwrap(),
+            Decision::Resume(ref receipt) if receipt.outcome == O::Draining
+        ));
+
+        let mut target = Harness::in_state(S::TargetQuarantined);
+        let seal = target.request(OP, command(CommandKind::SealTargetImport));
+        target.run_request(&seal, &env()).unwrap();
+        target.run(OP, CommandKind::AbortQuarantinedTarget).unwrap();
+        let replay = target.decide(&seal, &env()).unwrap();
+        assert!(matches!(
+            replay,
+            Decision::Replay(ref receipt) if receipt.outcome == O::Draining
+        ));
+        assert_eq!(target.state(), S::TargetAborted);
+    }
+
+    #[test]
     fn command_id_reuse_with_different_fingerprint_conflicts() {
         let mut h = Harness::source();
         let acquire = h.request(OP, command(CommandKind::AcquireSourceWriteFence));
@@ -1515,6 +1582,9 @@ mod tests {
         let mut other = receipt.clone();
         other.operation_id = OTHER_OP;
         assert!(complete_drain(&record, &other, boundary, &env()).is_err());
+        let mut stale = receipt.clone();
+        stale.revision_after -= 1;
+        assert!(complete_drain(&record, &stale, boundary, &env()).is_err());
 
         // Not draining any more.
         let h = Harness::in_state(S::SourceWriteFenced);
