@@ -14,6 +14,8 @@ use tokio::time::Duration;
 use crate::error::Error;
 use crate::metrics::DESCRIBE_COUNT;
 use crate::namespace::broadcasters::BroadcasterHandle;
+use crate::namespace::fence::controller::{FenceConnState, FenceController};
+use crate::namespace::fence::state::OperationClass;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::ResolveNamespacePathFn;
 use crate::query_result_builder::{QueryBuilderConfig, QueryResultBuilder};
@@ -47,6 +49,9 @@ pub struct MakeLegacyConnection<W> {
     block_writes: Arc<AtomicBool>,
     resolve_attach_path: ResolveNamespacePathFn,
     make_wal_manager: Arc<dyn Fn() -> InnerWalManager + Sync + Send + 'static>,
+    /// The namespace's fence controller. Every connection this maker opens, starting with the
+    /// held `_db` connection, carries a fence state bound to it.
+    fence: Arc<FenceController>,
 }
 
 impl<W> MakeLegacyConnection<W>
@@ -69,8 +74,12 @@ where
         block_writes: Arc<AtomicBool>,
         resolve_attach_path: ResolveNamespacePathFn,
         make_wal_manager: Arc<dyn Fn() -> InnerWalManager + Sync + Send + 'static>,
+        fence: Arc<FenceController>,
     ) -> Result<Self> {
         let txn_timeout = config_store.get().txn_timeout.unwrap_or(TXN_TIMEOUT);
+        let connection_manager = ConnectionManager::new(txn_timeout);
+        // Queued writers re-check the fence whenever its write generation changes.
+        fence.register_write_queue(connection_manager.fence_waker());
 
         let mut this = Self {
             db_path,
@@ -87,14 +96,20 @@ where
             encryption_config,
             block_writes,
             resolve_attach_path,
-            connection_manager: ConnectionManager::new(txn_timeout),
+            connection_manager,
             make_wal_manager,
+            fence,
         };
 
         let db = this.try_create_db().await?;
         this._db = Some(db);
 
         Ok(this)
+    }
+
+    /// The write-slot manager shared by every connection this maker opens.
+    pub(crate) fn connection_manager(&self) -> &ConnectionManager {
+        &self.connection_manager
     }
 
     /// Tries to create a database, retrying if the database is busy.
@@ -146,6 +161,7 @@ where
             self.resolve_attach_path.clone(),
             self.connection_manager.clone(),
             self.make_wal_manager.clone(),
+            FenceConnState::new(self.fence.clone(), OperationClass::NormalWrite),
         )
         .await
     }
@@ -165,6 +181,8 @@ where
 
 pub struct LegacyConnection<T> {
     pub(super) inner: Arc<Mutex<CoreConnection<WrappedWal<T, ManagedConnectionWal>>>>,
+    /// Shared with the connection's WAL wrapper and its `CoreConnection`.
+    pub(super) fence: Arc<FenceConnState>,
 }
 
 #[cfg(test)]
@@ -185,6 +203,10 @@ impl LegacyConnection<libsql_sys::wal::wrapper::PassthroughWalWrapper> {
             Arc::new(|_| unreachable!()),
             ConnectionManager::new(TXN_TIMEOUT),
             Arc::new(|| Sqlite3WalManager::default()),
+            FenceConnState::new(
+                FenceController::unfenced(Default::default()),
+                OperationClass::NormalWrite,
+            ),
         )
         .await
         .unwrap()
@@ -195,6 +217,7 @@ impl<T> Clone for LegacyConnection<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            fence: self.fence.clone(),
         }
     }
 }
@@ -321,11 +344,13 @@ where
         resolve_attach_path: ResolveNamespacePathFn,
         connection_manager: ConnectionManager,
         make_wal: Arc<dyn Fn() -> InnerWalManager + Sync + Send + 'static>,
+        fence: Arc<FenceConnState>,
     ) -> crate::Result<Self> {
         let (conn, id) = tokio::task::spawn_blocking({
             let connection_manager = connection_manager.clone();
+            let fence = fence.clone();
             move || -> crate::Result<_> {
-                let manager = ManagedConnectionWalWrapper::new(connection_manager);
+                let manager = ManagedConnectionWalWrapper::new(connection_manager, fence.clone());
                 let id = manager.id();
                 let wal = make_wal().wrap(manager).wrap(wal_wrapper);
 
@@ -340,6 +365,7 @@ where
                     current_frame_no_receiver,
                     block_writes,
                     resolve_attach_path,
+                    fence,
                 )?;
 
                 let namespace = path
@@ -366,7 +392,7 @@ where
 
         connection_manager.register_connection(&inner, id);
 
-        Ok(Self { inner })
+        Ok(Self { inner, fence })
     }
 
     pub async fn execute<B: QueryResultBuilder>(
@@ -445,6 +471,9 @@ where
 
     fn with_raw<R>(&self, f: impl FnOnce(&mut rusqlite::Connection) -> R) -> R {
         let mut inner = self.inner.lock();
+        // A raw use of the connection is a program like any other: the WAL gate admits a write
+        // transaction it opens only under the generation it started under.
+        self.fence.begin_program();
         f(inner.raw_mut())
     }
 }

@@ -673,12 +673,13 @@ pub fn complete_drain(
 
     let mut next = record.clone();
     if let DrainCompletion::SourceWrites { boundary } = completion {
-        if record.identity.log_id != Some(boundary.log_id) {
-            return Err(precondition(
-                FenceDetail::NamespaceIdentityMismatch,
-                "the frozen boundary belongs to a different replication log",
-            ));
-        }
+        // The boundary names the replication log that is live when the drain is proven. It is
+        // not the log the identity was captured on when the source was restarted while
+        // draining: crash recovery rebuilds the log from the database file under a new id
+        // (section 8.5). Write admission has been durably closed since `SOURCE_DRAINING`
+        // committed, and the lifecycle paths that could replace the database are denied, so
+        // the data is what was committed before the cutoff. The identity keeps the log id the
+        // caller acquired against.
         next.frozen_boundary = Some(boundary);
     }
     next.state = to;
@@ -903,7 +904,7 @@ mod tests {
             let boundary = DrainCompletion::SourceWrites {
                 boundary: FrozenBoundary {
                     log_id: LOG,
-                    frame_no: 42,
+                    frame_no: Some(42),
                 },
             };
             let mut h = if state.role() == Some(Role::Target) || state == S::Absent {
@@ -1083,14 +1084,14 @@ mod tests {
         h.complete(DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 7,
+                frame_no: Some(7),
             },
         });
         assert_eq!(h.state(), S::SourceWriteFenced);
         assert_eq!(h.revision(), 2);
         assert_eq!(
             h.record.as_ref().unwrap().frozen_boundary.unwrap().frame_no,
-            7
+            Some(7)
         );
         let acquire_receipt = h
             .receipts
@@ -1255,7 +1256,7 @@ mod tests {
         h.complete(DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 1,
+                frame_no: Some(1),
             },
         });
         h.run(OP, CommandKind::SetSourceReadFence).unwrap();
@@ -1464,7 +1465,7 @@ mod tests {
             DrainCompletion::SourceWrites {
                 boundary: FrozenBoundary {
                     log_id: LOG,
-                    frame_no: 3,
+                    frame_no: Some(3),
                 },
             },
             &env(),
@@ -1485,20 +1486,21 @@ mod tests {
         assert!(complete_drain(&record, &receipt, DrainCompletion::SourceReads, &env()).is_err());
         assert!(complete_drain(&record, &receipt, DrainCompletion::TargetImport, &env()).is_err());
 
-        // A boundary from another log.
-        let err = complete_drain(
+        // A boundary on a log rebuilt since acquisition (a restart while draining) is recorded
+        // as it is; the identity keeps the log the caller acquired against.
+        let rebuilt = FrozenBoundary {
+            log_id: Uuid::from_u128(0x77),
+            frame_no: Some(1),
+        };
+        let (next, _) = complete_drain(
             &record,
             &receipt,
-            DrainCompletion::SourceWrites {
-                boundary: FrozenBoundary {
-                    log_id: Uuid::from_u128(0x77),
-                    frame_no: 1,
-                },
-            },
+            DrainCompletion::SourceWrites { boundary: rebuilt },
             &env(),
         )
-        .unwrap_err();
-        assert_eq!(err.detail(), Some(FenceDetail::NamespaceIdentityMismatch));
+        .unwrap();
+        assert_eq!(next.frozen_boundary, Some(rebuilt));
+        assert_eq!(next.identity.log_id, Some(LOG));
 
         // A final receipt, or another operation's.
         let mut final_receipt = receipt.clone();
@@ -1506,7 +1508,7 @@ mod tests {
         let boundary = DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 1,
+                frame_no: Some(1),
             },
         };
         assert!(complete_drain(&record, &final_receipt, boundary, &env()).is_err());
@@ -1732,7 +1734,7 @@ mod tests {
         h.complete(DrainCompletion::SourceWrites {
             boundary: FrozenBoundary {
                 log_id: LOG,
-                frame_no: 5,
+                frame_no: Some(5),
             },
         });
         assert_eq!(h.state(), S::SourceWriteFenced);

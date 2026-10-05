@@ -268,6 +268,12 @@ struct Cli {
     #[clap(long, env = "SQLD_NAMESPACE_FENCE_RECEIPT_RETENTION_S")]
     namespace_fence_receipt_retention_s: Option<u64>,
 
+    /// How long, in milliseconds, acquiring a namespace write fence waits for active writers
+    /// when the request names no drain policy (the deadline then answers `DRAINING`).
+    /// Defaults to 30 seconds.
+    #[clap(long, env = "SQLD_NAMESPACE_FENCE_DEFAULT_WRITE_DRAIN_MS")]
+    namespace_fence_default_write_drain_ms: Option<u64>,
+
     /// Shutdown timeout duration in seconds, defaults to 30 seconds.
     #[clap(long, env = "SQLD_SHUTDOWN_TIMEOUT")]
     shutdown_timeout: Option<u64>,
@@ -664,6 +670,9 @@ fn make_meta_store_config(config: &Cli) -> anyhow::Result<MetaStoreConfig> {
         namespace_fence_receipt_retention: config
             .namespace_fence_receipt_retention_s
             .map(Duration::from_secs),
+        namespace_fence_default_write_drain: config
+            .namespace_fence_default_write_drain_ms
+            .map(Duration::from_millis),
     })
 }
 

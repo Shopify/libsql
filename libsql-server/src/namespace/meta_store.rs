@@ -31,7 +31,7 @@ use crate::{
     config::MetaStoreConfig, connection::legacy::open_conn_active_checkpoint, error::Error, Result,
 };
 
-use super::fence::command::{FenceCommand, FenceRequest};
+use super::fence::command::{DrainPolicy, FenceCommand, FenceRequest, OnDeadline};
 use super::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
 use super::fence::record::{
     CommandReceipt, NamespaceFenceRecord, ServerIdentity, ValidationSnapshot,
@@ -110,6 +110,8 @@ struct FenceSettings {
     /// namespace directory holds a marker.
     fail_closed: bool,
     receipt_retention: Duration,
+    /// The write drain deadline of an `AcquireSourceWriteFence` that names no drain policy.
+    default_write_drain: Duration,
 }
 
 fn setup_connection(conn: &rusqlite::Connection) -> Result<()> {
@@ -235,6 +237,9 @@ impl MetaStoreInner {
             receipt_retention: config
                 .namespace_fence_receipt_retention
                 .unwrap_or(fence_store::DEFAULT_RECEIPT_RETENTION),
+            default_write_drain: config
+                .namespace_fence_default_write_drain
+                .unwrap_or(crate::namespace::fence::drain::DEFAULT_WRITE_DRAIN),
         };
 
         let mut this = MetaStoreInner {
@@ -804,6 +809,17 @@ fn not_primary() -> FenceError {
     .with_detail(FenceDetail::NotPrimary)
 }
 
+/// A fence transaction whose `COMMIT` failed: whether it took effect is unknown, and the
+/// controller keeps the namespace closed until the same command is replayed (section 8.4).
+fn commit_indeterminate(e: rusqlite::Error) -> FenceStoreError {
+    FenceError::new(
+        FenceOutcome::FenceCommitIndeterminate,
+        format!("the metastore commit of a fence transition failed: {e}"),
+    )
+    .with_detail(FenceDetail::IndeterminateCommit)
+    .into()
+}
+
 fn unavailable_receipt(e: impl std::fmt::Display) -> FenceError {
     FenceError::new(
         FenceOutcome::FenceStateUnavailable,
@@ -918,7 +934,7 @@ fn apply_fence_command(
         .or(stored.record())
         .map_or(request.operation_id, |r| r.operation_id);
     fence_store::prune_receipts(&tx, ns, owner, ctx.now_ms, inner.fence.receipt_retention)?;
-    tx.commit()?;
+    tx.commit().map_err(commit_indeterminate)?;
     // The command established the fence from the durable state; whatever startup could not
     // recover about this name is settled.
     inner.recovered.lock().remove(ns);
@@ -1029,7 +1045,7 @@ fn complete_fence_drain(
     }
     fence_store::write_record(&tx, &next, fence_store::stored_revision(&tx, ns)?)?;
     fence_store::write_receipt(&tx, &final_receipt)?;
-    tx.commit()?;
+    tx.commit().map_err(commit_indeterminate)?;
     inner.recovered.lock().remove(ns);
 
     after_fence_commit(inner, &conn, Some(&next), true);
@@ -1287,6 +1303,16 @@ impl MetaStore {
     /// Whether namespace fences may be used on this server.
     pub fn fence_enabled(&self) -> bool {
         self.inner.fence.enabled
+    }
+
+    /// The drain policy of an `AcquireSourceWriteFence` that names none: the configured
+    /// deadline, then `DRAINING`.
+    pub fn fence_default_write_drain(&self) -> DrainPolicy {
+        DrainPolicy {
+            deadline_ms: u64::try_from(self.inner.fence.default_write_drain.as_millis())
+                .unwrap_or(u64::MAX),
+            on_deadline: OnDeadline::Fail,
+        }
     }
 
     /// Whether this metastore holds fence state, so fences are loaded and enforced.
@@ -1738,7 +1764,7 @@ mod fence_tests {
 
         let boundary = FrozenBoundary {
             log_id: LOG,
-            frame_no: 42,
+            frame_no: Some(42),
         };
         let commit = store
             .complete_fence_drain(
@@ -2113,7 +2139,7 @@ mod fence_tests {
                     DrainCompletion::SourceWrites {
                         boundary: FrozenBoundary {
                             log_id: LOG,
-                            frame_no: 1,
+                            frame_no: Some(1),
                         },
                     },
                     ctx(2_000),
@@ -2164,7 +2190,7 @@ mod fence_tests {
                 DrainCompletion::SourceWrites {
                     boundary: FrozenBoundary {
                         log_id: LOG,
-                        frame_no: 7,
+                        frame_no: Some(7),
                     },
                 },
                 ctx(2_000),

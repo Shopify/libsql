@@ -7,6 +7,7 @@ use crate::connection::config::DatabaseConfig;
 use crate::connection::connection_manager::InnerWalManager;
 use crate::database::{Database, SchemaDatabase};
 use crate::namespace::broadcasters::BroadcasterHandle;
+use crate::namespace::fence::controller::FenceController;
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{
     Namespace, NamespaceName, NamespaceStore, ResetCb, ResolveNamespacePathFn, RestoreOption,
@@ -49,6 +50,7 @@ impl ConfigureNamespace for SchemaConfigurator {
         resolve_attach_path: ResolveNamespacePathFn,
         _store: NamespaceStore,
         broadcaster: BroadcasterHandle,
+        fence: Arc<FenceController>,
     ) -> std::pin::Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
         Box::pin(async move {
             let mut join_set = JoinSet::new();
@@ -69,6 +71,7 @@ impl ConfigureNamespace for SchemaConfigurator {
                 broadcaster,
                 self.make_wal_manager.clone(),
                 self.base.encryption_config.clone(),
+                fence.clone(),
             )
             .await?;
 
@@ -90,6 +93,7 @@ impl ConfigureNamespace for SchemaConfigurator {
                 stats,
                 db_config_store: db_config.clone(),
                 path: db_path.into(),
+                fence,
             })
         })
     }
