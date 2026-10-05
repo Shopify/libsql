@@ -187,6 +187,12 @@ pub struct MetaStoreConfig {
     pub allow_recover_from_fs: bool,
     /// Destroy the metastore if there is a restore error
     pub destroy_on_error: bool,
+    /// Allow namespace fences to be used: creates the fence tables. Fences that already exist
+    /// are loaded and enforced whether or not this is set.
+    pub namespace_fence: bool,
+    /// How long receipts of finished fence operations are kept. `None` is the default of
+    /// 30 days.
+    pub namespace_fence_receipt_retention: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
