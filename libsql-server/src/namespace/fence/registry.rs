@@ -66,6 +66,29 @@ impl FenceRegistry {
         self.controllers.lock().remove(namespace)
     }
 
+    /// Forget `namespace`'s controller if it holds nothing worth keeping: no fence record and
+    /// no in-memory gate (only what a replica learned of its primary's fence, which the next
+    /// answered `hello` would replace), and nothing but the registry refers to it. For a name
+    /// whose setup failed before it was ever served, such as a replica's lazy creation that
+    /// the primary's fence refused. Returns whether it was forgotten.
+    pub fn forget_idle(&self, namespace: &NamespaceName) -> bool {
+        let mut controllers = self.controllers.lock();
+        let idle = controllers.get(namespace).is_some_and(|controller| {
+            let gate = controller.gate();
+            // Under the registry lock nobody can take another reference to it.
+            Arc::strong_count(controller) == 1
+                && matches!(gate.fence, StoredFence::None { .. })
+                && gate.indeterminate.is_none()
+                && gate.installing.is_none()
+                && gate.closing_reads.is_none()
+                && gate.creating_target.is_none()
+        });
+        if idle {
+            controllers.remove(namespace);
+        }
+        idle
+    }
+
     /// Refuse a namespace whose fence state is `UNKNOWN_UNAVAILABLE`, or that is being created
     /// as a quarantined target, before any work is done to serve it.
     pub fn check_available(&self, namespace: &NamespaceName) -> Result<(), FenceError> {
@@ -244,5 +267,42 @@ mod tests {
         assert!(Arc::ptr_eq(&registry.get(&"ns".into()).unwrap(), &a));
         assert!(registry.remove(&"ns".into()).is_some());
         assert!(!Arc::ptr_eq(&registry.controller(&"ns".into()), &a));
+    }
+
+    /// A replica's lazy creation that the primary refused leaves nothing behind in the registry,
+    /// unless the controller holds fence state or somebody else still refers to it.
+    #[test]
+    fn forget_idle_only_unreferenced_plain_controllers() {
+        let registry = FenceRegistry::default();
+        assert!(!registry.forget_idle(&"missing".into()));
+
+        // What a refused replication taught it does not keep it.
+        let refused = registry.controller(&"refused".into());
+        refused.observe_primary(Some(FenceError::new(
+            FenceOutcome::MigrationTargetQuarantined,
+            "quarantined on the primary",
+        )));
+        // Still referenced: kept.
+        assert!(!registry.forget_idle(&"refused".into()));
+        drop(refused);
+        assert!(registry.forget_idle(&"refused".into()));
+        assert!(registry.get(&"refused".into()).is_none());
+        // The next use starts from a fresh UNFENCED controller.
+        assert!(registry
+            .controller(&"refused".into())
+            .permits(OperationClass::NormalRead)
+            .is_ok());
+
+        // A controller with fence state is never forgotten.
+        let registry = FenceRegistry::seeded([(
+            "lost".into(),
+            StoredFence::Unavailable {
+                detail: FenceDetail::CorruptRecord,
+                reason: "test".into(),
+                marker: None,
+            },
+        )]);
+        assert!(!registry.forget_idle(&"lost".into()));
+        assert!(registry.get(&"lost".into()).is_some());
     }
 }

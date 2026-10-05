@@ -400,17 +400,46 @@ impl NamespaceStore {
 
         // A lookup that cannot create: only the default namespace and lazy creation create a
         // namespace here, and those refuse a name whose fence state is not established.
-        let handle = match self.inner.metadata.lookup(&namespace).await? {
-            Some(handle) => handle,
+        let (handle, created) = match self.inner.metadata.lookup(&namespace).await? {
+            Some(handle) => (handle, false),
             None if namespace == NamespaceName::default() || self.inner.allow_lazy_creation => {
-                self.inner.metadata.handle(namespace.clone()).await?
+                (self.inner.metadata.handle(namespace.clone()).await?, true)
             }
             None => return Err(Error::NamespaceDoesntExist(namespace.to_string())),
         };
-        f(self
+        let entry = match self
             .load_namespace(&namespace, handle, RestoreOption::Latest)
-            .await?)
-        .await
+            .await
+        {
+            Ok(entry) => entry,
+            Err(e) => {
+                if created && e.fence_error().is_some() {
+                    self.forget_refused_creation(&namespace).await;
+                }
+                return Err(e);
+            }
+        };
+        f(entry).await
+    }
+
+    /// Undo what a lazy creation that a fence refused left in memory (on a replica server, the
+    /// primary refused to replicate the name; `docs/NAMESPACE_FENCE.md` section 13.3): the
+    /// metastore entry [`MetaStore::handle`] added, which would otherwise make the name look
+    /// like an existing namespace, and the controller the attempt created. Both are kept when
+    /// they hold anything durable or are in use by another attempt.
+    async fn forget_refused_creation(&self, namespace: &NamespaceName) {
+        match self.inner.metadata.forget_unstored(namespace.clone()).await {
+            Ok(forgotten) => {
+                let controller = self.inner.fences.forget_idle(namespace);
+                tracing::debug!(
+                    "refused creation of {namespace}: metastore entry forgotten: {forgotten}, \
+                     controller forgotten: {controller}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to forget the refused creation of {namespace}: {e}")
+            }
+        }
     }
 
     fn resolve_attach_fn(&self) -> ResolveNamespacePathFn {

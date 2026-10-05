@@ -19,6 +19,7 @@ use crate::database::{Database, ReplicaDatabase};
 use crate::namespace::broadcasters::BroadcasterHandle;
 use crate::namespace::configurator::helpers::{make_stats, run_storage_monitor};
 use crate::namespace::fence::controller::FenceController;
+use crate::namespace::fence::replica::{refusal_backoff, PrimaryFenceRefusal};
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{Namespace, NamespaceBottomlessDbIdInit, RestoreOption};
 use crate::namespace::{NamespaceName, NamespaceStore, ResetCb, ResetOp, ResolveNamespacePathFn};
@@ -66,6 +67,9 @@ impl ConfigureNamespace for ReplicaConfigurator {
         Box::pin(async move {
             tracing::debug!("creating replica namespace");
             let db_path = self.base.base_path.join("dbs").join(name.as_str());
+            // Whether this server already had a copy of the namespace: a directory this setup
+            // creates is removed again if the primary's fence refuses the namespace.
+            let had_copy = db_path.try_exists()?;
             let channel = self.channel.clone();
             let uri = self.uri.clone();
 
@@ -77,6 +81,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
                 meta_store_handle.clone(),
                 store.clone(),
                 WalImpl::new_sqlite(&db_path, new_frame_sender).await?,
+                fence.clone(),
             )
             .await?;
             let mut replicator = libsql_replication::replicator::Replicator::new_sqlite(
@@ -110,7 +115,28 @@ impl ConfigureNamespace for ReplicaConfigurator {
                         )
                         .await;
                 }
-                Err(e) => Err(e)?,
+                Err(e) => {
+                    if let Some(refusal) = PrimaryFenceRefusal::of(&e) {
+                        // The primary's fence refuses the namespace (a quarantined target, a
+                        // read-fenced source, a fence state it cannot establish; section 13.3):
+                        // fail at once with its code rather than retrying the handshake, and
+                        // leave no local copy behind that this setup created.
+                        let denial = refusal.0.clone();
+                        drop(replicator);
+                        if !had_copy {
+                            if let Err(e) = tokio::fs::remove_dir_all(&db_path).await {
+                                if e.kind() != std::io::ErrorKind::NotFound {
+                                    tracing::warn!(
+                                        "failed to remove {} after the primary refused {name}: {e}",
+                                        db_path.display()
+                                    );
+                                }
+                            }
+                        }
+                        return Err(crate::Error::NamespaceFence(denial));
+                    }
+                    Err(e)?
+                }
                 Ok(_) => (),
             }
 
@@ -126,6 +152,19 @@ impl ConfigureNamespace for ReplicaConfigurator {
                 loop {
                     match replicator.run().await {
                         err @ Error::Fatal(_) => Err(err)?,
+                        e @ Error::Internal(_) if PrimaryFenceRefusal::of(&e).is_some() => {
+                            // The primary's fence refuses replication of this namespace
+                            // (`docs/NAMESPACE_FENCE.md` section 6.2). The client has published
+                            // the local read denial; retry at a capped, growing interval rather
+                            // than at once, until the primary answers `hello` again.
+                            let refusals = replicator.client_mut().fence_refusals();
+                            let delay = refusal_backoff(refusals);
+                            tracing::debug!(
+                                "{e}; retrying replication of {namespace} in {delay:?} \
+                                 ({refusals} refusals in a row)"
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
                         _err @ Error::NamespaceDoesntExist => {
                             // TODO(lucio): there is a bug where a primary will report that a valid
                             // namespace doesn't exist when it does and causes the replicate to

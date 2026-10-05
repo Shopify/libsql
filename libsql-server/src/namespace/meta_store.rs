@@ -15,7 +15,7 @@ use libsql_sys::wal::{
 };
 use parking_lot::Mutex;
 use prost::Message;
-use rusqlite::TransactionBehavior;
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use tokio::sync::oneshot;
 use tokio::sync::{
     mpsc,
@@ -1303,6 +1303,41 @@ impl MetaStore {
         r
     }
 
+    /// Take out the in-memory entry that [`handle`](Self::handle) put in the map for a
+    /// namespace whose creation then failed, so that [`exists`](Self::exists) and
+    /// [`lookup`](Self::lookup) do not report a namespace that was never created
+    /// (`docs/NAMESPACE_FENCE.md` section 13.3, replica lazy creation). Only an entry that no
+    /// handle is subscribed to any more and that has no stored config row is removed: a config
+    /// that was persisted, or a creation of the same name still in progress, keeps its entry.
+    /// Returns whether the entry was removed.
+    pub async fn forget_unstored(&self, namespace: NamespaceName) -> Result<bool> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || -> std::result::Result<bool, FenceStoreError> {
+            // The connection lock first, as everywhere else that takes both: a config being
+            // persisted concurrently is either already in its row here, or finds no entry when
+            // it publishes and inserts its own.
+            let conn = inner.conn.blocking_lock();
+            let stored = conn
+                .query_row(
+                    "SELECT 1 FROM namespace_configs WHERE namespace = ?1",
+                    [namespace.as_str()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            let mut configs = inner.configs.blocking_lock();
+            match configs.get(&namespace) {
+                Some(sender) if !stored && sender.receiver_count() == 0 => {
+                    configs.remove(&namespace);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })
+        .await?
+        .map_err(fence_store_error)
+    }
+
     // TODO: we need to either make sure that the metastore is restored
     // before we start accepting connections or we need to contact bottomless
     // here to check if a namespace exists. Preferably the former.
@@ -1737,6 +1772,38 @@ mod fence_tests {
             adoption_authorised: false,
             validation_snapshot: None,
         }
+    }
+
+    /// The in-memory entry a failed creation left is forgotten, so `exists()` and `lookup()` do
+    /// not report the name; a stored config, or a handle still held, keeps the entry.
+    #[tokio::test]
+    async fn forget_unstored_only_unused_unstored_entries() {
+        let tmp = tempdir().unwrap();
+        let meta = open(tmp.path(), true).await;
+        let ns = NamespaceName::from("lazy");
+
+        assert!(!meta.forget_unstored(ns.clone()).await.unwrap());
+
+        let handle = meta.handle(ns.clone()).await.unwrap();
+        assert!(meta.exists(&ns).await);
+        // A handle is still held (a creation in progress): kept.
+        assert!(!meta.forget_unstored(ns.clone()).await.unwrap());
+        assert!(meta.exists(&ns).await);
+        drop(handle);
+        assert!(meta.forget_unstored(ns.clone()).await.unwrap());
+        assert!(!meta.exists(&ns).await);
+        assert!(meta.lookup(&ns).await.unwrap().is_none());
+
+        // A stored config is never forgotten.
+        let stored = NamespaceName::from("stored");
+        meta.handle(stored.clone())
+            .await
+            .unwrap()
+            .store(DatabaseConfig::default())
+            .await
+            .unwrap();
+        assert!(!meta.forget_unstored(stored.clone()).await.unwrap());
+        assert!(meta.lookup(&stored).await.unwrap().is_some());
     }
 
     fn request(
