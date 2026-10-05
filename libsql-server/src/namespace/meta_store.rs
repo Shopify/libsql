@@ -23,7 +23,7 @@ use tokio::sync::{
 };
 use uuid::Uuid;
 
-use crate::config::BottomlessConfig;
+use crate::config::{BottomlessConfig, FenceAdoptionKey};
 use crate::connection::config::DatabaseConfig;
 use crate::database::DatabaseKind;
 use crate::schema::{MigrationDetails, MigrationSummary};
@@ -97,6 +97,35 @@ struct MetaStoreInner {
     /// record for. They are refused by lookups and by every config or lifecycle change, and
     /// never default-created. A fence command that commits for the name takes it out.
     recovered: Mutex<HashMap<NamespaceName, StoredFence>>,
+    /// Where this metastore's contents came from at startup, recorded once the server has
+    /// opened it (section 13.3).
+    restore_provenance: std::sync::OnceLock<MetastoreProvenance>,
+    /// The secret that authorises `AdoptFence` (section 12); `None` disables adoption.
+    fence_adoption_key: Option<FenceAdoptionKey>,
+}
+
+/// Whether the metastore was restored from its bottomless backup when the server started
+/// (`docs/NAMESPACE_FENCE.md` sections 4.3, 4.4 and 13.3). A restored metastore can hold fence
+/// records older than the namespace markers; the marker comparison makes those namespaces
+/// `UNKNOWN_UNAVAILABLE`, and this is what the admin API, the startup log and the
+/// `libsql_server_metastore_restored_from_backup` gauge report about the restore itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetastoreProvenance {
+    /// The metastore database was restored from its backup at startup.
+    pub restored_from_backup: bool,
+    /// The backup generation it was restored from, when known.
+    pub restored_generation: Option<Uuid>,
+}
+
+impl MetastoreProvenance {
+    /// The provenance of a bottomless restore that reported `did_recover`, where `generation`
+    /// is the replicator's generation right after the restore: the generation restored from.
+    pub fn from_restore(did_recover: bool, generation: Option<Uuid>) -> Self {
+        Self {
+            restored_from_backup: did_recover,
+            restored_generation: generation.filter(|_| did_recover),
+        }
+    }
 }
 
 /// How this metastore treats namespace fences (`docs/NAMESPACE_FENCE.md` section 13.1).
@@ -140,6 +169,8 @@ fn setup_connection(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// [`metastore_connection_maker_with_provenance`] without the provenance, for tests.
+#[cfg(test)]
 pub async fn metastore_connection_maker(
     config: Option<BottomlessConfig>,
     base_path: &Path,
@@ -147,8 +178,24 @@ pub async fn metastore_connection_maker(
     impl Fn() -> crate::Result<MetaStoreConnection>,
     MetaStoreWalManager,
 )> {
+    let (maker, wal_manager, _) =
+        metastore_connection_maker_with_provenance(config, base_path).await?;
+    Ok((maker, wal_manager))
+}
+
+/// [`metastore_connection_maker`], also returning whether the bottomless restore recovered the
+/// metastore from its backup, for [`MetaStore::record_restore_provenance`].
+pub async fn metastore_connection_maker_with_provenance(
+    config: Option<BottomlessConfig>,
+    base_path: &Path,
+) -> crate::Result<(
+    impl Fn() -> crate::Result<MetaStoreConnection>,
+    MetaStoreWalManager,
+    MetastoreProvenance,
+)> {
     let db_path = base_path.join("metastore");
     tokio::fs::create_dir_all(&db_path).await?;
+    let mut provenance = MetastoreProvenance::default();
     let replicator = match config {
         Some(config) => {
             let options = bottomless::replicator::Options {
@@ -175,7 +222,11 @@ pub async fn metastore_connection_maker(
                 options,
             )
             .await?;
-            let (action, _did_recover) = replicator.restore(None, None).await?;
+            let (action, did_recover) = replicator.restore(None, None).await?;
+            // A restore that recovered the database leaves the replicator on the generation it
+            // restored from; a new generation, if any, is only started below.
+            provenance =
+                MetastoreProvenance::from_restore(did_recover, replicator.generation().ok());
             // TODO: this logic should probably be moved to bottomless.
             match action {
                 bottomless::replicator::RestoreAction::SnapshotMainDbFile => {
@@ -213,7 +264,7 @@ pub async fn metastore_connection_maker(
         }
     };
 
-    Ok((maker, wal_manager))
+    Ok((maker, wal_manager, provenance))
 }
 
 impl MetaStoreInner {
@@ -254,6 +305,8 @@ impl MetaStoreInner {
             dbs_path,
             fence,
             recovered: Default::default(),
+            restore_provenance: Default::default(),
+            fence_adoption_key: config.namespace_fence_adoption_key.clone(),
         };
 
         if config.allow_recover_from_fs {
@@ -600,6 +653,17 @@ fn unavailable_error(stored: &StoredFence) -> FenceError {
         })
 }
 
+/// A config write or a delete under the stored fence: refused (and counted as a lifecycle
+/// denial) unless its state permits lifecycle operations.
+fn lifecycle_permitted(stored: &StoredFence) -> std::result::Result<(), FenceError> {
+    stored.permits(OperationClass::Lifecycle).inspect_err(|e| {
+        crate::namespace::fence::audit::denied(
+            e,
+            crate::namespace::fence::audit::DenialSurface::Lifecycle,
+        )
+    })
+}
+
 /// Why a name that has no config must not be created: its directory holds a marker, so it is a
 /// target being created or a namespace the metastore lost (section 13.3).
 fn marker_denial(dbs_path: &Path, namespace: &NamespaceName) -> Result<Option<FenceError>> {
@@ -692,7 +756,7 @@ fn try_process(
     if inner.fence.tables {
         let (stored, _) =
             fence_store::read_fence(&tx, &inner.dbs_path, namespace).map_err(fence_store_error)?;
-        stored.permits(OperationClass::Lifecycle)?;
+        lifecycle_permitted(&stored)?;
     }
     if let Some(schema) = config.shared_schema_name.as_ref() {
         if inner.db_kind.is_primary() {
@@ -923,6 +987,19 @@ fn apply_fence_command(
             created_config = Some(Arc::new(logical));
         } else {
             let Some(config) = &config else {
+                if let FenceCommand::AdoptFence(_) = &request.command {
+                    // Section 12: adoption changes the owner and nothing else. The marker holds
+                    // the fence record, not the namespace's configuration (its JWT key, size
+                    // limit, durability, backup id), so re-establishing the record would mean
+                    // inventing a configuration. The namespace stays unavailable.
+                    return Err(FenceError::new(
+                        FenceOutcome::FencePreconditionFailed,
+                        "the metastore holds no configuration for this namespace; adoption \
+                         re-establishes a fence, not a namespace configuration",
+                    )
+                    .with_detail(FenceDetail::NamespaceConfigMissing)
+                    .into());
+                }
                 return Err(FenceError::new(
                     FenceOutcome::FenceStateUnavailable,
                     "the fenced namespace has no config row",
@@ -948,6 +1025,13 @@ fn apply_fence_command(
     // The command established the fence from the durable state; whatever startup could not
     // recover about this name is settled.
     inner.recovered.lock().remove(ns);
+    if let (StoredFence::Unavailable { .. }, Some(next)) = (&stored, &record) {
+        // An adoption re-established the record the marker held (section 12). While the name
+        // was unavailable its in-memory config kept whatever the stale config row held; from
+        // now on it carries the namespace's own values, as `restore_fences` gives every
+        // established record at startup.
+        restore_own_blocks(inner, ns, next);
+    }
 
     let current = record.or_else(|| stored.record().cloned());
     after_fence_commit(
@@ -963,6 +1047,18 @@ fn apply_fence_command(
         record: current,
         created_config,
     })
+}
+
+/// Put the namespace's own `block_*` values ([`fence_store::own_config`]) into its in-memory
+/// config, if it has one. The caller holds the connection lock, which is taken before the
+/// config map's everywhere.
+fn restore_own_blocks(inner: &MetaStoreInner, ns: &NamespaceName, record: &NamespaceFenceRecord) {
+    let configs = inner.configs.blocking_lock();
+    if let Some(sender) = configs.get(ns) {
+        let config = sender.borrow().config.clone();
+        let config = fence_store::own_config(&config, record);
+        sender.send_modify(|c| c.config = Arc::new(config));
+    }
 }
 
 /// Whether the marker has to be written after a commit: the record changed, or it had fallen
@@ -1143,8 +1239,13 @@ impl MetaStore {
                         );
                     }
 
-                    let (maker, wal) =
-                        metastore_connection_maker(config.bottomless.clone(), base_path).await?;
+                    // The rebuilt metastore is restored from the backup again, so what the
+                    // server reports is this restore, not the one of the broken metastore.
+                    let (maker, wal, provenance) = metastore_connection_maker_with_provenance(
+                        config.bottomless.clone(),
+                        base_path,
+                    )
+                    .await?;
 
                     let conn = maker()?;
 
@@ -1156,6 +1257,7 @@ impl MetaStore {
                     })
                     .await
                     .unwrap()?;
+                    let _ = inner.restore_provenance.set(provenance);
 
                     tracing::info!("metastore destroy on error successful");
 
@@ -1256,7 +1358,7 @@ impl MetaStore {
             if self.inner.fence.tables {
                 let (stored, _) = fence_store::read_fence(&tx, &self.inner.dbs_path, &namespace)
                     .map_err(fence_store_error)?;
-                stored.permits(OperationClass::Lifecycle)?;
+                lifecycle_permitted(&stored)?;
                 if !matches!(stored, StoredFence::None { .. }) {
                     // The marker goes before the commit: a crash in between leaves a record
                     // without a marker, which is repaired on load, rather than a marker
@@ -1348,6 +1450,51 @@ impl MetaStore {
     /// Whether namespace fences may be used on this server.
     pub fn fence_enabled(&self) -> bool {
         self.inner.fence.enabled
+    }
+
+    /// Whether `presented`, the value of a request's `x-libsql-fence-adoption-key` header,
+    /// authorises `AdoptFence` (section 12): an adoption key is configured and `presented` is
+    /// that key. Compared in constant time.
+    pub fn fence_adoption_authorised(&self, presented: Option<&[u8]>) -> bool {
+        match (&self.inner.fence_adoption_key, presented) {
+            (Some(key), Some(presented)) => key.matches(presented),
+            _ => false,
+        }
+    }
+
+    /// Records where this metastore's contents came from at startup, as reported by
+    /// [`metastore_connection_maker_with_provenance`], then sets the
+    /// `libsql_server_metastore_restored_from_backup` gauge and, after a restore from backup,
+    /// logs a startup warning. What was recorded first wins: when `destroy_on_error` rebuilt
+    /// the metastore while opening it, the restore of the rebuilt metastore is already recorded
+    /// and is what is reported. The server calls this once, right after opening the metastore.
+    pub fn record_restore_provenance(&self, provenance: MetastoreProvenance) {
+        let provenance = *self.inner.restore_provenance.get_or_init(|| provenance);
+        crate::metrics::METASTORE_RESTORED_FROM_BACKUP.set(if provenance.restored_from_backup {
+            1.0
+        } else {
+            0.0
+        });
+        if provenance.restored_from_backup {
+            tracing::warn!(
+                restored_generation = ?provenance.restored_generation,
+                fence_tables = self.inner.fence.tables,
+                unavailable_namespaces = self.inner.recovered.lock().len(),
+                "the metastore was restored from its backup at startup; fence records the backup \
+                 does not hold are detected through the namespace markers and reported as \
+                 UNKNOWN_UNAVAILABLE"
+            );
+        }
+    }
+
+    /// Where this metastore's contents came from at startup; the default (not restored) until
+    /// [`record_restore_provenance`](Self::record_restore_provenance) is called.
+    pub fn restore_provenance(&self) -> MetastoreProvenance {
+        self.inner
+            .restore_provenance
+            .get()
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The drain policy of an `AcquireSourceWriteFence` that names none: the configured
@@ -2956,6 +3103,129 @@ mod fence_tests {
                     .await,
             );
             assert_eq!(e.detail(), Some(FenceDetail::MetastoreBehindMarker));
+        }
+    }
+
+    /// Metastore restore provenance (`docs/NAMESPACE_FENCE.md` sections 4.3, 4.4 and 13.3).
+    mod provenance {
+        use super::*;
+
+        #[test]
+        fn generation_only_after_a_recovery() {
+            let generation = Uuid::from_u128(0x77);
+            assert_eq!(
+                MetastoreProvenance::from_restore(true, Some(generation)),
+                MetastoreProvenance {
+                    restored_from_backup: true,
+                    restored_generation: Some(generation),
+                }
+            );
+            // A restore that found the local database up to date (or nothing to restore) did
+            // not recover anything, whatever generation the replicator is on.
+            assert_eq!(
+                MetastoreProvenance::from_restore(false, Some(generation)),
+                MetastoreProvenance::default()
+            );
+            assert_eq!(
+                MetastoreProvenance::from_restore(true, None),
+                MetastoreProvenance {
+                    restored_from_backup: true,
+                    restored_generation: None,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn not_restored_until_recorded_and_first_record_wins() {
+            let dir = tempdir().unwrap();
+            let store = open(dir.path(), true).await;
+            assert_eq!(store.restore_provenance(), MetastoreProvenance::default());
+
+            let restored = MetastoreProvenance {
+                restored_from_backup: true,
+                restored_generation: Some(Uuid::from_u128(0x77)),
+            };
+            store.record_restore_provenance(restored);
+            assert_eq!(store.restore_provenance(), restored);
+            // Every clone of the store reports the same provenance.
+            assert_eq!(store.clone().restore_provenance(), restored);
+
+            store.record_restore_provenance(MetastoreProvenance::default());
+            assert_eq!(store.restore_provenance(), restored);
+        }
+
+        /// An S3 endpoint backed by a temporary directory, on a port of its own.
+        async fn mock_s3() -> (tempfile::TempDir, String) {
+            use s3s::auth::SimpleAuth;
+            use s3s::service::S3ServiceBuilder;
+
+            let root = tempdir().unwrap();
+            let mut s3 = S3ServiceBuilder::new(s3s_fs::FileSystem::new(root.path()).unwrap());
+            s3.set_auth(SimpleAuth::from_single("key", "secret"));
+            let service = s3.build().into_shared().into_make_service();
+            let server = hyper::Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+            let endpoint = format!("http://{}", server.local_addr());
+            tokio::spawn(server);
+            (root, endpoint)
+        }
+
+        fn bottomless(endpoint: String) -> BottomlessConfig {
+            BottomlessConfig {
+                access_key_id: "key".into(),
+                secret_access_key: "secret".into(),
+                session_token: None,
+                region: "us-east-1".into(),
+                backup_id: "metastore-provenance".into(),
+                bucket_name: "provenance".into(),
+                backup_interval: Duration::from_millis(100),
+                bucket_endpoint: endpoint,
+            }
+        }
+
+        async fn open_bottomless(
+            dir: &Path,
+            config: &BottomlessConfig,
+        ) -> (MetaStore, MetastoreProvenance) {
+            let (maker, manager, provenance) =
+                metastore_connection_maker_with_provenance(Some(config.clone()), dir)
+                    .await
+                    .unwrap();
+            let store = MetaStore::new(
+                MetaStoreConfig::default(),
+                dir,
+                maker().unwrap(),
+                manager,
+                DatabaseKind::Primary,
+            )
+            .await
+            .unwrap();
+            store.record_restore_provenance(provenance);
+            (store, provenance)
+        }
+
+        /// A metastore opened on an empty directory from a backup that holds one reports the
+        /// restore and the generation it came from; one opened with nothing to restore does
+        /// not.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn bottomless_restore_is_reported() {
+            let (_s3, endpoint) = mock_s3().await;
+            let config = bottomless(endpoint);
+
+            let first = tempdir().unwrap();
+            let (store, provenance) = open_bottomless(first.path(), &config).await;
+            assert_eq!(provenance, MetastoreProvenance::default());
+            assert_eq!(store.restore_provenance(), MetastoreProvenance::default());
+            let _handle = create_namespace(&store, "db").await;
+            // Uploads everything the backup does not hold yet.
+            store.shutdown().await.unwrap();
+
+            let second = tempdir().unwrap();
+            let (store, provenance) = open_bottomless(second.path(), &config).await;
+            assert!(provenance.restored_from_backup, "{provenance:?}");
+            assert!(provenance.restored_generation.is_some(), "{provenance:?}");
+            assert_eq!(store.restore_provenance(), provenance);
+            // The restored metastore holds what the first one backed up.
+            assert!(store.exists(&"db".into()).await);
         }
     }
 }

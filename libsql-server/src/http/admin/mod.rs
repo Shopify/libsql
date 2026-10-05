@@ -248,8 +248,10 @@ async fn handle_get_index() -> &'static str {
     "Welcome to the sqld admin API"
 }
 
-async fn handle_metrics(State(metrics): State<Metrics>) -> String {
-    metrics.render()
+async fn handle_metrics<C>(State(app_state): State<Arc<AppState<C>>>) -> String {
+    // The fence gauges are computed from the registry when they are read.
+    app_state.namespaces.update_fence_gauges();
+    app_state.metrics.render()
 }
 
 async fn handle_get_config<C: Connector>(

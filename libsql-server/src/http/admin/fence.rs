@@ -4,7 +4,8 @@
 //! server was started with `--enable-namespace-fence`, except `InspectFence`, which is also
 //! served while fence state exists in the metastore with the flag off (fences are enforced
 //! either way, section 13.1). Every mutating route runs through
-//! [`NamespaceStore::execute_fence_command`], which owns replay, the drains and target creation.
+//! [`NamespaceStore::execute_fence_command`], which owns replay, the drains and target creation
+//! (`AdoptFence` through `execute_fence_command_authorised`, with the adoption key check).
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use bytes::Bytes;
-use hyper::StatusCode;
+use hyper::{HeaderMap, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -23,16 +24,18 @@ use crate::auth::parse_jwt_keys;
 use crate::error::Error;
 use crate::hrana::proto;
 use crate::namespace::fence::command::{
-    CommandKind, DrainPolicy, FenceCommand, FenceRequest, OnDeadline, TargetConfig,
+    AdoptArgs, CommandKind, DrainPolicy, FenceCommand, FenceRequest, OnDeadline, TargetConfig,
     ValidationResult,
 };
 use crate::namespace::fence::controller::{DrainCounters, FenceController};
 use crate::namespace::fence::outcome::{FenceDetail, FenceError, FenceOutcome};
-use crate::namespace::fence::record::{CommandReceipt, NamespaceFenceRecord, ServerIdentity};
+use crate::namespace::fence::record::{
+    Adoption, CommandReceipt, NamespaceFenceRecord, ServerIdentity,
+};
 use crate::namespace::fence::state::FenceState;
 use crate::namespace::fence::store::{StoredFence, StoredReceipt};
 use crate::namespace::fence::{server_identity, FENCE_PROTOCOL_VERSION, PROXY_STABLE_CODE};
-use crate::namespace::meta_store::FenceCommit;
+use crate::namespace::meta_store::{FenceCommit, MetastoreProvenance};
 use crate::namespace::NamespaceName;
 use crate::net::Connector;
 
@@ -43,9 +46,11 @@ use super::AppState;
 /// looks at part of a result.
 pub const MAX_VALIDATION_QUERY_ROWS: usize = 10_000;
 
+/// The header that carries the adoption key (section 12).
+pub const ADOPTION_KEY_HEADER: &str = "x-libsql-fence-adoption-key";
+
 /// The commands this server serves over the admin API, reported by capability discovery.
-/// Adoption is served once its route exists.
-const SERVED_COMMANDS: [&str; 11] = [
+const SERVED_COMMANDS: [&str; 12] = [
     "InspectFence",
     CommandKind::AcquireSourceWriteFence.as_str(),
     CommandKind::SetSourceReadFence.as_str(),
@@ -57,6 +62,7 @@ const SERVED_COMMANDS: [&str; 11] = [
     CommandKind::PublishTargetReadableWriteFenced.as_str(),
     CommandKind::EnableTargetWrites.as_str(),
     CommandKind::AbortQuarantinedTarget.as_str(),
+    CommandKind::AdoptFence.as_str(),
 ];
 
 /// The fence routes, added to the admin router.
@@ -66,7 +72,7 @@ pub(super) fn routes<C: Connector>() -> axum::Router<Arc<AppState<C>>> {
             move |State(state): State<Arc<AppState<C>>>,
                   Path(namespace): Path<String>,
                   body: Bytes| async move {
-                handle_command(state, namespace, kind, body).await
+                handle_command(state, namespace, kind, body, false).await
             },
         )
     };
@@ -117,6 +123,7 @@ pub(super) fn routes<C: Connector>() -> axum::Router<Arc<AppState<C>>> {
             "/v1/namespaces/:namespace/fence/target/validation-query",
             post(handle_validation_query),
         )
+        .route("/v1/namespaces/:namespace/fence/adopt", post(handle_adopt))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -132,8 +139,7 @@ async fn handle_capabilities<C>(State(state): State<Arc<AppState<C>>>) -> Json<V
         "proxy_stable_code": PROXY_STABLE_CODE,
         "server": server_json(&server_identity()),
         "active_fences": state.namespaces.active_fences(),
-        // Metastore restore provenance is not tracked yet.
-        "metastore": { "restored_from_backup": false, "restored_generation": null },
+        "metastore": metastore_provenance_json(&meta.restore_provenance()),
     }))
 }
 
@@ -204,11 +210,34 @@ async fn handle_inspect<C>(
     let body = json!({
         "outcome": FenceOutcome::Applied.as_str(),
         "replayed": false,
-        "fence": fence_json(&namespace, &inspection.fence, controller.as_deref()),
+        "fence": fence_json(
+            &namespace,
+            &inspection.fence,
+            controller.as_deref(),
+            &meta.restore_provenance(),
+        ),
         "receipts": receipts,
         "drain": drain_json(controller.as_deref()),
     });
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// `AdoptFence` (section 12): the admin credential (checked by the middleware) and the separate
+/// adoption key in [`ADOPTION_KEY_HEADER`]. Whether the key matched is handed to the transition,
+/// which refuses an unauthorised adoption with `adoption_not_authorised` after replay handling,
+/// like every other check.
+async fn handle_adopt<C>(
+    State(state): State<Arc<AppState<C>>>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let presented = headers.get(ADOPTION_KEY_HEADER).map(|v| v.as_bytes());
+    let authorised = state
+        .namespaces
+        .meta_store()
+        .fence_adoption_authorised(presented);
+    handle_command(state, namespace, CommandKind::AdoptFence, body, authorised).await
 }
 
 async fn handle_command<C>(
@@ -216,6 +245,7 @@ async fn handle_command<C>(
     namespace: String,
     kind: CommandKind,
     body: Bytes,
+    adoption_authorised: bool,
 ) -> Response {
     if !state.namespaces.meta_store().fence_enabled() {
         return StatusCode::NOT_FOUND.into_response();
@@ -231,11 +261,18 @@ async fn handle_command<C>(
         Ok(request) => request,
         Err(e) => return error_reply(&state, &namespace, e).await,
     };
-    match state
-        .namespaces
-        .execute_fence_command(request, server_identity())
-        .await
-    {
+    let result = if kind == CommandKind::AdoptFence {
+        state
+            .namespaces
+            .execute_fence_command_authorised(request, server_identity(), adoption_authorised)
+            .await
+    } else {
+        state
+            .namespaces
+            .execute_fence_command(request, server_identity())
+            .await
+    };
+    match result {
         Ok(commit) => success_reply(&state, &namespace, commit),
         Err(e) => fence_or_error(&state, &namespace, e).await,
     }
@@ -307,9 +344,10 @@ async fn handle_validation_query<C>(
     drop(session);
 
     let controller = state.namespaces.existing_fence_controller(&namespace);
+    let provenance = state.namespaces.meta_store().restore_provenance();
     let fence = controller
         .as_ref()
-        .map(|c| fence_json(&namespace, &c.gate().fence, Some(c)))
+        .map(|c| fence_json(&namespace, &c.gate().fence, Some(c), &provenance))
         .unwrap_or(Value::Null);
     let body = json!({
         "results": results,
@@ -396,14 +434,20 @@ async fn error_reply<C>(
     error: FenceError,
 ) -> Response {
     let mut reply = ErrorReply::new(error);
+    let provenance = state.namespaces.meta_store().restore_provenance();
     match state.namespaces.existing_fence_controller(namespace) {
         Some(controller) => {
-            reply.fence = fence_json(namespace, &controller.gate().fence, Some(&controller));
+            reply.fence = fence_json(
+                namespace,
+                &controller.gate().fence,
+                Some(&controller),
+                &provenance,
+            );
             reply.drain = drain_json(Some(&controller));
         }
         None => {
             if let Ok((inspection, _)) = state.namespaces.inspect_fence(namespace).await {
-                reply.fence = fence_json(namespace, &inspection.fence, None);
+                reply.fence = fence_json(namespace, &inspection.fence, None, &provenance);
             }
         }
     }
@@ -424,13 +468,15 @@ fn success_reply<C>(
     commit: FenceCommit,
 ) -> Response {
     let controller = state.namespaces.existing_fence_controller(namespace);
+    let provenance = state.namespaces.meta_store().restore_provenance();
     let fence = match (&commit.record, &controller) {
         (Some(record), _) => fence_json(
             namespace,
             &StoredFence::Record(record.clone()),
             controller.as_deref(),
+            &provenance,
         ),
-        (None, Some(c)) => fence_json(namespace, &c.gate().fence, Some(c)),
+        (None, Some(c)) => fence_json(namespace, &c.gate().fence, Some(c), &provenance),
         (None, None) => Value::Null,
     };
     let outcome = commit.receipt.outcome;
@@ -637,9 +683,12 @@ fn parse_command(
         }
         CommandKind::EnableTargetWrites => FenceCommand::EnableTargetWrites,
         CommandKind::AbortQuarantinedTarget => FenceCommand::AbortQuarantinedTarget,
-        CommandKind::AdoptFence => {
-            return Err(invalid("adoption is not served by this route"));
-        }
+        CommandKind::AdoptFence => FenceCommand::AdoptFence(AdoptArgs {
+            current_operation_id: body.uuid("current_operation_id")?,
+            approvers: body.req("approvers")?,
+            incident_ref: body.req("incident_ref")?,
+            reason: body.req("reason")?,
+        }),
     };
     body.finish()?;
     Ok(FenceRequest {
@@ -894,33 +943,18 @@ fn record_fields(record: &NamespaceFenceRecord, out: &mut Map<String, Value>) {
     out.insert("written_by".into(), server_json(&record.written_by));
     out.insert(
         "adoptions".into(),
-        Value::Array(
-            record
-                .adoptions
-                .iter()
-                .map(|a| {
-                    json!({
-                        "previous_operation_id": a.previous_operation_id.to_string(),
-                        "new_operation_id": a.new_operation_id.to_string(),
-                        "command_id": a.command_id.to_string(),
-                        "approvers": a.approvers,
-                        "incident_ref": a.incident_ref,
-                        "reason": a.reason,
-                        "at": timestamp(a.at_ms),
-                        "revision": a.revision,
-                    })
-                })
-                .collect(),
-        ),
+        Value::Array(record.adoptions.iter().map(adoption_json).collect()),
     );
 }
 
 /// The fence view of section 4.3. `fence` is the durable state being reported; `controller`,
-/// when the namespace has one, supplies the live admission and the live log id.
+/// when the namespace has one, supplies the live admission and the live log id; `provenance`
+/// says whether the metastore that holds `fence` was restored from its backup at startup.
 fn fence_json(
     namespace: &NamespaceName,
     fence: &StoredFence,
     controller: Option<&FenceController>,
+    provenance: &MetastoreProvenance,
 ) -> Value {
     let gate = controller.map(|c| c.gate());
     let mut out = Map::new();
@@ -990,9 +1024,34 @@ fn fence_json(
     out.insert("server".into(), server_json(&server_identity()));
     out.insert(
         "provenance".into(),
-        json!({ "metastore_restored_from_backup": false, "marker": marker }),
+        json!({
+            "metastore_restored_from_backup": provenance.restored_from_backup,
+            "metastore_restored_generation": provenance.restored_generation.map(|g| g.to_string()),
+            "marker": marker,
+        }),
     );
     Value::Object(out)
+}
+
+/// The `metastore` object of the capability endpoint (section 4.4).
+fn metastore_provenance_json(provenance: &MetastoreProvenance) -> Value {
+    json!({
+        "restored_from_backup": provenance.restored_from_backup,
+        "restored_generation": provenance.restored_generation.map(|g| g.to_string()),
+    })
+}
+
+fn adoption_json(a: &Adoption) -> Value {
+    json!({
+        "previous_operation_id": a.previous_operation_id.to_string(),
+        "new_operation_id": a.new_operation_id.to_string(),
+        "command_id": a.command_id.to_string(),
+        "approvers": a.approvers,
+        "incident_ref": a.incident_ref,
+        "reason": a.reason,
+        "at": timestamp(a.at_ms),
+        "revision": a.revision,
+    })
 }
 
 fn receipt_json(receipt: &CommandReceipt) -> Value {
@@ -1007,6 +1066,7 @@ fn receipt_json(receipt: &CommandReceipt) -> Value {
         "state_after": receipt.state_after.as_str(),
         "applied_at": timestamp(receipt.applied_at_ms),
         "instance_id": receipt.instance_id.to_string(),
+        "adoption": receipt.adoption.as_ref().map(adoption_json),
     })
 }
 
@@ -1020,5 +1080,59 @@ fn stored_receipt_json(stored: &StoredReceipt) -> Value {
             "applied_at": timestamp(stored.applied_at_ms),
             "error": e.to_string(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A metastore restored from its backup is reported in the fence view (section 4.3) and
+    /// in the capability endpoint's `metastore` object (section 4.4), with the generation.
+    #[test]
+    fn restore_provenance_is_reported() {
+        let generation = Uuid::from_u128(0x77);
+        let restored = MetastoreProvenance {
+            restored_from_backup: true,
+            restored_generation: Some(generation),
+        };
+        let namespace = NamespaceName::from_string("db".into()).unwrap();
+        let unavailable = StoredFence::Unavailable {
+            detail: FenceDetail::MetastoreBehindMarker,
+            reason: "the metastore is behind the marker".into(),
+            marker: None,
+        };
+
+        let view = fence_json(&namespace, &unavailable, None, &restored);
+        assert_eq!(
+            view["provenance"],
+            json!({
+                "metastore_restored_from_backup": true,
+                "metastore_restored_generation": generation.to_string(),
+                "marker": "metastore_behind_marker",
+            })
+        );
+        assert_eq!(view["state"], "UNKNOWN_UNAVAILABLE");
+        assert_eq!(
+            metastore_provenance_json(&restored),
+            json!({ "restored_from_backup": true, "restored_generation": generation.to_string() })
+        );
+
+        let plain = StoredFence::None {
+            namespace_exists: true,
+        };
+        let view = fence_json(&namespace, &plain, None, &MetastoreProvenance::default());
+        assert_eq!(
+            view["provenance"],
+            json!({
+                "metastore_restored_from_backup": false,
+                "metastore_restored_generation": null,
+                "marker": null,
+            })
+        );
+        assert_eq!(
+            metastore_provenance_json(&MetastoreProvenance::default()),
+            json!({ "restored_from_backup": false, "restored_generation": null })
+        );
     }
 }

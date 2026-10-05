@@ -730,7 +730,7 @@ mod tests {
             fence_status as fn(FenceError) -> tonic::Status,
         )
         .unwrap();
-        assert_eq!(s.fence.cancel_read_leases(), 1);
+        assert_eq!(s.fence.cancel_read_leases_by_kind().total(), 1);
         until_released(&s.fence).await;
         let status = tokio::time::timeout(PROMPT, stream.next())
             .await

@@ -15,6 +15,7 @@ use tokio::time::Instant;
 
 use crate::namespace::meta_store::{FenceCommit, FenceCommitKind, FenceContext, MetaStore};
 
+use super::audit::{CommandReport, DrainKind, ForcedKind};
 use super::command::{DrainPolicy, FenceCommand, FenceRequest};
 use super::controller::{FenceController, Transition};
 use super::drain::{now_ms, FORCED_ROLLBACK_GRACE};
@@ -75,10 +76,14 @@ pub async fn set_source_read_fence(
     let drain_key = (commit.receipt.operation_id, commit.receipt.command_id);
 
     // Step 4.
-    if !drain_readers(&controller, policy).await {
+    let started = Instant::now();
+    if !drain_readers(&controller, policy, &mut transition.report).await {
         return Ok(commit);
     }
 
+    transition
+        .report
+        .drained(DrainKind::Read, started.elapsed());
     // Step 5.
     ctx.now_ms = now_ms();
     let mut completed = transition
@@ -95,7 +100,11 @@ pub async fn set_source_read_fence(
 /// through their own), and the drain keeps waiting for the actual releases for one more
 /// deadline, but at least [`FORCED_ROLLBACK_GRACE`]. `false` when leases are still held then:
 /// the answer is `DRAINING`, never a guess.
-async fn drain_readers(controller: &FenceController, policy: DrainPolicy) -> bool {
+async fn drain_readers(
+    controller: &FenceController,
+    policy: DrainPolicy,
+    report: &mut CommandReport,
+) -> bool {
     let namespace = controller.namespace().clone();
     let deadline_after = Duration::from_millis(policy.deadline_ms);
     let deadline = Instant::now() + deadline_after;
@@ -104,7 +113,11 @@ async fn drain_readers(controller: &FenceController, policy: DrainPolicy) -> boo
     }
     let _ = controller.hook(HookPoint::BeforeReadLeaseCancel).await;
     let held = controller.read_lease_counts();
-    let asked = controller.cancel_read_leases();
+    let asked = controller.cancel_read_leases_by_kind();
+    report.forced(ForcedKind::SqlCancel, asked.sql);
+    report.forced(ForcedKind::DumpCancel, asked.dump);
+    report.forced(ForcedKind::StreamTermination, asked.replication);
+    let asked = asked.total();
     tracing::info!(
         %namespace,
         deadline_ms = policy.deadline_ms,

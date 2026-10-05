@@ -45,6 +45,7 @@ fn capabilities() {
             "PublishTargetReadableWriteFenced",
             "EnableTargetWrites",
             "AbortQuarantinedTarget",
+            "AdoptFence",
         ] {
             assert!(commands.contains(&command), "{command} missing: {body}");
         }
@@ -56,11 +57,34 @@ fn capabilities() {
             .unwrap()
             .starts_with("sqld "));
         Uuid::parse_str(body["server"]["instance_id"].as_str().unwrap())?;
-        assert_eq!(body["metastore"]["restored_from_backup"], false);
+        // Metastore restore provenance: this server's metastore was not restored from a
+        // backup, which the capability endpoint, every fence view and the gauge all report.
+        assert_eq!(body["metastore"]["restored_from_backup"], false, "{body}");
+        assert_eq!(
+            body["metastore"]["restored_generation"],
+            json!(null),
+            "{body}"
+        );
+        assert_eq!(
+            crate::common::snapshot_metrics()
+                .get_gauge("libsql_server_metastore_restored_from_backup"),
+            Some(0.0)
+        );
 
         // An active fence is counted.
         admin.create_namespace("src").await?;
         let log_id = load_and_log_id(&admin, "src").await?;
+        let (status, body) = admin.inspect("src").await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["fence"]["provenance"],
+            json!({
+                "metastore_restored_from_backup": false,
+                "metastore_restored_generation": null,
+                "marker": null,
+            }),
+            "{body}"
+        );
         let (status, body) = admin
             .command(
                 "src",
@@ -69,6 +93,14 @@ fn capabilities() {
             )
             .await?;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["fence"]["provenance"]["metastore_restored_from_backup"], false,
+            "{body}"
+        );
+        assert_eq!(
+            body["fence"]["provenance"]["marker"], "consistent",
+            "{body}"
+        );
         let (_, body) = admin.get("/v1/fence/capabilities").await?;
         assert_eq!(body["active_fences"], 1, "{body}");
 
@@ -700,6 +732,188 @@ fn inspect_reports_drain_counters() {
         let mut rows = connect("src")?.query("select count(*) from t", ()).await?;
         let n: i64 = rows.next().await?.unwrap().get(0)?;
         assert_eq!(n, 2);
+        Ok(())
+    });
+    sim.run().unwrap();
+}
+
+const ADOPTION_KEY: &str = "fence-adoption-key";
+
+fn adopt_body(
+    new_op: Uuid,
+    cmd: Uuid,
+    state: &str,
+    rev: u64,
+    current_op: Uuid,
+) -> serde_json::Value {
+    command_body(
+        new_op,
+        cmd,
+        state,
+        rev,
+        json!({
+            "current_operation_id": current_op.to_string(),
+            "approvers": ["alice", "bob"],
+            "incident_ref": "INC-1",
+            "reason": "the operation's control record was lost",
+        }),
+    )
+}
+
+/// `AdoptFence` over HTTP (section 12): the admin credential and the adoption key header are
+/// both required, two distinct approvers are required, and an adoption moves the owner and
+/// nothing else. The old owner is refused afterwards and the new one finishes the operation.
+#[test]
+fn adopt_over_http() {
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    make_primary(
+        &mut sim,
+        tmp.path().to_path_buf(),
+        Primary {
+            adoption_key: Some(ADOPTION_KEY),
+            ..Default::default()
+        },
+    );
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        admin.create_namespace("src").await?;
+        let log_id = load_and_log_id(&admin, "src").await?;
+        let (old, new) = (uuid(0xa), uuid(0xb));
+        let conn = connect("src")?;
+        let (status, acquired) = admin
+            .command(
+                "src",
+                "source/acquire-write-fence",
+                acquire_body(old, uuid(1), &log_id),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{acquired}");
+        assert_eq!(state_of(&acquired), ("SOURCE_WRITE_FENCED", 2));
+
+        let body = adopt_body(new, uuid(2), "SOURCE_WRITE_FENCED", 2, old);
+        // No key, a wrong key, and the admin credential missing.
+        for key in [None, Some("not-the-key")] {
+            let (status, refused) = admin.adopt("src", body.clone(), key).await?;
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{refused}");
+            assert_eq!(refused["outcome"], "FENCE_PRECONDITION_FAILED");
+            assert_eq!(refused["detail"], "adoption_not_authorised", "{refused}");
+            assert_eq!(state_of(&refused), ("SOURCE_WRITE_FENCED", 2), "{refused}");
+        }
+        let (status, _) = Admin::new(None)
+            .adopt("src", body.clone(), Some(ADOPTION_KEY))
+            .await?;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // One approver, the same approver twice, and an unknown field.
+        for approvers in [json!(["alice"]), json!(["alice", "alice"])] {
+            let mut bad = adopt_body(new, uuid(3), "SOURCE_WRITE_FENCED", 2, old);
+            bad["approvers"] = approvers;
+            let (status, refused) = admin.adopt("src", bad, Some(ADOPTION_KEY)).await?;
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{refused}");
+            assert_eq!(refused["detail"], "adoption_not_authorised", "{refused}");
+        }
+        let mut bad = adopt_body(new, uuid(3), "SOURCE_WRITE_FENCED", 2, old);
+        bad["gate"] = json!("open");
+        let (status, refused) = admin.adopt("src", bad, Some(ADOPTION_KEY)).await?;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{refused}");
+        assert_eq!(refused["detail"], "invalid_argument", "{refused}");
+
+        let (status, adopted) = admin.adopt("src", body.clone(), Some(ADOPTION_KEY)).await?;
+        assert_eq!(status, StatusCode::OK, "{adopted}");
+        assert_eq!(adopted["outcome"], "APPLIED");
+        assert_eq!(adopted["replayed"], false);
+        assert_eq!(state_of(&adopted), ("SOURCE_WRITE_FENCED", 3));
+        assert_eq!(adopted["fence"]["operation_id"], new.to_string());
+        assert_eq!(adopted["fence"]["admission"]["write"], "closed");
+        assert_eq!(adopted["fence"]["admission"]["read"], "open");
+        assert_eq!(
+            adopted["fence"]["frozen_boundary"],
+            acquired["fence"]["frozen_boundary"]
+        );
+        assert_eq!(adopted["receipt"]["command"], "AdoptFence");
+        let adoption = &adopted["receipt"]["adoption"];
+        assert_eq!(adoption["previous_operation_id"], old.to_string());
+        assert_eq!(adoption["new_operation_id"], new.to_string());
+        assert_eq!(adoption["approvers"], json!(["alice", "bob"]));
+        assert_eq!(adoption["incident_ref"], "INC-1");
+        assert_eq!(adopted["fence"]["adoptions"][0], *adoption);
+        // Writes stay closed; reads stay open.
+        assert!(conn.execute("insert into t values (2)", ()).await.is_err());
+        conn.query("select * from t", ()).await?;
+
+        // A replay returns the stored receipt, even without the key.
+        let (status, replay) = admin.adopt("src", body.clone(), None).await?;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["receipt"], adopted["receipt"]);
+
+        // The old owner is refused; the new owner finishes the operation.
+        let (status, refused) = admin
+            .command(
+                "src",
+                "source/release-write-fence",
+                command_body(old, uuid(4), "SOURCE_WRITE_FENCED", 3, json!({})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["outcome"], "FENCE_OWNED_BY_ANOTHER_OPERATION");
+        let (status, released) = admin
+            .command(
+                "src",
+                "source/release-write-fence",
+                command_body(new, uuid(5), "SOURCE_WRITE_FENCED", 3, json!({})),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{released}");
+        assert_eq!(state_of(&released), ("RELEASED", 4));
+        conn.execute("insert into t values (3)", ()).await?;
+
+        // A finished operation cannot be adopted.
+        let (status, refused) = admin
+            .adopt(
+                "src",
+                adopt_body(uuid(0xc), uuid(6), "RELEASED", 4, new),
+                Some(ADOPTION_KEY),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["outcome"], "INVALID_FENCE_TRANSITION");
+        assert_eq!(refused["detail"], "operation_finished", "{refused}");
+        Ok(())
+    });
+    sim.run().unwrap();
+}
+
+/// Without `--namespace-fence-adoption-key`, adoption is disabled whatever the request presents.
+#[test]
+fn adopt_disabled_without_key() {
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf(), Primary::default());
+    sim.client("client", async {
+        let admin = Admin::new(Some(ADMIN_KEY));
+        admin.create_namespace("src").await?;
+        let log_id = load_and_log_id(&admin, "src").await?;
+        let (status, acquired) = admin
+            .command(
+                "src",
+                "source/acquire-write-fence",
+                acquire_body(uuid(0xa), uuid(1), &log_id),
+            )
+            .await?;
+        assert_eq!(status, StatusCode::OK, "{acquired}");
+        for key in [None, Some(""), Some(ADOPTION_KEY)] {
+            let (status, refused) = admin
+                .adopt(
+                    "src",
+                    adopt_body(uuid(0xb), uuid(2), "SOURCE_WRITE_FENCED", 2, uuid(0xa)),
+                    key,
+                )
+                .await?;
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{refused}");
+            assert_eq!(refused["detail"], "adoption_not_authorised", "{refused}");
+            assert_eq!(refused["fence"]["operation_id"], uuid(0xa).to_string());
+        }
         Ok(())
     });
     sim.run().unwrap();

@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
 
+#[cfg(test)]
 use super::outcome::FenceError;
 
 /// A named point on a fence transition or a gated path.
@@ -35,10 +36,6 @@ pub enum HookPoint {
     AfterMetastoreCommit,
     /// The committed result is about to be published to the gate.
     BeforeGatePublish,
-    /// In `begin_write_txn`, after the gate check admitted the transaction.
-    InBeginWriteTxnAfterCheck,
-    /// The connection manager released the write slot.
-    AfterManagerRelease,
     /// A drain is about to read the frozen boundary.
     BeforeBoundaryCapture,
     /// The rows of a quarantined target were committed; the target is not published yet.
@@ -70,7 +67,9 @@ pub enum HookAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutcome {
     Continue,
+    #[cfg(test)]
     Fail(FenceError),
+    #[cfg(test)]
     Indeterminate,
 }
 
