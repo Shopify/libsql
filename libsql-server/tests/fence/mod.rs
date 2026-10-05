@@ -4,12 +4,17 @@
 
 mod admin;
 mod lifecycle;
+mod protocol;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use hyper::StatusCode;
-use libsql_server::config::{AdminApiConfig, MetaStoreConfig, RpcServerConfig, UserApiConfig};
+use libsql_server::auth::user_auth_strategies::http_basic::HttpBasic;
+use libsql_server::auth::Auth;
+use libsql_server::config::{
+    AdminApiConfig, MetaStoreConfig, RpcClientConfig, RpcServerConfig, UserApiConfig,
+};
 use s3s::header::AUTHORIZATION;
 use serde_json::{json, Value};
 use turmoil::{Builder, Sim};
@@ -26,6 +31,8 @@ pub struct Primary {
     /// `None` starts the admin API without an auth key.
     pub admin_key: Option<&'static str>,
     pub fence_enabled: bool,
+    /// A basic-auth credential the user API requires; `None` leaves it unauthenticated.
+    pub user_credential: Option<&'static str>,
 }
 
 impl Default for Primary {
@@ -33,6 +40,7 @@ impl Default for Primary {
         Self {
             admin_key: Some(ADMIN_KEY),
             fence_enabled: true,
+            user_credential: None,
         }
     }
 }
@@ -49,13 +57,20 @@ pub fn make_primary(sim: &mut Sim, path: PathBuf, primary: Primary) {
     let Primary {
         admin_key,
         fence_enabled,
+        user_credential,
     } = primary;
     sim.host("primary", move || {
         let path = path.clone();
         async move {
             let server = TestServer {
                 path: path.into(),
-                user_api_config: UserApiConfig::default(),
+                user_api_config: UserApiConfig {
+                    auth_strategy: match user_credential {
+                        Some(credential) => Auth::new(HttpBasic::new(credential.into())),
+                        None => UserApiConfig::<TurmoilAcceptor>::default().auth_strategy,
+                    },
+                    ..Default::default()
+                },
                 admin_api_config: Some(AdminApiConfig {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
                     connector: TurmoilConnector,
@@ -70,6 +85,37 @@ pub fn make_primary(sim: &mut Sim, path: PathBuf, primary: Primary) {
                     namespace_fence: fence_enabled,
                     ..Default::default()
                 },
+                disable_namespaces: false,
+                disable_default_namespace: true,
+                ..Default::default()
+            };
+            server.start_sim(8080).await?;
+            Ok(())
+        }
+    });
+}
+
+/// A replica of `primary` on host `replica0`: user API on 8080, admin API (no auth key) on
+/// 9090. It creates a namespace lazily, on first use, by replicating it from the primary.
+pub fn make_replica(sim: &mut Sim, path: PathBuf) {
+    init_tracing();
+    sim.host("replica0", move || {
+        let path = path.clone();
+        async move {
+            let server = TestServer {
+                path: path.into(),
+                user_api_config: UserApiConfig::default(),
+                admin_api_config: Some(AdminApiConfig {
+                    acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 9090)).await?,
+                    connector: TurmoilConnector,
+                    disable_metrics: true,
+                    auth_key: None,
+                }),
+                rpc_client_config: Some(RpcClientConfig {
+                    remote_url: "http://primary:4567".into(),
+                    connector: TurmoilConnector,
+                    tls_config: None,
+                }),
                 disable_namespaces: false,
                 disable_default_namespace: true,
                 ..Default::default()

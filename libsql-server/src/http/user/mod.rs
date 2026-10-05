@@ -3,7 +3,7 @@ pub(crate) mod dump;
 mod extract;
 mod hrana_over_http_1;
 mod listen;
-mod result_builder;
+pub(crate) mod result_builder;
 mod trace;
 mod types;
 #[macro_use]
@@ -143,9 +143,12 @@ async fn handle_query(
     let db = connection_maker.create().await?;
 
     let builder = JsonHttpPayloadBuilder::new();
-    let builder = db
+    let mut builder = db
         .execute_batch_or_rollback(batch, ctx, builder, query.replication_index)
         .await?;
+    if let Some(denial) = builder.take_fence_denial() {
+        return Err(Error::NamespaceFence(denial));
+    }
 
     let res = (
         [(header::CONTENT_TYPE, "application/json")],

@@ -27,4 +27,17 @@ message DatabaseConfig {
     optional bool shared_schema = 11;
     optional string shared_schema_name = 12;
     optional DurabilityMode durability_mode = 13;
+    // The namespace fence as seen by the primary when it answered. Only ever filled by the
+    // primary's replication `Hello`, and only while a fence is active; it is never part of a
+    // stored configuration. Absent from older primaries; older replicas ignore it and still
+    // see the legacy `block_*` fields above.
+    optional ReplicatedFence fence = 14;
+}
+
+// The part of a namespace fence a replica needs to apply the primary's read admission.
+message ReplicatedFence {
+    // The fence state name, e.g. "SOURCE_READ_FENCED".
+    string state = 1;
+    // The revision of the fence record the state belongs to.
+    uint64 revision = 2;
 }

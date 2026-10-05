@@ -27,6 +27,10 @@ pub enum BatchError {
     ResponseTooLarge,
     #[error("Schema migration error: {message}")]
     SchemaError { message: String },
+    /// The whole batch was refused by the namespace fence (`docs/NAMESPACE_FENCE.md`
+    /// section 6), for example a read under a read fence.
+    #[error(transparent)]
+    Fence(crate::namespace::fence::outcome::FenceError),
 }
 
 fn proto_cond_to_cond(
@@ -183,6 +187,7 @@ pub fn batch_error_from_sqld_error(sqld_error: SqldError) -> Result<BatchError, 
         SqldError::BuilderError(QueryResultBuilderError::ResponseTooLarge(_)) => {
             BatchError::ResponseTooLarge
         }
+        SqldError::NamespaceFence(e) => BatchError::Fence(e),
         sqld_error => return Err(sqld_error),
     })
 }
@@ -201,6 +206,7 @@ impl BatchError {
             Self::TransactionBusy => "TRANSACTION_BUSY",
             Self::ResponseTooLarge => "RESPONSE_TOO_LARGE",
             Self::SchemaError { message: _ } => "SCHEMA_MIGRATION_ERROR",
+            Self::Fence(e) => e.outcome().as_str(),
         }
     }
 }

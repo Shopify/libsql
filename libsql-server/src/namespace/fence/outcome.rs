@@ -275,6 +275,27 @@ impl FenceError {
         &self.message
     }
 
+    /// The status of this error on either HTTP API: the user API's mapping for a data-plane
+    /// denial (`423`), and the admin API's for any other outcome.
+    pub fn http_status(&self) -> StatusCode {
+        self.outcome
+            .user_http_status()
+            .unwrap_or_else(|| self.outcome.admin_http_status())
+    }
+
+    /// The JSON error body of the HTTP APIs for this error: the usual `error` message plus the
+    /// additive stable `code` and, when there is one, the bounded `detail`.
+    pub fn http_error_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "error": self.to_string(),
+            "code": self.outcome.as_str(),
+        });
+        if let Some(detail) = self.detail {
+            body["detail"] = detail.as_str().into();
+        }
+        body
+    }
+
     /// A gRPC status for this error, if the outcome has a gRPC mapping. The code is in the
     /// [`GRPC_FENCE_CODE_METADATA`] entry and prefixes the message.
     pub fn to_grpc_status(&self) -> Option<tonic::Status> {
@@ -296,6 +317,38 @@ impl FenceError {
             .ok()?
             .parse()
             .ok()
+    }
+
+    /// The fence denial a peer reported as a gRPC status produced by
+    /// [`FenceError::to_grpc_status`], with the peer's message. `None` for any other status,
+    /// including one whose code is not the fence mapping of the outcome it names.
+    pub fn from_grpc_status(status: &tonic::Status) -> Option<FenceError> {
+        let outcome = Self::outcome_from_grpc_status(status)?;
+        if outcome.grpc_code() != Some(status.code()) {
+            return None;
+        }
+        Some(Self::from_peer(outcome, status.message()))
+    }
+
+    /// The fence denial a peer reported in the proxy protocol's `Error.stable_code` field
+    /// (section 6.1), with the peer's message. `None` for a code this server does not know or
+    /// that is not a data-plane denial, which the peer never sends: such an error keeps its
+    /// untyped mapping.
+    pub fn from_proxy_stable_code(stable_code: &str, message: &str) -> Option<FenceError> {
+        let outcome = stable_code.parse::<FenceOutcome>().ok()?;
+        outcome.proxy_stable_code()?;
+        Some(Self::from_peer(outcome, message))
+    }
+
+    /// A denial reported by a peer. The peer's message is `"<CODE>: <message>"` (this type's
+    /// `Display`); the prefix is dropped so that it is not repeated. The bounded `detail` is
+    /// not carried by the peer protocols.
+    fn from_peer(outcome: FenceOutcome, message: &str) -> FenceError {
+        let message = message
+            .strip_prefix(outcome.as_str())
+            .and_then(|m| m.strip_prefix(": "))
+            .unwrap_or(message);
+        Self::new(outcome, message)
     }
 }
 
@@ -402,6 +455,49 @@ mod tests {
 
         let control = FenceError::new(FenceOutcome::FenceRevisionMismatch, "stale");
         assert!(control.to_grpc_status().is_none());
+    }
+
+    /// A denial crosses the proxy and RPC protocols as the same outcome and message, and
+    /// nothing else is mistaken for one.
+    #[test]
+    fn peer_denials_round_trip() {
+        let err = FenceError::new(FenceOutcome::MigrationWriteFenced, "writes are fenced");
+        let status = err.to_grpc_status().unwrap();
+        assert_eq!(FenceError::from_grpc_status(&status), Some(err.clone()));
+        // The metadata alone is not enough: the code must be the outcome's gRPC mapping.
+        let mut forged = tonic::Status::unavailable("MIGRATION_WRITE_FENCED: x");
+        forged.metadata_mut().insert(
+            GRPC_FENCE_CODE_METADATA,
+            tonic::metadata::MetadataValue::from_static("MIGRATION_WRITE_FENCED"),
+        );
+        assert_eq!(FenceError::from_grpc_status(&forged), None);
+        assert_eq!(
+            FenceError::from_grpc_status(&tonic::Status::failed_precondition("x")),
+            None
+        );
+
+        for outcome in FenceOutcome::ALL {
+            let decoded = FenceError::from_proxy_stable_code(outcome.as_str(), "m");
+            match outcome.proxy_stable_code() {
+                Some(_) => assert_eq!(decoded, Some(FenceError::new(outcome, "m"))),
+                None => assert_eq!(decoded, None, "{outcome}"),
+            }
+        }
+        assert_eq!(
+            FenceError::from_proxy_stable_code("MIGRATION_READ_FENCED", &err_msg()),
+            Some(FenceError::new(
+                FenceOutcome::MigrationReadFenced,
+                "reads are fenced"
+            ))
+        );
+        assert_eq!(
+            FenceError::from_proxy_stable_code("SOMETHING_NEW", "m"),
+            None
+        );
+
+        fn err_msg() -> String {
+            FenceError::new(FenceOutcome::MigrationReadFenced, "reads are fenced").to_string()
+        }
     }
 
     #[test]
