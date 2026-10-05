@@ -32,6 +32,8 @@ use crate::LIBSQL_PAGE_SIZE;
 
 pub mod stats;
 
+const HEAP_PROFILE_DIR: &str = "heap_profile";
+
 #[derive(Clone)]
 struct Metrics {
     handle: Option<PrometheusHandle>,
@@ -573,7 +575,7 @@ async fn enable_profile_heap(Json(req): Json<EnableHeapProfileRequest>) -> crate
             max_trackers: req.max_trackers.unwrap_or(200),
             tracker_event_buffer_size: req.tracker_event_buffer_size.unwrap_or(5_000),
             sample_rate: req.sample_rate.unwrap_or(1.0),
-            profile_dir: PathBuf::from("heap_profile"),
+            profile_dir: PathBuf::from(HEAP_PROFILE_DIR),
         })
         .map_err(|e| crate::Error::Anyhow(anyhow::anyhow!("{e}")))
     })
@@ -582,11 +584,24 @@ async fn enable_profile_heap(Json(req): Json<EnableHeapProfileRequest>) -> crate
     Ok(path.file_name().unwrap().to_str().unwrap().to_string())
 }
 
-async fn disable_profile_heap(Path(profile): Path<String>) -> impl axum::response::IntoResponse {
+fn heap_profile_path(profile: &str) -> crate::Result<PathBuf> {
+    let Some(timestamp) = profile.strip_prefix("rip-") else {
+        return Err(Error::InvalidPath(profile.to_owned()));
+    };
+    if timestamp.is_empty() || !timestamp.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(Error::InvalidPath(profile.to_owned()));
+    }
+
+    Ok(PathBuf::from(HEAP_PROFILE_DIR).join(profile))
+}
+
+async fn disable_profile_heap(
+    Path(profile): Path<String>,
+) -> crate::Result<impl axum::response::IntoResponse> {
+    let profile_dir = heap_profile_path(&profile)?;
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
     tokio::task::spawn_blocking(move || {
         rheaper::disable_tracking();
-        let profile_dir = PathBuf::from("heap_profile").join(&profile);
         let sink =
             PollSender::new(tx).sink_map_err(|_| std::io::Error::from(ErrorKind::BrokenPipe));
         let writer = tokio_util::io::SyncIoBridge::new(SinkWriter::new(CopyToBytes::new(sink)));
@@ -605,11 +620,84 @@ async fn disable_profile_heap(Path(profile): Path<String>) -> impl axum::respons
         tokio_stream::wrappers::ReceiverStream::new(rx).map(|b| Result::<_, Infallible>::Ok(b));
     let body = StreamBody::new(stream);
 
-    body
+    Ok(body)
 }
 
 async fn delete_profile_heap(Path(profile): Path<String>) -> crate::Result<()> {
-    let profile_dir = PathBuf::from("heap_profile").join(&profile);
+    let profile_dir = heap_profile_path(&profile)?;
     tokio::fs::remove_dir_all(&profile_dir).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::Method;
+    use tower::ServiceExt;
+
+    #[test]
+    fn heap_profile_path_accepts_generated_profile_ids() {
+        assert_eq!(
+            heap_profile_path("rip-1720000000").unwrap(),
+            PathBuf::from(HEAP_PROFILE_DIR).join("rip-1720000000")
+        );
+    }
+
+    #[test]
+    fn heap_profile_path_rejects_invalid_profile_ids() {
+        for profile in [
+            "",
+            ".",
+            "..",
+            "../rip-1720000000",
+            "/data",
+            "rip-1720000000/..",
+            "rip-1720000000/profile",
+            "rip-1720000000\\profile",
+            "profile",
+            "rip-",
+            "rip-invalid",
+            "rip-+1720000000",
+        ] {
+            assert!(
+                matches!(heap_profile_path(profile), Err(Error::InvalidPath(path)) if path == profile),
+                "unexpected result for {profile:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn heap_profile_routes_reject_percent_encoded_traversal() {
+        let app = axum::Router::new()
+            .route(
+                "/profile/heap/disable/:id",
+                axum::routing::post(disable_profile_heap),
+            )
+            .route(
+                "/profile/heap/:id",
+                axum::routing::delete(delete_profile_heap),
+            );
+
+        for (method, uri) in [
+            (Method::POST, "/profile/heap/disable/%2e%2e"),
+            (Method::POST, "/profile/heap/disable/rip-1720000000%2F.."),
+            (Method::DELETE, "/profile/heap/%2e%2e"),
+            (Method::DELETE, "/profile/heap/%2Fdata"),
+            (Method::DELETE, "/profile/heap/rip-1720000000%2F.."),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
 }
