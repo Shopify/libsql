@@ -58,7 +58,7 @@ impl TokenType {
 }
 
 fn from_bytes(bytes: &[u8]) -> String {
-    unsafe { str::from_utf8_unchecked(bytes).to_owned() }
+    String::from_utf8_lossy(bytes).to_string()
 }
 
 include!(concat!(env!("OUT_DIR"), "/keywords.rs"));
@@ -401,5 +401,15 @@ impl TokenType {
             TK_READONLY => Some("READONLY"),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::from_bytes;
+
+    #[test]
+    fn converts_invalid_utf8_lossily() {
+        assert_eq!(from_bytes(&[0xC0, 0x80]), "��");
     }
 }
