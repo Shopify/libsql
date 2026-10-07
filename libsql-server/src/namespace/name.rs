@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    fmt,
+    path::{Component, Path},
+};
 
 use bytes::Bytes;
 use serde::{de::Visitor, Deserialize};
@@ -45,8 +48,16 @@ impl NamespaceName {
     }
 
     fn validate(s: &str) -> crate::Result<()> {
-        if s.is_empty() {
-            tracing::warn!("invalid namespace: empty namespace");
+        // Names must be a single path component on both Unix and Windows.
+        // Keep harmless punctuation and Unicode rather than imposing an identifier alphabet.
+        let mut components = Path::new(s).components();
+        if s.is_empty()
+            || s.chars().any(|c| matches!(c, '/' | '\\' | '\0'))
+            || (cfg!(windows) && s.contains(':'))
+            || !matches!(components.next(), Some(Component::Normal(_)))
+            || components.next().is_some()
+        {
+            tracing::warn!("invalid namespace name");
             return Err(crate::error::Error::InvalidNamespace);
         }
 
@@ -67,9 +78,42 @@ impl NamespaceName {
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
+}
 
-    pub(crate) fn new_unchecked(s: impl AsRef<str>) -> Self {
-        Self(Bytes::copy_from_slice(s.as_ref().as_bytes()))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_single_safe_path_components_are_names() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../victim",
+            "a/b",
+            "a\\b",
+            "/tmp/victim",
+            "a\0b",
+        ] {
+            assert!(
+                NamespaceName::from_string(name.to_owned()).is_err(),
+                "{name:?}"
+            );
+            assert!(NamespaceName::from_bytes(Bytes::copy_from_slice(name.as_bytes())).is_err());
+            assert!(serde_json::from_str::<NamespaceName>(&format!("{name:?}")).is_err());
+        }
+        for name in ["tenant", "a..b", "hello world", "café!", "a:b"] {
+            if cfg!(windows) && name.contains(':') {
+                continue;
+            }
+            assert_eq!(
+                NamespaceName::from_string(name.to_owned())
+                    .unwrap()
+                    .as_str(),
+                name
+            );
+        }
     }
 }
 

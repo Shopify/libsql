@@ -274,7 +274,7 @@ impl MetaStoreInner {
                     };
 
                     let config = match metadata::DatabaseConfig::decode(&v[..]) {
-                        Ok(c) => Arc::new(DatabaseConfig::from(&c)),
+                        Ok(c) => Arc::new(DatabaseConfig::try_from(&c)?),
                         Err(e) => {
                             tracing::warn!("unable to convert config: {}", e);
                             continue;
@@ -633,21 +633,21 @@ impl MetaStoreHandle {
         let config = match fs::read(config_path) {
             Ok(data) => {
                 let c = metadata::DatabaseConfig::decode(&data[..])?;
-                DatabaseConfig::from(&c)
+                DatabaseConfig::try_from(&c)?
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => DatabaseConfig::default(),
             Err(err) => return Err(Error::IOError(err)),
         };
 
         Ok(Self {
-            namespace: NamespaceName::new_unchecked("testmetastore"),
+            namespace: NamespaceName::from("testmetastore"),
             inner: HandleState::Internal(Arc::new(Mutex::new(Arc::new(config)))),
         })
     }
 
     pub fn internal() -> Self {
         MetaStoreHandle {
-            namespace: NamespaceName::new_unchecked("testmetastore"),
+            namespace: NamespaceName::from("testmetastore"),
             inner: HandleState::Internal(Arc::new(Mutex::new(Arc::new(DatabaseConfig::default())))),
         }
     }

@@ -185,7 +185,10 @@ impl ReplicatorClient for Client {
             }
 
             self.meta_store_handle
-                .store(DatabaseConfig::from(config))
+                .store(
+                    DatabaseConfig::try_from(config)
+                        .map_err(|e| Status::new(Code::InvalidArgument, e.to_string()))?,
+                )
                 .await
                 .map_err(|e| Error::Internal(e.into()))?;
 

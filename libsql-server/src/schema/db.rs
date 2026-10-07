@@ -127,7 +127,8 @@ pub(super) fn register_schema_migration_job(
     };
     let config_bytes = row.get_ref(1)?.as_blob().unwrap();
     // TODO: handle corrupted meta
-    let config = DatabaseConfig::from(&metadata::DatabaseConfig::decode(config_bytes).unwrap());
+    let config = DatabaseConfig::try_from(&metadata::DatabaseConfig::decode(config_bytes).unwrap())
+        .map_err(|e| Error::Registration(Box::new(e)))?;
     if !config.is_shared_schema {
         return Err(Error::NotASchema(schema.clone()));
     }
