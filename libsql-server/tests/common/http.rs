@@ -45,6 +45,19 @@ impl Client {
         self.post_with_headers(url, &[], body).await
     }
 
+    /// Like [`post`](Self::post), but returns 5xx responses instead of failing.
+    pub(crate) async fn post_raw<T: Serialize>(
+        &self,
+        url: &str,
+        body: T,
+    ) -> anyhow::Result<Response> {
+        let bytes: Bytes = serde_json::to_vec(&body)?.into();
+        let request = hyper::Request::post(url)
+            .header("Content-Type", "application/json")
+            .body(Body::from(bytes))?;
+        Ok(Response(self.0.request(request).await?))
+    }
+
     pub(crate) async fn post_with_headers<T: Serialize>(
         &self,
         url: &str,
