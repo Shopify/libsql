@@ -680,6 +680,7 @@ pub(crate) mod test {
             encryption_config: None,
             connection_creation_timeout: None,
             disable_intelligent_throttling: false,
+            dump_import: Default::default(),
         };
         let primary_config = PrimaryConfig {
             max_log_size: 1_000_000_000,
