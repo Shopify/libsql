@@ -12,6 +12,7 @@
 //! See `docs/STREAMING_DUMP_IMPORT_DESIGN.md` §8–9.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use fallible_iterator::FallibleIterator;
 use futures::StreamExt;
@@ -27,7 +28,7 @@ use crate::namespace::DumpStream;
 use crate::BLOCKING_RT;
 
 use super::framer::{advance_position, Frame, FrameError, StatementFramer};
-use super::{map_exec_error, map_parse_error, DumpImportConfig, DumpImportStats};
+use super::{map_exec_error, map_parse_error, DumpImportConfig, DumpImportStats, ImportFailure};
 
 enum Msg {
     Stmt {
@@ -54,9 +55,15 @@ impl From<FrameError> for LoadDumpError {
             FrameError::NulByte { line, column } => LoadDumpError::InvalidSqlInput(format!(
                 "dump contains a NUL byte at line {line}, column {column}"
             )),
-            FrameError::StatementTooLarge { line, limit, .. } => {
-                LoadDumpError::StatementTooLarge { line, limit }
-            }
+            FrameError::StatementTooLarge {
+                line,
+                column,
+                limit,
+            } => LoadDumpError::StatementTooLarge {
+                line,
+                column,
+                limit,
+            },
         }
     }
 }
@@ -65,10 +72,13 @@ pub(super) async fn load_dump_streaming(
     mut stream: DumpStream,
     conn: PrimaryConnection,
     cfg: &DumpImportConfig,
-) -> Result<DumpImportStats, LoadDumpError> {
-    let (tx, rx) = mpsc::channel::<Msg>(cfg.queue_depth);
-    let budget = Arc::new(Semaphore::new(cfg.queue_bytes));
-    let queue_bytes = cfg.queue_bytes;
+) -> Result<DumpImportStats, ImportFailure> {
+    // `DumpImportConfig::validate` runs for CLI-built configs only; never panic on a
+    // programmatically built one (mpsc::channel(0) and clamp(1, 0) both panic).
+    let queue_depth = cfg.queue_depth.max(1);
+    let queue_bytes = cfg.queue_bytes.clamp(1, u32::MAX as usize);
+    let (tx, rx) = mpsc::channel::<Msg>(queue_depth);
+    let budget = Arc::new(Semaphore::new(queue_bytes));
     let executor = BLOCKING_RT.spawn_blocking(move || run_executor(conn, rx));
     let mut framer = StatementFramer::new(cfg.max_statement_bytes);
 
@@ -96,23 +106,28 @@ pub(super) async fn load_dump_streaming(
     // Guarantees the executor observes channel closure if we bailed out before sending `End`.
     drop(tx);
 
-    let exec = executor
+    let (exec, mut stats) = executor
         .await
         .map_err(|e| LoadDumpError::Internal(format!("dump executor task failed: {e}")))?;
+    stats.bytes = framer.bytes_seen();
 
-    match (feed, exec) {
-        (Ok(()), exec) => exec.map(|mut stats| {
-            stats.bytes = framer.bytes_seen();
-            stats
-        }),
+    let res = match (feed, exec) {
+        (Ok(()), exec) => exec,
         // The executor failed first and closed the channel; report its error.
         (Err(FeedError::ExecutorGone), Err(e)) => Err(e),
         // Can't happen: the executor only returns Ok after receiving `End`.
-        (Err(FeedError::ExecutorGone), Ok(_)) => Err(LoadDumpError::Internal(
+        (Err(FeedError::ExecutorGone), Ok(())) => Err(LoadDumpError::Internal(
             "dump executor finished before the dump was fully read".to_string(),
         )),
         // A stream or framing error wins over the executor's generic "ended before completion".
         (Err(FeedError::Source(e)), _) => Err(e),
+    };
+    match res {
+        Ok(()) => Ok(stats),
+        Err(error) => Err(ImportFailure {
+            error,
+            partial: stats,
+        }),
     }
 }
 
@@ -139,24 +154,37 @@ async fn send_frame(
     .map_err(|_| FeedError::ExecutorGone)
 }
 
+/// How often the executor logs progress while an import is running.
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 struct Executor {
     conn: PrimaryConnection,
     n_stmt: u64,
     skipped_wasm_table: bool,
     stats: DumpImportStats,
+    started: Instant,
+    last_progress_log: Instant,
 }
 
 /// Runs on a blocking thread for the whole import. Never cancelled by tokio: it always reaches
 /// its own COMMIT-or-ROLLBACK decision, even if the reader (and the admin request) go away.
+/// (Should it panic instead, unwinding drops the connection, and SQLite rolls back an open
+/// transaction when a connection is closed.)
+///
+/// Returns the outcome together with the statistics accumulated so far, so a failure can report
+/// how far the import got.
 fn run_executor(
     conn: PrimaryConnection,
     mut rx: mpsc::Receiver<Msg>,
-) -> Result<DumpImportStats, LoadDumpError> {
+) -> (Result<(), LoadDumpError>, DumpImportStats) {
+    let now = Instant::now();
     let mut ex = Executor {
         conn,
         n_stmt: 0,
         skipped_wasm_table: false,
         stats: DumpImportStats::default(),
+        started: now,
+        last_progress_log: now,
     };
 
     ex.conn.with_raw(|c| {
@@ -173,16 +201,19 @@ fn run_executor(
     }
     ex.conn
         .with_raw(|c| c.authorizer(None::<fn(AuthContext<'_>) -> Authorization>));
-    res
+    (res, std::mem::take(&mut ex.stats))
 }
 
 impl Executor {
-    fn run(&mut self, rx: &mut mpsc::Receiver<Msg>) -> Result<DumpImportStats, LoadDumpError> {
+    fn run(&mut self, rx: &mut mpsc::Receiver<Msg>) -> Result<(), LoadDumpError> {
         loop {
             match rx.blocking_recv() {
                 Some(Msg::Stmt {
                     sql, line, column, ..
-                }) => self.handle_statement(&sql, line, column)?,
+                }) => {
+                    self.handle_statement(&sql, line, column)?;
+                    self.maybe_log_progress();
+                }
                 Some(Msg::End) => break,
                 None => {
                     // Reader dropped the sender without `End`: stream error, framing error or
@@ -199,7 +230,18 @@ impl Executor {
             return Err(LoadDumpError::NoCommit);
         }
 
-        Ok(std::mem::take(&mut self.stats))
+        Ok(())
+    }
+
+    fn maybe_log_progress(&mut self) {
+        if self.last_progress_log.elapsed() >= PROGRESS_LOG_INTERVAL {
+            self.last_progress_log = Instant::now();
+            tracing::info!(
+                statements = self.stats.statements_executed,
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "dump import in progress"
+            );
+        }
     }
 
     fn is_autocommit(&self) -> bool {
