@@ -22,11 +22,15 @@ use crate::error::LoadDumpError;
 use crate::namespace::{DumpStream, NamespaceName};
 
 mod buffered;
+mod complete;
 mod framer;
 mod streaming;
 
 /// Which implementation loads a dump into a fresh namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+///
+/// Deserializes leniently (case-insensitive, surrounding whitespace ignored), like the CLI flag,
+/// so `"Streaming"` means the same thing in a request body and in `SQLD_DUMP_IMPORTER`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DumpImporterKind {
     /// Read the entire dump into memory before executing it.
@@ -61,6 +65,13 @@ impl FromStr for DumpImporterKind {
                 "unknown dump importer `{other}`, expected `buffered` or `streaming`"
             )),
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DumpImporterKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -133,6 +144,21 @@ pub struct DumpImportStats {
     pub elapsed: Duration,
 }
 
+/// A failed import, together with how far it got before failing.
+pub(super) struct ImportFailure {
+    pub error: LoadDumpError,
+    pub partial: DumpImportStats,
+}
+
+impl From<LoadDumpError> for ImportFailure {
+    fn from(error: LoadDumpError) -> Self {
+        Self {
+            error,
+            partial: DumpImportStats::default(),
+        }
+    }
+}
+
 /// Load `stream` into the fresh database behind `conn` using the requested importer.
 ///
 /// On error the dump transaction has been rolled back (or was never started).
@@ -147,7 +173,9 @@ pub(crate) async fn load_dump(
     tracing::info!(namespace = %namespace, importer = %kind, "loading dump");
 
     let res = match kind {
-        DumpImporterKind::Buffered => buffered::load_dump_buffered(stream, conn).await,
+        DumpImporterKind::Buffered => buffered::load_dump_buffered(stream, conn)
+            .await
+            .map_err(ImportFailure::from),
         DumpImporterKind::Streaming => streaming::load_dump_streaming(stream, conn, cfg).await,
     };
 
@@ -188,20 +216,25 @@ pub(crate) async fn load_dump(
             );
             Ok(stats)
         }
-        Err(e) => {
+        Err(ImportFailure { error, partial }) => {
+            let kind_label = failure_kind(&error);
             metrics::increment_counter!(
                 "libsql_server_dump_import_failures",
                 "importer" => kind.as_str(),
-                "kind" => failure_kind(&e)
+                "kind" => kind_label
             );
+            // The error itself (which may quote dump SQL) is logged by the HTTP layer when the
+            // response is built; here we record the category and how far the import got.
             tracing::warn!(
                 namespace = %namespace,
                 importer = %kind,
-                error = %e,
+                kind = kind_label,
+                statements = partial.statements_executed,
+                bytes = partial.bytes,
                 elapsed_ms = elapsed.as_millis() as u64,
                 "dump load failed; transaction rolled back"
             );
-            Err(e)
+            Err(error)
         }
     }
 }
@@ -298,7 +331,17 @@ mod test {
             serde_json::from_str::<DumpImporterKind>("\"streaming\"").unwrap(),
             DumpImporterKind::Streaming
         );
-        assert!(serde_json::from_str::<DumpImporterKind>("\"Streaming\"").is_err());
+        // same leniency as the CLI flag
+        assert_eq!(
+            serde_json::from_str::<DumpImporterKind>("\" Buffered \"").unwrap(),
+            DumpImporterKind::Buffered
+        );
+        assert!(serde_json::from_str::<DumpImporterKind>("\"turbo\"").is_err());
+        assert!(serde_json::from_str::<DumpImporterKind>("1").is_err());
+        assert_eq!(
+            serde_json::to_string(&DumpImporterKind::Streaming).unwrap(),
+            "\"streaming\""
+        );
     }
 
     #[test]

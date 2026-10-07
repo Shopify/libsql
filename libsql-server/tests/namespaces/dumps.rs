@@ -65,6 +65,15 @@ async fn count_rows(ns: &str, table: &str) -> anyhow::Result<i64> {
 /// Serve `chunks` as one HTTP response body on `dump-store:8080`, each chunk as its own body
 /// frame. A trailing `Err` chunk aborts the body mid-way.
 fn make_dump_store(sim: &mut Sim, chunks: Vec<Result<Bytes, std::io::Error>>) {
+    make_dump_store_paced(sim, chunks, Duration::from_millis(1))
+}
+
+/// Like [`make_dump_store`], pausing `pause` (simulated time) before each chunk.
+fn make_dump_store_paced(
+    sim: &mut Sim,
+    chunks: Vec<Result<Bytes, std::io::Error>>,
+    pause: Duration,
+) {
     // turmoil may call the host closure more than once; the chunks are cloned per call.
     let chunks: Vec<Result<Bytes, (std::io::ErrorKind, String)>> = chunks
         .into_iter()
@@ -83,10 +92,11 @@ fn make_dump_store(sim: &mut Sim, chunks: Vec<Result<Bytes, std::io::Error>>) {
                             async move {
                                 // Yield between chunks so hyper flushes each one before the
                                 // next (or an error) is produced.
-                                let stream = futures::stream::iter(chunks).then(|c| async move {
-                                    tokio::time::sleep(Duration::from_millis(1)).await;
-                                    c.map_err(|(kind, msg)| std::io::Error::new(kind, msg))
-                                });
+                                let stream =
+                                    futures::stream::iter(chunks).then(move |c| async move {
+                                        tokio::time::sleep(pause).await;
+                                        c.map_err(|(kind, msg)| std::io::Error::new(kind, msg))
+                                    });
                                 Ok::<_, Infallible>(HyperResponse::new(Body::wrap_stream(stream)))
                             }
                         }))
@@ -897,7 +907,7 @@ fn streaming_statement_too_large() {
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = resp.body_string().await?;
         assert!(
-            body.contains("starting at line 3 exceeds the maximum allowed size"),
+            body.contains("starting at line 3, column 1 exceeds the maximum allowed size"),
             "unexpected body: {body}"
         );
         assert!(count_rows("foo", "test").await.is_err());
@@ -1193,6 +1203,300 @@ fn streaming_large_dump() {
             resp.body_string().await.unwrap_or_default()
         );
         assert_eq!(count_rows("foo", "test").await?, ROWS as i64);
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+/// The first `CREATE TABLE libsql_wasm_func_table` of a dump is skipped by both importers and
+/// does not disturb the "statement 3+ must be in a transaction" rule.
+fn load_dump_skips_wasm_table_with(importer: Option<&'static str>) {
+    const DUMP: &str = r#"
+    PRAGMA foreign_keys=OFF;
+    BEGIN TRANSACTION;
+    CREATE TABLE libsql_wasm_func_table (name text PRIMARY KEY, body text) WITHOUT ROWID;
+    CREATE TABLE test (x);
+    INSERT INTO test VALUES(1);
+    COMMIT;"#;
+
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+    std::fs::write(tmp_path.join("dump.sql"), DUMP).unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async move {
+        let client = Client::new();
+        let resp = create_from_dump(
+            &client,
+            "foo",
+            &file_url(&tmp_path.join("dump.sql")),
+            importer,
+        )
+        .await?;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{}",
+            resp.body_string().await.unwrap_or_default()
+        );
+        assert_eq!(count_rows("foo", "test").await?, 1);
+        // the wasm table itself was not created
+        assert!(count_rows("foo", "libsql_wasm_func_table").await.is_err());
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn load_dump_skips_wasm_table() {
+    load_dump_skips_wasm_table_with(BUFFERED);
+}
+
+#[test]
+fn load_dump_skips_wasm_table_streaming() {
+    load_dump_skips_wasm_table_with(STREAMING);
+}
+
+/// An empty (or comment-only) dump creates an empty namespace with both importers.
+fn load_empty_dump_with(importer: Option<&'static str>) {
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+    std::fs::write(tmp_path.join("empty.sql"), "").unwrap();
+    std::fs::write(tmp_path.join("comment.sql"), "-- nothing to see here\n").unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async move {
+        let client = Client::new();
+        for (ns, file) in [("empty", "empty.sql"), ("comment", "comment.sql")] {
+            let resp =
+                create_from_dump(&client, ns, &file_url(&tmp_path.join(file)), importer).await?;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{ns}: {}",
+                resp.body_string().await.unwrap_or_default()
+            );
+            let db = Database::open_remote_with_connector(
+                &format!("http://{ns}.primary:8080"),
+                "",
+                TurmoilConnector,
+            )?;
+            let conn = db.connect()?;
+            let mut rows = conn.query("select count(*) from sqlite_schema", ()).await?;
+            assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 0);
+        }
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[test]
+fn load_empty_dump() {
+    load_empty_dump_with(BUFFERED);
+}
+
+#[test]
+fn load_empty_dump_streaming() {
+    load_empty_dump_with(STREAMING);
+}
+
+/// A dump whose final `COMMIT` has no trailing `;` (the framer's `finish()` tail) commits, and
+/// a file that ends in the middle of a statement is rejected cleanly.
+#[test]
+fn streaming_eof_without_semicolon() {
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+    std::fs::write(
+        tmp_path.join("ok.sql"),
+        "BEGIN TRANSACTION;\nCREATE TABLE test (x);\nINSERT INTO test VALUES(1);\nCOMMIT",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp_path.join("cut.sql"),
+        "BEGIN TRANSACTION;\nCREATE TABLE test (x);\nINSERT INTO test VALUES(1);\nINSERT INTO test VAL",
+    )
+    .unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    sim.client("client", async move {
+        let client = Client::new();
+        let resp = create_from_dump(
+            &client,
+            "ok",
+            &file_url(&tmp_path.join("ok.sql")),
+            STREAMING,
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(count_rows("ok", "test").await?, 1);
+
+        let resp = create_from_dump(
+            &client,
+            "cut",
+            &file_url(&tmp_path.join("cut.sql")),
+            STREAMING,
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.body_string().await?;
+        assert!(
+            body.contains("syntax error") && body.contains("line 4"),
+            "unexpected body: {body}"
+        );
+        assert!(count_rows("cut", "test").await.is_err());
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+/// Executor failure while the reader is blocked on a saturated queue: the executor must drop
+/// its receiver so the queued permits are released and the reader observes the failure instead
+/// of hanging.
+#[test]
+fn streaming_failure_under_backpressure() {
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    let mut dump = String::from("BEGIN TRANSACTION;\nCREATE TABLE test (x);\n");
+    for i in 0..20_000 {
+        dump.push_str(&format!("INSERT INTO test VALUES({i});\n"));
+    }
+    // an oversized statement deep inside the dump
+    dump.push_str(&format!(
+        "INSERT INTO test VALUES('{}');\n",
+        "x".repeat(DumpImportConfig::MIN_MAX_STATEMENT_BYTES)
+    ));
+    for i in 0..20_000 {
+        dump.push_str(&format!("INSERT INTO test VALUES({i});\n"));
+    }
+    dump.push_str("COMMIT;\n");
+    std::fs::write(tmp_path.join("dump.sql"), dump).unwrap();
+
+    make_primary_with_db_config(
+        &mut sim,
+        tmp.path().to_path_buf(),
+        DbConfig {
+            dump_import: DumpImportConfig {
+                max_statement_bytes: DumpImportConfig::MIN_MAX_STATEMENT_BYTES,
+                queue_bytes: DumpImportConfig::MIN_QUEUE_BYTES,
+                queue_depth: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    sim.client("client", async move {
+        let client = Client::new();
+        let resp = create_from_dump(
+            &client,
+            "foo",
+            &file_url(&tmp_path.join("dump.sql")),
+            STREAMING,
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(count_rows("foo", "test").await.is_err());
+
+        // a statement-level failure (not a framing one) behind a full queue behaves the same
+        let mut dump = String::from("BEGIN TRANSACTION;\nCREATE TABLE test (x);\n");
+        for i in 0..20_000 {
+            dump.push_str(&format!("INSERT INTO test VALUES({i});\n"));
+        }
+        dump.push_str("INSERT INTO nope VALUES(1);\n");
+        for i in 0..20_000 {
+            dump.push_str(&format!("INSERT INTO test VALUES({i});\n"));
+        }
+        dump.push_str("COMMIT;\n");
+        std::fs::write(tmp_path.join("dump2.sql"), dump).unwrap();
+        let resp = create_from_dump(
+            &client,
+            "bar",
+            &file_url(&tmp_path.join("dump2.sql")),
+            STREAMING,
+        )
+        .await?;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = resp.body_string().await?;
+        assert!(
+            body.contains("no such table: nope"),
+            "unexpected body: {body}"
+        );
+        assert!(count_rows("bar", "test").await.is_err());
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+/// The admin request is abandoned while the import is still streaming in. The executor thread
+/// must notice the closed channel, roll back and release the connection, so the server stays
+/// healthy and the namespace can be used afterwards instead of being wedged by a half-open
+/// transaction.
+#[test]
+fn streaming_cancelled_request_rolls_back() {
+    let mut sim = sim();
+    let tmp = tempdir().unwrap();
+    make_primary(&mut sim, tmp.path().to_path_buf());
+
+    // Deliver the dump slowly (64-byte chunks, 50ms apart) so the request is still in flight
+    // when it is abandoned. Few, large chunks also keep the number of unread segments below
+    // turmoil's simulated socket buffer once nobody reads them anymore.
+    make_dump_store_paced(
+        &mut sim,
+        CHUNKY_DUMP
+            .as_bytes()
+            .chunks(64)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect(),
+        Duration::from_millis(50),
+    );
+
+    sim.client("client", async move {
+        let client = Client::new();
+        let aborted = tokio::time::timeout(
+            Duration::from_millis(100),
+            create_from_dump(&client, "foo", "http://dump-store:8080/", STREAMING),
+        )
+        .await;
+        assert!(aborted.is_err(), "the request should still be in flight");
+        // Let the server notice the closed connection (simulated time) and the executor thread
+        // roll back and drop its connection (real time: the sim clock doesn't wait for it).
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Depending on where the request was cut, the namespace was registered (pre-existing
+        // behavior: the metastore row survives a failed create) or not. Either way it must be
+        // usable now: no lingering write transaction, no partial data.
+        let resp = client
+            .post_raw("http://primary:9090/v1/namespaces/foo/create", json!({}))
+            .await?;
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST,
+            "unexpected status {}",
+            resp.status()
+        );
+        assert!(count_rows("foo", "test").await.is_err());
+        let db =
+            Database::open_remote_with_connector("http://foo.primary:8080", "", TurmoilConnector)?;
+        let conn = db.connect()?;
+        conn.execute("create table after_cancel (x)", ()).await?;
+        conn.execute("insert into after_cancel values (1)", ())
+            .await?;
+        assert_eq!(count_rows("foo", "after_cancel").await?, 1);
+
+        // and other namespaces are unaffected
+        let resp = create_from_dump(&client, "bar", "http://dump-store:8080/", STREAMING).await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(count_rows("bar", "test").await?, 3);
         Ok(())
     });
 

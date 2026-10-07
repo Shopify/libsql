@@ -17,9 +17,13 @@
 # Start the server with e.g.:
 #   sqld --enable-namespaces --admin-listen-addr 127.0.0.1:9090 --http-listen-addr 127.0.0.1:8080
 #
-# Linux reads VmRSS from /proc; macOS falls back to `ps -o rss`.
+# Linux reads VmRSS from /proc; macOS falls back to `ps -o rss`. Requires curl and python3.
 
 set -euo pipefail
+
+for tool in curl python3; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "$tool is required" >&2; exit 2; }
+done
 
 DUMP=${1:?usage: $0 <dump.sql> [admin_url] [user_host:port] [sqld_pid]}
 ADMIN=${2:-http://127.0.0.1:9090}
@@ -34,18 +38,29 @@ case "$DUMP" in
   *) echo "dump path must be absolute: $DUMP" >&2; exit 2 ;;
 esac
 
+if [ -n "$PID" ]; then
+  # Refuse to sample an unrelated process (e.g. a container-local PID passed from the host).
+  comm=$(ps -o comm= -p "$PID" 2>/dev/null | tr -d ' ' || true)
+  case "$comm" in
+    *sqld*) ;;
+    *) echo "PID $PID is not a sqld process (comm=${comm:-?}); RSS sampling disabled" >&2; PID= ;;
+  esac
+fi
+
+now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+
 rss_kb() {
   if [ -z "$PID" ]; then echo 0; return; fi
   if [ -r "/proc/$PID/status" ]; then
     awk '/^VmRSS:/ {print $2}' "/proc/$PID/status"
   else
-    ps -o rss= -p "$PID" | tr -d ' '
+    ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ' || echo 0
   fi
 }
 
 sample_rss() { # $1 = output csv; samples every 200ms until killed
   while :; do
-    printf '%s,%s\n' "$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')" "$(rss_kb)"
+    printf '%s,%s\n' "$(now_ms)" "$(rss_kb)"
     sleep 0.2
   done >"$1"
 }
@@ -55,18 +70,20 @@ import_with() { # $1 = importer, $2 = namespace
   local csv="$OUT/rss_$importer.csv"
   local baseline; baseline=$(rss_kb)
   if [ -n "$PID" ]; then sample_rss "$csv" & sampler=$!; fi
-  local start; start=$(date +%s.%N)
+  local start; start=$(now_ms)
   local code
   code=$(curl -sS -o "$OUT/create_$importer.json" -w '%{http_code}' \
     -X POST "$ADMIN/v1/namespaces/$ns/create" \
     -H 'content-type: application/json' \
-    -d "{\"dump_url\":\"file://$DUMP\",\"dump_importer\":\"$importer\"}")
-  local end; end=$(date +%s.%N)
+    -d "{\"dump_url\":\"file://$DUMP\",\"dump_importer\":\"$importer\"}") \
+    || { echo "request to $ADMIN failed (is the admin API reachable?)" >&2; exit 2; }
+  local end; end=$(now_ms)
   if [ -n "$sampler" ]; then kill "$sampler" 2>/dev/null || true; wait "$sampler" 2>/dev/null || true; fi
   local peak=0
   if [ -s "$csv" ]; then peak=$(cut -d, -f2 "$csv" | sort -n | tail -n1); fi
-  printf '%s\t%s\t%s\t%.2f\t%s\t%s\t%s\n' \
-    "$importer" "$ns" "$code" "$(echo "$end - $start" | bc)" "$baseline" "$peak" "$(( (peak - baseline) / 1024 ))" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$importer" "$ns" "$code" "$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", (e - s) / 1000 }')" \
+    "$baseline" "$peak" "$(( (peak - baseline) / 1024 ))" \
     >>"$OUT/results.tsv"
   [ "$code" = 200 ] || { echo "import with $importer failed ($code): $(cat "$OUT/create_$importer.json")" >&2; exit 1; }
 }
@@ -107,7 +124,8 @@ for importer in buffered streaming; do
   integrity=$(curl -sS -H "x-namespace: $ns" -H 'content-type: application/json' \
     -X POST "http://$USER_HOST/v2/pipeline" \
     -d '{"requests":[{"type":"execute","stmt":{"sql":"PRAGMA integrity_check"}},{"type":"close"}]}' \
-    | python3 -c 'import json,sys; r=json.load(sys.stdin)["results"][0]; print(r["response"]["result"]["rows"][0][0]["value"] if r["type"]=="ok" else r)')
+    | python3 -c 'import json,sys; r=json.load(sys.stdin)["results"][0]; print(r["response"]["result"]["rows"][0][0]["value"] if r["type"]=="ok" else r)') \
+    || { echo "integrity_check request for $ns failed" >&2; exit 2; }
   echo "$importer: integrity_check=$integrity rows=$(wc -l <"$OUT/data_$importer.sql") size=$(wc -c <"$OUT/dump_$importer.sql")"
 done
 if cmp -s "$OUT/data_buffered.sql" "$OUT/data_streaming.sql"; then

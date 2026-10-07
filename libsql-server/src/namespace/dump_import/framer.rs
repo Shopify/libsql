@@ -2,16 +2,16 @@
 //!
 //! [`StatementFramer`] turns an arbitrary sequence of byte chunks into complete SQL statements,
 //! each ending at the `;` that terminates it, while only ever holding one unfinished statement
-//! in memory. Statement boundaries are decided by SQLite's own `sqlite3_complete()`, so
-//! semicolons inside string literals, quoted identifiers, comments and `CREATE TRIGGER ... END`
-//! bodies are handled exactly like the `sqlite3` shell does.
+//! in memory. Statement boundaries follow the rules of SQLite's `sqlite3_complete()` (via the
+//! resumable port in [`super::complete`]), so semicolons inside string literals, quoted
+//! identifiers, comments and `CREATE TRIGGER ... END` bodies are handled exactly like the
+//! `sqlite3` shell does, in a single linear pass over the dump.
 //!
 //! See `docs/STREAMING_DUMP_IMPORT_DESIGN.md` §7.
 
-use std::ffi::c_char;
-
 use memchr::{memchr, memchr_iter, memrchr};
-use rusqlite::ffi::sqlite3_complete;
+
+use super::complete::CompletionScanner;
 
 /// One complete statement (plus any whitespace/comments that preceded it in the dump), with the
 /// 1-based position of its first byte in the whole dump.
@@ -36,13 +36,16 @@ pub(super) enum FrameError {
     },
 }
 
+/// Frames at least this large are handed over without copying (see `push`).
+const LARGE_FRAME_BYTES: usize = 1024 * 1024;
+
 pub(super) struct StatementFramer {
     /// Bytes after the last emitted frame; starts with the next statement's leading
     /// whitespace/comments.
     buf: Vec<u8>,
-    /// Offset in `buf` from which to look for the next `;`. Semicolons before it were already
-    /// tested and found not to terminate the statement.
-    scan_from: usize,
+    /// Number of leading bytes of `buf` the scanner has already consumed.
+    fed: usize,
+    scanner: CompletionScanner,
     /// 1-based line of `buf[0]` in the whole dump.
     line: u64,
     /// 1-based byte column of `buf[0]` in the whole dump.
@@ -55,7 +58,8 @@ impl StatementFramer {
     pub fn new(max_statement_bytes: usize) -> Self {
         Self {
             buf: Vec::new(),
-            scan_from: 0,
+            fed: 0,
+            scanner: CompletionScanner::new(),
             line: 1,
             column: 1,
             max_statement_bytes,
@@ -82,29 +86,37 @@ impl StatementFramer {
         self.buf.extend_from_slice(chunk);
 
         let mut frames = Vec::new();
+        // `start` is the offset in `buf` of the statement being scanned; frames before it are
+        // removed from `buf` in one `drain` at the end rather than one per frame.
         let mut start = 0;
-        while let Some(rel) = memchr(b';', &self.buf[self.scan_from..]) {
-            let end = self.scan_from + rel;
-            if is_complete_statement(&mut self.buf, start, end) {
-                if end + 1 - start > self.max_statement_bytes {
-                    return Err(self.too_large(&self.buf[start..=end]));
-                }
-                let sql = self.buf[start..=end].to_vec();
-                frames.push(Frame {
-                    sql,
-                    line: self.line,
-                    column: self.column,
-                });
-                (self.line, self.column) =
-                    advance_position((self.line, self.column), &self.buf[start..=end]);
-                start = end + 1;
+        while let Some(rel) = self.scanner.find_statement_end(&self.buf[self.fed..]) {
+            let end = self.fed + rel;
+            self.fed = end + 1;
+            let len = end + 1 - start;
+            if len > self.max_statement_bytes {
+                return Err(self.too_large(&self.buf[start..=end]));
             }
-            self.scan_from = end + 1;
+            let (line, column) = (self.line, self.column);
+            (self.line, self.column) = advance_position((line, column), &self.buf[start..=end]);
+            let sql = if start == 0 && len >= LARGE_FRAME_BYTES {
+                // A statement that spanned several pushes always starts at 0 (everything before
+                // it was drained by an earlier push). Hand its buffer over instead of copying it,
+                // so the peak is one copy of the largest statement, not two.
+                let rest = self.buf.split_off(end + 1);
+                self.fed -= end + 1;
+                std::mem::replace(&mut self.buf, rest)
+            } else {
+                start = end + 1;
+                self.buf[start - len..start].to_vec()
+            };
+            frames.push(Frame { sql, line, column });
         }
+        // Everything in `buf` has now been fed to the scanner exactly once.
+        self.fed = self.buf.len();
 
         if start > 0 {
             self.buf.drain(..start);
-            self.scan_from -= start;
+            self.fed -= start;
         }
 
         if self.buf.len() > self.max_statement_bytes {
@@ -138,34 +150,10 @@ impl StatementFramer {
             line: self.line,
             column: self.column,
         };
-        self.scan_from = 0;
+        self.fed = 0;
         (self.line, self.column) = advance_position((self.line, self.column), &frame.sql);
         Some(frame)
     }
-}
-
-/// Does `buf[start..=end]` (whose last byte is `;`) look like a complete SQL statement?
-///
-/// `sqlite3_complete` needs a NUL-terminated string, so a terminator is temporarily placed right
-/// after the `;`. The function only tokenizes; it does not parse or touch any database.
-fn is_complete_statement(buf: &mut Vec<u8>, start: usize, end: usize) -> bool {
-    debug_assert_eq!(buf[end], b';');
-    let pushed = if end + 1 == buf.len() {
-        buf.push(0);
-        true
-    } else {
-        false
-    };
-    let saved = buf[end + 1];
-    buf[end + 1] = 0;
-    // SAFETY: `buf[start..]` is NUL-terminated at `end + 1`, which is within bounds, and
-    // `sqlite3_complete` only reads the string.
-    let complete = unsafe { sqlite3_complete(buf[start..].as_ptr() as *const c_char) } != 0;
-    buf[end + 1] = saved;
-    if pushed {
-        buf.pop();
-    }
-    complete
 }
 
 /// Position of the byte following `bytes`, given the position of its first byte.
@@ -412,37 +400,157 @@ mod test {
         assert_eq!(absolute_position((1, 1), (1, 1)), (1, 1));
     }
 
-    #[test]
-    fn completeness_oracle() {
-        fn complete(s: &str) -> bool {
-            let mut buf = s.as_bytes().to_vec();
-            let end = buf.len() - 1;
-            is_complete_statement(&mut buf, 0, end)
+    /// The reference: SQLite's own `sqlite3_complete()` applied to `buf[start..=end]` for every
+    /// candidate `;`, i.e. the quadratic algorithm the resumable scanner replaces.
+    fn reference_frames(input: &[u8]) -> Vec<Vec<u8>> {
+        use std::ffi::{c_char, CString};
+        let mut frames = Vec::new();
+        let mut start = 0;
+        for end in memchr_iter(b';', input) {
+            let candidate = CString::new(&input[start..=end]).unwrap();
+            // SAFETY: `candidate` is a valid NUL-terminated string that outlives the call.
+            let complete =
+                unsafe { rusqlite::ffi::sqlite3_complete(candidate.as_ptr() as *const c_char) };
+            if complete != 0 {
+                frames.push(input[start..=end].to_vec());
+                start = end + 1;
+            }
         }
-        assert!(complete("SELECT 1;"));
-        assert!(complete(";"));
-        assert!(complete(" \n ;"));
-        assert!(complete("PRAGMA foreign_keys=OFF;"));
-        assert!(complete("EXPLAIN SELECT 1;"));
-        assert!(complete("SELECT 'a;b';"));
-        assert!(complete("/* a; */ SELECT 1;"));
-        assert!(complete("-- c;\nSELECT 1;"));
-        assert!(complete(
-            "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;"
-        ));
-        assert!(!complete("SELECT ';"));
-        assert!(!complete("-- c;"));
-        assert!(!complete(
-            "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;"
-        ));
-        assert!(!complete(
-            "CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;"
-        ));
+        frames
+    }
 
-        // the oracle only looks at `buf[start..=end]`
-        let mut buf = b"SELECT 1;SELECT ';".to_vec();
-        assert!(is_complete_statement(&mut buf, 0, 8));
-        assert!(!is_complete_statement(&mut buf, 9, 17));
-        assert_eq!(buf, b"SELECT 1;SELECT ';");
+    /// Tiny deterministic PRNG so the differential test needs no extra dependencies.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[(self.next() as usize) % items.len()]
+        }
+    }
+
+    /// Differential test: frame boundaries must match `sqlite3_complete` for random token soups
+    /// built from everything the state machine cares about, under every chunking.
+    #[test]
+    fn framing_matches_sqlite3_complete() {
+        const PIECES: &[&str] = &[
+            ";",
+            ";",
+            ";",
+            " ",
+            "\n",
+            "\t",
+            "\r",
+            "\x0c",
+            "\x0b",
+            "/",
+            "*",
+            "-",
+            "--",
+            "/*",
+            "*/",
+            "[",
+            "]",
+            "'",
+            "\"",
+            "`",
+            "''",
+            "CREATE",
+            "create",
+            "TEMP",
+            "Temporary",
+            "TRIGGER",
+            "END",
+            "end",
+            "EXPLAIN",
+            "BEGIN",
+            "SELECT",
+            "x",
+            "1",
+            "_a",
+            "$b",
+            "ends",
+            "temps",
+            "\u{17c}",
+            "é",
+            "(",
+            ")",
+            ",",
+            "=",
+            "+",
+            ".",
+            "CASE",
+            "WHEN",
+            "THEN",
+        ];
+        let mut rng = Lcg(0x5eed);
+        for case in 0..2000 {
+            let n = 1 + (rng.next() as usize) % 40;
+            let mut input = String::new();
+            for _ in 0..n {
+                input.push_str(rng.pick(PIECES));
+            }
+            // make sure something terminates so the interesting path is exercised often
+            if case % 2 == 0 {
+                input.push(';');
+            }
+            let bytes = input.as_bytes();
+            let expected = reference_frames(bytes);
+            for chunk in [1usize, 2, 3, 7, bytes.len().max(1)] {
+                let mut framer = StatementFramer::new(LIMIT);
+                let mut got = Vec::new();
+                for piece in bytes.chunks(chunk) {
+                    got.extend(framer.push(piece).unwrap().into_iter().map(|f| f.sql));
+                }
+                assert_eq!(got, expected, "input {input:?} chunk {chunk}");
+            }
+        }
+    }
+
+    /// A statement full of interior semicolons is scanned once, not once per semicolon.
+    #[test]
+    fn semicolon_dense_statement_is_linear() {
+        let semis = 200_000;
+        let mut s = String::from("INSERT INTO t VALUES('");
+        for _ in 0..semis {
+            s.push_str("abc;");
+        }
+        s.push_str("');");
+        let mut framer = StatementFramer::new(1 << 30);
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        for chunk in s.as_bytes().chunks(64 * 1024) {
+            frames += framer.push(chunk).unwrap().len();
+        }
+        assert_eq!(frames, 1);
+        // ~800 KB; the quadratic version needed tens of seconds for this shape.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "framing took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn large_frames_are_handed_over_without_copy() {
+        let big = format!("INSERT INTO t VALUES('{}');", "x".repeat(LARGE_FRAME_BYTES));
+        let mut framer = StatementFramer::new(1 << 30);
+        let mut frames = Vec::new();
+        for chunk in big.as_bytes().chunks(64 * 1024) {
+            frames.extend(framer.push(chunk).unwrap());
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].sql, big.as_bytes());
+        // the pending buffer was replaced, not drained in place
+        assert!(framer.buf.capacity() < LARGE_FRAME_BYTES);
+        // and framing continues correctly afterwards
+        assert_eq!(framer.push(b"SELECT 1;").unwrap().len(), 1);
+        assert_eq!(framer.push(b"-- tail").unwrap().len(), 0);
+        assert_eq!(framer.finish().unwrap().sql, b"-- tail");
     }
 }

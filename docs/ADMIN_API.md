@@ -40,10 +40,18 @@ rejected.
   `--dump-import-max-statement-size` is rejected with `413`.
 
 When omitted, the server's `--dump-importer` setting (`SQLD_DUMP_IMPORTER`, default `buffered`)
-applies. Both importers produce the same data; the streaming importer additionally stores the
-schema SQL exactly as written in the dump, whereas the buffered importer stores the parser's
-normalized rendering. A dump whose *data* contains the word "attach" is rejected by the buffered
-importer (substring check) but accepted by the streaming one (statement-level check).
+applies. Values are matched case-insensitively; an unknown value is rejected with `422`.
+
+Both importers produce the same data. Known differences:
+
+- the streaming importer stores the schema SQL exactly as written in the dump, whereas the
+  buffered importer stores the parser's normalized rendering;
+- a dump whose *data* contains the word "attach" is rejected by the buffered importer (substring
+  check) but accepted by the streaming one (statement-level check); a standalone `DETACH`
+  statement is rejected with `400` by the streaming importer and fails at execution (`500`) with
+  the buffered one;
+- invalid UTF-8 or NUL bytes yield `400` (buffered: `500`), and statements that return rows are
+  executed with their rows discarded (buffered: `500`).
 
 ```HTTP
 DELETE /v1/namespaces/:namespace

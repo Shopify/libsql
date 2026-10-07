@@ -2,7 +2,7 @@
 
 Status: implemented (see `libsql-server/src/namespace/dump_import/`) · Target: `Shopify/libsql`, branch `v0.9.30-shopify-patches` · Related: Retail #35846, LibSQL DB Mover P0
 
-Sections marked *as built* record where the implementation refined the original proposal.
+Sections marked *as built* record where the implementation refined the original proposal, including the changes made after the adversarial review of PR #51 (§18).
 
 This document is written so that an implementer can follow it step by step without re-deriving decisions. Every file, type, flag, error and test is named. Section 16 is the ordered implementation plan; sections 7–9 are the normative specifications.
 
@@ -227,6 +227,8 @@ pub struct DumpImportStats {
 Turn an arbitrary sequence of byte chunks into complete SQL statements, each ending at the `;` that terminates it, without ever holding more than one unfinished statement in memory.
 
 ### 7.2 Completeness oracle
+
+> *As built:* the FFI call below was the first implementation. Because `sqlite3_complete` has no resumable form, calling it for every candidate `;` costs O(statement length) each time, which is quadratic for statements with many interior semicolons (measured: a 1 MiB text value with 50k semicolons took 20 s of CPU on a tokio worker). The shipped framer instead uses `complete.rs`, a resumable Rust port of complete.c's tokenizer and 8×8 state machine (`CompletionScanner::find_statement_end`), so a dump is scanned exactly once. `sqlite3_complete` is kept only as the reference in a differential unit test (`framing_matches_sqlite3_complete`: random token soups × chunkings must frame identically). The rest of this section describes the semantics both implementations share.
 
 ```rust
 use rusqlite::ffi::sqlite3_complete;   // re-exported libsql_ffi binding: fn(*const c_char) -> c_int
@@ -541,6 +543,7 @@ In `dump_stream_from_url` change `ReaderStream::new(f)` to `ReaderStream::with_c
 | `BEGIN`/`COMMIT` missing (`NoTxn`, `NoCommit`) | 400, same messages | 400, same messages | yes |
 | Syntax error | 400 `syntax error near 'X' at line L, column C` (absolute) | identical (absolute via §7.6) | yes |
 | `ATTACH 'f' AS x;` as a statement | 400 "attach statements are not allowed in dumps" (substring check) | 400, same message (AST check) | yes |
+| standalone `DETACH x;` | passes the substring check, fails at execution → 500 | 400 (AST check) | documented |
 | Word "attach" inside data (`'attachment'`) | **400** (false positive) | 200 | new test, streaming only |
 | `ATTACH foo/bar.sql` without `;` (existing test) | 400 "attach statements are not allowed" | 400 `syntax error near 'COMMIT' …` | keep legacy test; add streaming test with a well-formed ATTACH |
 | Empty statement `;;`, comment-only segments | absorbed by the parser | empty frame skipped | new test, both |
@@ -675,6 +678,8 @@ First run (*as built*; debug build, macOS arm64, 36 MB dump, 300 007 statements,
 
 Both namespaces: `PRAGMA integrity_check` = `ok`, 300 300 identical data rows. The buffered importer had earlier rejected a variant of the same dump whose data contained the word "attachment" (§10).
 
+After the review fixes (§18), a 10 MB dump of 50 rows holding 200 KB CSS-like values (~5 000 interior semicolons each — the shape that was quadratic): streaming 0.56 s / +21 MB RSS, buffered 0.53 s / +32 MB RSS, identical data, `integrity_check` ok. The pre-fix framer needed ≈ 0.36 s *per row* for this shape.
+
 ---
 
 ## 16. Implementation plan (ordered; each step compiles and passes tests)
@@ -729,3 +734,26 @@ File change list:
 - **`EXPLAIN`/row-returning statements** are executed and their rows discarded; the buffered importer fails on them. Acceptable and documented.
 - **413 vs 400 for oversized statements.** Chosen 413 so operators can tell "raise the cap" from "fix the dump". Revisit if admin clients treat 413 specially.
 - **Default flip timing.** Keep `buffered` as default until the §15 acceptance criteria are met on production-shaped data (settings and catalog schemas, FTS tables included).
+
+---
+
+## 18. Adversarial review of PR #51 — findings and resolutions
+
+Independent reviewers (scope, correctness, security, performance, testing, architecture, operations) plus a manual pass. Verdict before fixes: **NEEDS CHANGES** (one HIGH, several MEDIUM). All items below are resolved in the PR unless marked *deferred*.
+
+| Sev | Finding | Resolution |
+|---|---|---|
+| HIGH | Framing was O(n²) in interior semicolons and ran on a tokio worker: 1 MiB/50k `;` → 20 s CPU; a 200 KB CSS-like value → 0.36 s per row (perf, security, architecture reviewers; measured). | Resumable port of `sqlite3_complete` (`complete.rs`), differential-tested against the FFI; `semicolon_dense_statement_is_linear` test. Framing is now a single linear pass. |
+| MEDIUM | Peak memory ≈ 2× largest statement: `to_vec()` copy while `buf` still held the bytes until `drain`. | Frames ≥ 1 MiB are handed over with `split_off`/`mem::replace` (no copy); `large_frames_are_handed_over_without_copy` test. |
+| MEDIUM | `DumpImportConfig { queue_bytes: 0 }` / `{ queue_depth: 0 }` built without `validate()` panicked (`clamp(1, 0)`, `mpsc::channel(0)`). | Clamped at the point of use in `load_dump_streaming`. |
+| MEDIUM | Failure log repeated the full error (which may quote dump SQL) at WARN, duplicating the HTTP layer's ERROR log. | WARN now logs the failure *category* plus partial progress (statements, bytes); the error text stays in the HTTP-layer log/response. |
+| MEDIUM | No progress visibility or partial stats for multi-minute imports. | Executor logs `dump import in progress` every 10 s; failures report statements/bytes processed. |
+| MEDIUM | `dump_importer` JSON value was case-sensitive while the CLI flag was lenient. | `Deserialize` now delegates to `FromStr` (case-insensitive, trimmed). |
+| MEDIUM | Untested: WASM-table skip, empty dump, EOF without `;`, executor failure under backpressure, request cancellation. | Tests added for all five (cancellation test tolerates the pre-existing "namespace may or may not be registered" nondeterminism). |
+| MEDIUM | Bench script: macOS `date +%N` prints garbage silently; hard `bc`/`python3` dependencies; bare `$(curl …)` under `set -e`; caller-supplied PID not verified. | `python3` for timestamps, `awk` arithmetic, explicit tool check, curl/`integrity_check` failures reported, PID must be a `sqld` process. |
+| LOW | 413 message dropped the computed column. | `StatementTooLarge` carries `column`. |
+| LOW | Bare `DETACH` is 400 (streaming) vs 500 (buffered) — undocumented difference. | Documented in ADMIN_API.md and §10. |
+| LOW | Executor panic bypasses `rollback_best_effort`. | Not a correctness gap: unwinding drops the connection and SQLite rolls back on close; documented on `run_executor`. |
+| *deferred* | Per-statement policy (WASM skip, `n_stmt > 2` rule) duplicated between importers. | Keep until the buffered importer is removed; the parameterized tests pin both. |
+| *deferred* | `BLOCKING_RT` hosts one long-lived thread per concurrent streaming import with no admission control. | 50 000-thread pool and low create concurrency today; revisit with bulk provisioning. |
+| *deferred* | Splitting the PR (refactor vs feature). | Commit 1 is the pure refactor and can be reviewed in isolation. |

@@ -299,9 +299,13 @@ pub enum LoadDumpError {
     #[error("`dump_importer` requires `dump_url`")]
     ImporterWithoutDumpUrl,
     #[error(
-        "A dump statement starting at line {line} exceeds the maximum allowed size ({limit} bytes)"
+        "A dump statement starting at line {line}, column {column} exceeds the maximum allowed size ({limit} bytes)"
     )]
-    StatementTooLarge { line: u64, limit: usize },
+    StatementTooLarge {
+        line: u64,
+        column: usize,
+        limit: usize,
+    },
 }
 
 impl ResponseError for LoadDumpError {}
