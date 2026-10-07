@@ -65,9 +65,11 @@ impl Default for DatabaseConfig {
     }
 }
 
-impl From<&metadata::DatabaseConfig> for DatabaseConfig {
-    fn from(value: &metadata::DatabaseConfig) -> Self {
-        DatabaseConfig {
+impl TryFrom<&metadata::DatabaseConfig> for DatabaseConfig {
+    type Error = crate::Error;
+
+    fn try_from(value: &metadata::DatabaseConfig) -> Result<Self, Self::Error> {
+        Ok(DatabaseConfig {
             block_reads: value.block_reads,
             block_writes: value.block_writes,
             block_reason: value.block_reason.clone(),
@@ -79,16 +81,16 @@ impl From<&metadata::DatabaseConfig> for DatabaseConfig {
             allow_attach: value.allow_attach,
             max_row_size: value.max_row_size.unwrap_or_else(default_max_row_size),
             is_shared_schema: value.shared_schema.unwrap_or(false),
-            // namespace name is coming from primary, we assume it's valid
             shared_schema_name: value
                 .shared_schema_name
-                .clone()
-                .map(NamespaceName::new_unchecked),
+                .as_ref()
+                .map(|name| NamespaceName::from_string(name.clone()))
+                .transpose()?,
             durability_mode: match value.durability_mode {
                 None => DurabilityMode::default(),
                 Some(m) => DurabilityMode::from(metadata::DurabilityMode::try_from(m)),
             },
-        }
+        })
     }
 }
 
@@ -109,6 +111,22 @@ impl From<&DatabaseConfig> for metadata::DatabaseConfig {
             shared_schema_name: value.shared_schema_name.as_ref().map(|s| s.to_string()),
             durability_mode: Some(metadata::DurabilityMode::from(value.durability_mode).into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn shared_schema_names_are_checked_in_replication_and_json() {
+        let wire = metadata::DatabaseConfig {
+            shared_schema_name: Some("../outside".into()),
+            ..metadata::DatabaseConfig::from(&DatabaseConfig::default())
+        };
+        assert!(DatabaseConfig::try_from(&wire).is_err());
+        let json = r#"{"block_reads":false,"block_writes":false,"block_reason":null,"max_db_pages":100,"heartbeat_url":null,"bottomless_db_id":null,"shared_schema_name":"../outside"}"#;
+        assert!(serde_json::from_str::<DatabaseConfig>(json).is_err());
     }
 }
 
