@@ -11,6 +11,7 @@ use tonic::transport::Channel;
 use tower::ServiceExt;
 
 use crate::auth::{Auth, Disabled};
+pub use crate::namespace::dump_import::{DumpImportConfig, DumpImporterKind};
 use crate::net::{AddrIncoming, Connector};
 
 pub struct RpcClientConfig<C = HttpConnector> {
@@ -103,6 +104,7 @@ pub struct DbConfig {
     pub max_concurrent_requests: u64,
     pub disable_intelligent_throttling: bool,
     pub connection_creation_timeout: Option<Duration>,
+    pub dump_import: DumpImportConfig,
 }
 
 impl Default for DbConfig {
@@ -123,6 +125,7 @@ impl Default for DbConfig {
             max_concurrent_requests: 128,
             disable_intelligent_throttling: false,
             connection_creation_timeout: None,
+            dump_import: DumpImportConfig::default(),
         }
     }
 }
