@@ -20,6 +20,7 @@ pub use self::store::NamespaceStore;
 
 pub mod broadcasters;
 pub(crate) mod configurator;
+pub mod dump_import;
 pub mod meta_store;
 mod name;
 pub mod replication_wal;
@@ -128,13 +129,35 @@ impl Namespace {
 pub type DumpStream =
     Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static + Unpin>;
 
+/// A SQL dump to load into a fresh namespace, and how to load it.
+pub struct DumpSource {
+    pub stream: DumpStream,
+    /// Importer to use. `None` selects the server-wide default
+    /// (`BaseNamespaceConfig::dump_import.default_importer`).
+    pub importer: Option<dump_import::DumpImporterKind>,
+}
+
+impl DumpSource {
+    pub fn new(stream: DumpStream) -> Self {
+        Self {
+            stream,
+            importer: None,
+        }
+    }
+
+    pub fn with_importer(mut self, importer: Option<dump_import::DumpImporterKind>) -> Self {
+        self.importer = importer;
+        self
+    }
+}
+
 #[derive(Default)]
 pub enum RestoreOption {
     /// Restore database state from the most recent version found in a backup.
     #[default]
     Latest,
     /// Restore database from SQLite dump.
-    Dump(DumpStream),
+    Dump(DumpSource),
     /// Restore database state to a backup version equal to specific generation.
     Generation(Uuid),
     /// Restore database state to a backup version present at a specific point in time.
