@@ -27,8 +27,8 @@ pub(super) enum FrameError {
     /// Dumps are text; a NUL byte can't be part of valid SQL and would confuse the C framing
     /// oracle, so it is rejected outright.
     NulByte { line: u64, column: usize },
-    /// The statement starting at `(line, column)` grew past the configured limit without
-    /// terminating.
+    /// The statement starting at `(line, column)` is larger than the configured limit (or grew
+    /// past it without terminating).
     StatementTooLarge {
         line: u64,
         column: usize,
@@ -86,6 +86,9 @@ impl StatementFramer {
         while let Some(rel) = memchr(b';', &self.buf[self.scan_from..]) {
             let end = self.scan_from + rel;
             if is_complete_statement(&mut self.buf, start, end) {
+                if end + 1 - start > self.max_statement_bytes {
+                    return Err(self.too_large(&self.buf[start..=end]));
+                }
                 let sql = self.buf[start..=end].to_vec();
                 frames.push(Frame {
                     sql,
@@ -105,14 +108,22 @@ impl StatementFramer {
         }
 
         if self.buf.len() > self.max_statement_bytes {
-            return Err(FrameError::StatementTooLarge {
-                line: self.line,
-                column: self.column,
-                limit: self.max_statement_bytes,
-            });
+            return Err(self.too_large(&self.buf));
         }
 
         Ok(frames)
+    }
+
+    /// `pending` starts at the framer's current position; report the statement's first
+    /// non-whitespace byte so the message points at the statement rather than at the end of
+    /// the previous line.
+    fn too_large(&self, pending: &[u8]) -> FrameError {
+        let (line, column) = statement_start((self.line, self.column), pending);
+        FrameError::StatementTooLarge {
+            line,
+            column,
+            limit: self.max_statement_bytes,
+        }
     }
 
     /// Signal end of input. Returns whatever follows the last terminated statement: possibly
@@ -158,7 +169,7 @@ fn is_complete_statement(buf: &mut Vec<u8>, start: usize, end: usize) -> bool {
 }
 
 /// Position of the byte following `bytes`, given the position of its first byte.
-fn advance_position((line, column): (u64, usize), bytes: &[u8]) -> (u64, usize) {
+pub(super) fn advance_position((line, column): (u64, usize), bytes: &[u8]) -> (u64, usize) {
     match memrchr(b'\n', bytes) {
         Some(last) => (
             line + memchr_iter(b'\n', bytes).count() as u64,
@@ -166,6 +177,12 @@ fn advance_position((line, column): (u64, usize), bytes: &[u8]) -> (u64, usize) 
         ),
         None => (line, column + bytes.len()),
     }
+}
+
+/// Position of the first non-whitespace byte of `frame`, whose first byte is at `pos`.
+pub(super) fn statement_start(pos: (u64, usize), frame: &[u8]) -> (u64, usize) {
+    let ws = frame.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    advance_position(pos, &frame[..ws])
 }
 
 /// Translate a position reported relative to a frame into a position in the whole dump.
@@ -338,26 +355,36 @@ mod test {
         let mut framer = StatementFramer::new(16);
         // exactly at the limit is fine as long as it terminates
         assert_eq!(framer.push(b"SELECT 1234567;").unwrap().len(), 1);
-        // a pending statement longer than the limit is rejected at the start position
+        // a pending statement longer than the limit is rejected; the position points at the
+        // statement itself, not at the whitespace that precedes it
         framer.push(b"\n").unwrap();
         assert_eq!(
             framer.push(b"SELECT 'this is too long"),
             Err(FrameError::StatementTooLarge {
-                line: 1,
-                column: 16,
+                line: 2,
+                column: 1,
                 limit: 16
             })
         );
-        // a terminated statement longer than the limit arriving in one chunk is accepted:
-        // it never needs to be buffered unterminated
+        // a terminated statement longer than the limit is rejected too, even when it arrives
+        // in one chunk
         let mut framer = StatementFramer::new(16);
+        assert_eq!(framer.push(b"SELECT 1;\n").unwrap().len(), 1);
         assert_eq!(
-            framer
-                .push(b"SELECT 'this is longer than sixteen bytes';")
-                .unwrap()
-                .len(),
-            1
+            framer.push(b"  SELECT 'this is longer than sixteen bytes';"),
+            Err(FrameError::StatementTooLarge {
+                line: 2,
+                column: 3,
+                limit: 16
+            })
         );
+    }
+
+    #[test]
+    fn statement_start_skips_leading_whitespace() {
+        assert_eq!(statement_start((5, 33), b"\n    SELECT 1;"), (6, 5));
+        assert_eq!(statement_start((5, 33), b"SELECT 1;"), (5, 33));
+        assert_eq!(statement_start((5, 33), b"  \n"), (6, 1));
     }
 
     #[test]

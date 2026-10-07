@@ -250,7 +250,7 @@ pub(super) fn map_parse_error(
 
     let msg = match e {
         E::ParserError(ParserError::SyntaxError { token_type, found }, Some((line, col))) => {
-            let near_token = found.as_deref().unwrap_or(&token_type);
+            let near_token = found.as_deref().unwrap_or(token_type);
             format!(
                 "syntax error near '{}' at line {}, column {}",
                 near_token, line, col
