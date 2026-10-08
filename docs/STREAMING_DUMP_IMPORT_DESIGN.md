@@ -58,14 +58,14 @@ Where the WAL bytes go during the import transaction: `ReplicationLoggerWalWrapp
 ```
             async (tokio runtime)                                 blocking thread (BLOCKING_RT)
 DumpStream ──chunks──▶ StatementFramer ──frames──▶ mpsc(depth) + byte budget ──▶ StatementExecutor ──▶ PrimaryConnection
-(hyper body /          memchr(';') +                (Semaphore permits               UTF-8 check → sqlite3_parser →
- tokio file)           sqlite3_complete()            travel with each frame)         policy checks → execute original SQL
+(hyper body /          resumable complete.c         (Semaphore permits               UTF-8 check → sqlite3_parser →
+ tokio file)           state machine                 travel with each frame)         policy checks → execute original SQL
                                                                                       → ROLLBACK on any failure
 ```
 
 Three components, each independently testable:
 
-- **`StatementFramer`** (sync, pure): accumulates bytes, emits complete SQL statements with their 1-based `(line, column)` in the original dump. Uses SQLite's own `sqlite3_complete()` so semicolons inside strings, comments and `CREATE TRIGGER … END` bodies are handled exactly as the `sqlite3` shell does.
+- **`StatementFramer`** (sync, pure): accumulates bytes, emits complete SQL statements with their 1-based `(line, column)` in the original dump. Uses a resumable Rust port of SQLite's `complete.c` tokenizer and state machine so semicolons inside strings, comments and `CREATE TRIGGER … END` bodies are handled like `sqlite3_complete()`, but in one linear pass. A differential test checks the port against SQLite's function.
 - **Reader task** (async): drives the stream, feeds the framer, pushes frames into a bounded channel, sends an explicit `End` marker.
 - **`StatementExecutor`** (blocking, one thread for the whole import): owns the `PrimaryConnection`, validates/parses/executes each frame in order inside the dump's own transaction, enforces the transaction rules, rolls back on abort.
 
@@ -156,7 +156,8 @@ libsql-server/src/namespace/dump_import/
 ├── mod.rs        DumpImporterKind, DumpImportConfig, DumpImportStats, pub(crate) async fn load_dump(...) dispatcher,
 │                 shared error-mapping helpers (map_parse_error, map_exec_error), metrics/logging
 ├── buffered.rs   legacy load_dump moved verbatim (renamed load_dump_buffered), returns DumpImportStats
-├── framer.rs     StatementFramer + is_complete_statement() + position helpers + unit tests
+├── complete.rs   resumable port of SQLite's complete.c tokenizer/state machine
+├── framer.rs     StatementFramer + position helpers + differential/unit tests
 └── streaming.rs  load_dump_streaming (reader task) + run_executor (blocking) + Msg type
 ```
 
@@ -226,29 +227,18 @@ pub struct DumpImportStats {
 
 Turn an arbitrary sequence of byte chunks into complete SQL statements, each ending at the `;` that terminates it, without ever holding more than one unfinished statement in memory.
 
-### 7.2 Completeness oracle
+### 7.2 Completeness scanner
 
-> *As built:* the FFI call below was the first implementation. Because `sqlite3_complete` has no resumable form, calling it for every candidate `;` costs O(statement length) each time, which is quadratic for statements with many interior semicolons (measured: a 1 MiB text value with 50k semicolons took 20 s of CPU on a tokio worker). The shipped framer instead uses `complete.rs`, a resumable Rust port of complete.c's tokenizer and 8×8 state machine (`CompletionScanner::find_statement_end`), so a dump is scanned exactly once. `sqlite3_complete` is kept only as the reference in a differential unit test (`framing_matches_sqlite3_complete`: random token soups × chunkings must frame identically). The rest of this section describes the semantics both implementations share.
+`CompletionScanner` in `complete.rs` is a resumable Rust port of SQLite's `complete.c`. It carries two pieces of state across chunks:
 
-```rust
-use rusqlite::ffi::sqlite3_complete;   // re-exported libsql_ffi binding: fn(*const c_char) -> c_int
+- lexical state (`Normal`, comments, bracket/quote, partial `/` or `-`, or an identifier spanning a chunk boundary);
+- SQLite's 8×8 statement-completion state machine for `EXPLAIN`, `CREATE [TEMP] TRIGGER`, interior semicolons and `END;`.
 
-/// `buf[start..=end]` is a candidate statement whose last byte is b';'.
-/// sqlite3_complete needs a NUL-terminated string, so a terminator is temporarily placed at end+1.
-fn is_complete_statement(buf: &mut Vec<u8>, start: usize, end: usize) -> bool {
-    debug_assert_eq!(buf[end], b';');
-    let pushed = if end + 1 == buf.len() { buf.push(0); true } else { false };
-    let saved = buf[end + 1];
-    buf[end + 1] = 0;
-    // SAFETY: buf[start..] is a NUL-terminated byte string; sqlite3_complete only reads it.
-    let complete = unsafe { sqlite3_complete(buf[start..].as_ptr() as *const _) } != 0;
-    buf[end + 1] = saved;
-    if pushed { buf.pop(); }
-    complete
-}
-```
+`find_statement_end(bytes)` consumes each byte once and returns the first `;` that takes the state machine back to `START`. The caller resumes immediately after that byte for the next statement. The input therefore costs O(dump bytes), including statements with many semicolons in strings, comments or trigger bodies.
 
-Semantics of `sqlite3_complete` (sqlite3.h:2770–2805): returns non-zero iff the string ends with a semicolon token that is not inside a string/identifier/comment and the text is not an unfinished `CREATE TRIGGER … BEGIN … END`. It does not parse; it tokenizes only. Verified against the bundled SQLite (probe run on this branch):
+The first implementation called SQLite's non-resumable `sqlite3_complete()` FFI function for every candidate `;`, rescanning from the statement start and becoming O(k·len) for *k* interior semicolons (measured: 20 s for 1 MiB/50k `;` on a tokio worker). The FFI remains only as the reference in `framing_matches_sqlite3_complete`: 2,000 deterministic random token soups under five chunkings must frame identically.
+
+The scanner matches these `sqlite3_complete` semantics (sqlite3.h:2770–2805): a statement ends with a semicolon token outside strings/identifiers/comments and not inside an unfinished `CREATE TRIGGER … BEGIN … END`. It tokenizes; it does not parse.
 
 | input | result |
 |---|---|
@@ -264,8 +254,9 @@ Embedded NUL bytes would truncate the view, hence §7.4 rule 1.
 
 ```rust
 pub struct StatementFramer {
-    buf: Vec<u8>,          // bytes after the last emitted frame; starts with the next statement's leading whitespace/comments
-    scan_from: usize,      // offset in buf from which to look for the next ';' (avoids re-testing rejected candidates)
+    buf: Vec<u8>,          // bytes after the last emitted frame
+    fed: usize,            // leading bytes already consumed by scanner
+    scanner: CompletionScanner,
     line: u64,             // 1-based line of buf[0] in the whole dump
     column: usize,         // 1-based byte column of buf[0]
     max_statement_bytes: usize,
@@ -274,32 +265,28 @@ pub struct StatementFramer {
 
 pub struct Frame { pub sql: Vec<u8>, pub line: u64, pub column: usize }
 
-#[derive(Debug)]
 pub enum FrameError {
     NulByte { line: u64, column: usize },
     StatementTooLarge { line: u64, column: usize, limit: usize },
 }
 ```
 
-`new(max_statement_bytes)` → `line = 1, column = 1`, empty buffer.
+`new(max_statement_bytes)` starts at `(line=1, column=1)` with an empty buffer and a fresh scanner.
 
 ### 7.4 `push(&mut self, chunk: &[u8]) -> Result<Vec<Frame>, FrameError>`
 
-1. If `memchr(0, chunk)` finds a NUL at offset `k`: compute its position (advance a copy of `(line, column)` over `buf[..]` then `chunk[..k]`) and return `NulByte`. Nothing is appended.
-2. `bytes_seen += chunk.len()`; `buf.extend_from_slice(chunk)`.
-3. `let mut start = 0; let mut frames = Vec::new();`
-4. Loop: `let Some(rel) = memchr(b';', &buf[scan_from..]) else break; let end = scan_from + rel;`
-   - If `is_complete_statement(&mut buf, start, end)`:
-     - *as built:* if `end + 1 - start > max_statement_bytes` → `StatementTooLarge` (position = first non-whitespace byte of the statement, via `statement_start`)
-     - `frames.push(Frame { sql: buf[start..=end].to_vec(), line: self.line, column: self.column })`
-     - advance position over `buf[start..=end]` (§7.6)
-     - `start = end + 1; scan_from = start;`
-   - else `scan_from = end + 1;`
-5. After the loop: `buf.drain(..start)` (one memmove per push, not per frame); `scan_from -= start`.
-6. If `buf.len() > max_statement_bytes` → `StatementTooLarge { line, column, limit }` where `(line, column)` is the first non-whitespace byte of the pending statement (*as built*: `statement_start`, so the message points at the statement rather than at the end of the previous line).
-7. Return `frames`.
+1. Reject the first NUL in the chunk with its exact absolute position. Nothing is appended.
+2. Add the chunk length to `bytes_seen` and append it to `buf`.
+3. Starting at `fed`, repeatedly ask `scanner.find_statement_end(...)` for the next terminating `;`. The scanner consumes every examined byte exactly once, including across calls to `push`.
+4. For each complete frame:
+   - reject it if its length exceeds `max_statement_bytes`, reporting the first non-whitespace byte;
+   - record its absolute start position and advance `(line, column)` over it;
+   - copy normal frames; when a frame starts at buffer offset zero and is at least 1 MiB, hand over the existing allocation with `split_off`/`mem::replace` so peak memory remains one large-statement copy.
+5. Drain all emitted small frames from `buf` in one operation and adjust `fed`.
+6. If the pending unterminated bytes exceed the limit, return `StatementTooLarge` at the statement start.
+7. Return the frames in input order.
 
-Complexity: each candidate `;` costs one `sqlite3_complete` scan from the statement start, so a statement containing *k* interior semicolons (trigger bodies, string literals) costs O(k·len). Normal dumps have k ≤ a few. A frame is emitted at the first terminating `;`, so a frame contains exactly one statement plus any leading whitespace/comments.
+A frame contains exactly one statement plus any leading whitespace/comments. The framing pass is O(dump bytes); copying emitted frames adds O(dump bytes).
 
 ### 7.5 `finish(&mut self) -> Option<Frame>`
 
@@ -577,19 +564,22 @@ Disk: the single dump transaction means the SQLite WAL and the replication log e
 
 ## 12. Observability
 
-Logging (in the dispatcher, `tracing`):
+Logging (`tracing`):
 
 - start: `info!(namespace, importer, "loading dump")`
+- progress every 10 s from the executor: `info!(statements, elapsed_ms, "dump import in progress")`
 - success: `info!(namespace, importer, statements, skipped, bytes, max_statement_bytes, elapsed_ms, "dump loaded")`
-- failure: `warn!(namespace, importer, error = %e, elapsed_ms, "dump load failed; transaction rolled back")`
+- failure: `warn!(namespace, importer, kind, statements, bytes, elapsed_ms, "dump load failed; transaction rolled back")`
 
-Metrics (`libsql-server/src/metrics.rs` style; `metrics` 0.21 macros with labels):
+The dispatcher intentionally omits the error text from the WARN because parser/execution errors may quote dump SQL and the HTTP layer already logs the response error. Failures retain partial streaming statistics.
 
-- `libsql_server_dump_import_duration_seconds{importer}` histogram
-- `libsql_server_dump_import_bytes{importer}` counter
-- `libsql_server_dump_import_statements{importer}` counter
-- `libsql_server_dump_import_failures{importer, kind}` counter, `kind ∈ {stream, parse, exec, txn, limit}`
-- `libsql_server_dump_import_max_statement_bytes{importer}` histogram
+Metrics (`metrics` 0.21 macros with labels):
+
+- `libsql_server_dump_import_duration_seconds{importer}` histogram (success or failure)
+- `libsql_server_dump_import_bytes{importer}` counter (success)
+- `libsql_server_dump_import_statements{importer}` counter (success)
+- `libsql_server_dump_import_failures{importer, kind}` counter, `kind ∈ {txn, parse, exec, limit, other}`
+- `libsql_server_dump_import_max_statement_bytes{importer}` histogram (success)
 
 ---
 
@@ -606,50 +596,37 @@ These are tracked by the DB Mover quarantine/fence work (Retail #35846/#35848).
 
 ## 14. Testing
 
-### 14.1 Unit tests — `framer.rs`
+### 14.1 Unit tests — `complete.rs`, `framer.rs`, `mod.rs`
 
-Use a helper that feeds a dump in every chunk size from 1 to N (`for cs in 1..=input.len()`) and asserts identical frames. Cases:
+20 dump-import unit tests cover:
 
-1. Two simple statements; `;` at the very end of a chunk; `;` as the first byte of a chunk.
-2. `;` inside a string literal `'a;b'`, inside `"quoted;ident"`, inside `-- comment;\n`, inside `/* block ; comment */`.
-3. `CREATE TRIGGER … BEGIN INSERT …; UPDATE …; END;` → one frame.
-4. Multibyte UTF-8 (`'żółć'`, emoji) split across chunk boundaries → frames are valid UTF-8.
-5. Empty statements `;;` and `;\n;` → frames emitted; concatenation reproduces input.
-6. `finish()` returns `None` after a trailing `;`, returns the tail for `COMMIT` without `;` and for `-- trailing comment\n`.
-7. NUL byte → `NulByte` with correct line/column.
-8. Oversized pending statement → `StatementTooLarge` at the correct position; a statement exactly at the limit passes.
-9. Position tracking: construct a multi-line dump, assert each frame's `(line, column)`; assert `absolute_position` on the §7.6 worked example.
-10. `is_complete_statement` directly: `"SELECT 1;"` true, `"SELECT ';"` false, `"CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;"` false, `"… END;"` true, `";"` true.
+- completion-state behavior for ordinary statements, comments, quotes, brackets and `CREATE [TEMP] TRIGGER … END;`;
+- chunk invariance (including one-byte chunks), multibyte UTF-8 splits, exact positions, NUL rejection, exact/over statement limits, empty statements and EOF tails;
+- a differential oracle: 2,000 deterministic random token soups, each tested under five chunkings, must frame identically to SQLite's `sqlite3_complete()`;
+- a semicolon-dense 1 MiB statement to guard the linear scanner path;
+- allocation identity for the ≥1 MiB zero-copy frame hand-over;
+- importer parsing and config validation.
 
 ### 14.2 Integration tests — `libsql-server/tests/namespaces/dumps.rs`
 
-Add helper:
+39 dump integration tests run the historical cases against the buffered control and matching streaming variants where behavior should agree. Additional coverage includes:
 
-```rust
-async fn create_from_dump(client: &Client, ns: &str, dump_url: String, importer: Option<&str>) -> Response {
-    let mut body = json!({ "dump_url": dump_url });
-    if let Some(i) = importer { body["dump_importer"] = json!(i); }
-    client.post(&format!("http://primary:9090/v1/namespaces/{ns}/create"), body).await.unwrap()
-}
-```
+- HTTP delivery in 1-byte, 7-byte and whole-body chunks, plus a body error half-way through a transaction;
+- trigger, CASE and nested-CASE bodies; syntax positions; `ATTACH` rejection; invalid UTF-8 and NUL input;
+- configurable server default, `dump_importer` without `dump_url` (400), unknown importer (422), and the statement-size limit (413);
+- equivalence of imported data across both implementations, including triggers, views, indexes, blobs, REAL values, rowids and `WITHOUT ROWID` tables;
+- a dump much larger than the queue budget, executor failure behind a saturated queue, and cancellation of the admin request (rollback and connection release);
+- empty/comment-only dumps, skipped `libsql_wasm_func_table`, and final `COMMIT` without a semicolon.
 
-Refactor each existing test body into `fn <name>_with(importer: Option<&str>)` and keep the existing `#[test] fn <name>()` calling `_with(None)` (snapshots untouched), plus `#[test] fn <name>_streaming()` calling `_with(Some("streaming"))`. Streaming variants that need a snapshot use `insta::assert_snapshot!("<legacy_name>", value)` (named snapshot) when the message is identical, otherwise a new snapshot.
+### 14.3 Validation commands
 
-New tests (streaming unless noted):
+- `cargo fmt --check -p libsql-server`
+- `RUSTFLAGS="-D warnings --cfg tokio_unstable" cargo check -p libsql-server --all-targets`
+- `cargo test -p libsql-server --lib dump_import`
+- `cargo test -p libsql-server --test tests namespaces::dumps`
+- clippy clean on the new importer files
 
-- `streaming_chunked_http_delivery`: the turmoil `dump-store` host serves the dump as `hyper::Body::wrap_stream(futures::stream::iter(chunks))` with 1-, 3- and 7-byte chunks; assert 200 and row count. End-to-end framing test.
-- `streaming_truncated_http_body`: body stream yields half the dump then `Err(io::Error)` → 500; `select count(*) from test` fails.
-- `streaming_empty_statements`, `streaming_commit_without_semicolon`, `streaming_semicolon_in_string_and_comment`.
-- `streaming_attach_statement_rejected` (`ATTACH 'x.db' AS x;`) → 400 with the legacy message; `streaming_word_attach_in_data_accepted`.
-- `streaming_statement_too_large` → 413, requires a server with `DbConfig { dump_import: DumpImportConfig { max_statement_bytes: 1024, .. } }` — add `make_primary_with_db_config(sim, path, DbConfig)` beside `make_primary`.
-- `dump_importer_without_dump_url` → 400; `dump_importer_unknown_value` → 400.
-- `server_default_streaming`: server started with `default_importer: Streaming`, request omits `dump_importer`, dump whose data contains the word `'attachment'` succeeds (buffered would reject it with 400 — proves streaming was used).
-- `importers_produce_identical_databases`: same dump (triggers, views, indexes, `sqlite_sequence`, text with quotes/newlines, blobs, REAL values like `1.0e10`, a `WITHOUT ROWID` table, a table whose rowid must be preserved) into `ns_buffered` and `ns_streaming`; `GET /dump?preserve_row_ids=true` on both; assert identical data lines, assert the streaming output contains the source DDL verbatim, snapshot the streaming output (*as built*; see §10 for why not byte-equal).
-- `streaming_large_dump`: generate 200k single-row INSERTs into a temp file; assert count. Guards against accidental O(n²) in framing.
-
-### 14.3 Lints
-
-`cargo clippy -p libsql-server -- -D warnings` and `cargo fmt` (toolchain 1.98.1, workspace enforces `-D warnings`).
+CI uses nextest process isolation. A few unrelated turmoil tests also flake under in-process parallel `cargo test` on the base commit; they pass alone and are not changed here.
 
 ---
 
@@ -665,7 +642,7 @@ New tests (streaming unless noted):
    - `curl -H 'x-namespace: ns_buffered' localhost:8080/dump?preserve_row_ids=true > a.sql`; same for `ns_streaming` → the `INSERT`/`DELETE` lines must be identical (DDL text legitimately differs, §10);
    - `PRAGMA integrity_check` via hrana (`POST /v2/pipeline`) on both → `ok`;
    - compare `libsql_server_dump_import_*` metrics from `/metrics`.
-5. Acceptance: streaming peak RSS delta plateaus (< 64 MiB) across the three sizes while buffered scales ≈ 2× dump; streaming wall time ≤ buffered wall time; dumps byte-identical.
+5. Acceptance: streaming peak RSS delta plateaus (< 64 MiB) across the three sizes while buffered scales ≈ 2× dump; streaming wall time ≤ buffered wall time; data lines are byte-identical and the streaming schema text matches the input (buffered normalizes DDL).
 
 The script is `scripts/bench-dump-import.sh`; it implements steps 3–4 against a running server and prints a results table.
 
@@ -689,12 +666,13 @@ After the review fixes (§18), a 10 MB dump of 50 rows holding 200 KB CSS-like v
 - Add `DumpImporterKind`, `DumpImportConfig`, `DumpImportStats`, dispatcher `load_dump` (streaming arm temporarily `unimplemented!()`-free: return `Internal("streaming importer not available")`).
 - `DumpSource`, `RestoreOption::Dump(DumpSource)`; update `helpers.rs` match; `admin/mod.rs` builds `DumpSource { stream, importer: req.dump_importer }`.
 - `DbConfig.dump_import`, `BaseNamespaceConfig.dump_import`, `lib.rs` plumbing, `scheduler.rs` test constructors, CLI flags in `main.rs`, `make_db_config` validation.
-- New `LoadDumpError` variants: `ImporterWithoutDumpUrl` (400), `StatementTooLarge { line: u64, limit: usize }` (413, `StatusCode::PAYLOAD_TOO_LARGE`). Update `IntoResponse for &LoadDumpError`.
+- New `LoadDumpError` variants: `ImporterWithoutDumpUrl` (400), `StatementTooLarge { line: u64, column: usize, limit: usize }` (413, `StatusCode::PAYLOAD_TOO_LARGE`). Update `IntoResponse for &LoadDumpError`.
 - `ReaderStream::with_capacity(f, 64 * 1024)`.
 - Run the existing dump tests: all green, snapshots unchanged.
 
 **Step 2 — framer**
 - `framer.rs` per §7 with the unit tests of §14.1. Add `memchr` dependency.
+- *As reviewed:* add `complete.rs`, the resumable linear port of SQLite's completion state machine, and keep the FFI only as the differential-test oracle.
 
 **Step 3 — streaming importer**
 - `streaming.rs` per §8–9; wire the dispatcher arm; `From<FrameError> for LoadDumpError`.
@@ -710,7 +688,7 @@ File change list:
 | File | Change |
 |---|---|
 | `libsql-server/Cargo.toml` | `memchr = "2"` |
-| `libsql-server/src/namespace/dump_import/{mod,buffered,framer,streaming}.rs` | new |
+| `libsql-server/src/namespace/dump_import/{mod,buffered,complete,framer,streaming}.rs` | new |
 | `libsql-server/src/namespace/mod.rs` | `pub(crate) mod dump_import;`, `DumpSource`, `RestoreOption::Dump(DumpSource)` |
 | `libsql-server/src/namespace/configurator/helpers.rs` | remove `load_dump` + its imports; new match arm |
 | `libsql-server/src/namespace/configurator/mod.rs` | `BaseNamespaceConfig.dump_import` |
@@ -719,7 +697,7 @@ File change list:
 | `libsql-server/src/main.rs` | 4 flags, `make_db_config`, validation |
 | `libsql-server/src/http/admin/mod.rs` | `dump_importer` field, check, `DumpSource`, `ReaderStream::with_capacity` |
 | `libsql-server/src/error.rs` | 2 variants + response mapping |
-| `libsql-server/src/metrics.rs` | 5 metrics |
+| `libsql-server/src/namespace/dump_import/mod.rs` | importer dispatch, stats/logs, 5 metrics, shared error mapping |
 | `libsql-server/src/schema/scheduler.rs` | test `BaseNamespaceConfig` literals |
 | `libsql-server/tests/namespaces/{mod,dumps}.rs` + snapshots | helpers, variants, new tests |
 | `docs/ADMIN_API.md`, `docs/USER_GUIDE.md` | docs |
@@ -728,7 +706,7 @@ File change list:
 
 ## 17. Risks and open questions
 
-- **Oracle/parser disagreement.** `sqlite3_complete` and `sqlite3_parser` are two tokenizers. If they ever disagree on where a statement ends, the result is a parse error (fail closed) or the §8.5 step 2 guard, never silent corruption. Known shared rules: strings, quoted identifiers, `--`/`/* */` comments, `CREATE [TEMP] TRIGGER … END`.
+- **Completion-scanner/parser disagreement.** The resumable `complete.c` port and `sqlite3_parser` are two tokenizers. If they disagree on where a statement ends, the result is a parse error (fail closed) or the §8.5 step 2 guard, never silent corruption. The differential test checks framing against SQLite's own `sqlite3_complete()` across strings, quoted identifiers, comments, triggers and randomized token soups.
 - **Per-statement `Parser` allocation.** `Parser::new` allocates a lemon stack per call. If profiling shows it matters, reuse via `Parser::reset` behind a small wrapper; not needed for correctness.
 - **Original-text execution vs AST text.** Deliberate (§8.5). If an A/B shows a divergence, the `/dump` diff in §15 will surface it; the fix belongs in the parser, not in the importer.
 - **`EXPLAIN`/row-returning statements** are executed and their rows discarded; the buffered importer fails on them. Acceptable and documented.

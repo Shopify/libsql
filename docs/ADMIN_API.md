@@ -34,10 +34,10 @@ rejected.
 
 - `buffered` (historical): the whole dump is read into memory, parsed, then executed. Memory
   usage is proportional to the dump size.
-- `streaming`: statements are framed with `sqlite3_complete()` and executed while the dump is
-  still being read. Memory usage is bounded by the server's queue settings plus the largest
-  single statement (see `--dump-import-*` flags); a statement larger than
-  `--dump-import-max-statement-size` is rejected with `413`.
+- `streaming`: statements are framed with a resumable port of SQLite's `sqlite3_complete()` state
+  machine and executed while the dump is still being read. Memory usage is bounded by the
+  server's queue settings plus the largest single statement (see `--dump-import-*` flags); a
+  statement larger than `--dump-import-max-statement-size` is rejected with `413`.
 
 When omitted, the server's `--dump-importer` setting (`SQLD_DUMP_IMPORTER`, default `buffered`)
 applies. Values are matched case-insensitively; an unknown value is rejected with `422`.
