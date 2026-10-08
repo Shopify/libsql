@@ -604,12 +604,15 @@ async fn disable_profile_heap(
     Path(profile): Path<String>,
 ) -> crate::Result<impl axum::response::IntoResponse> {
     let profile_dir = heap_profile_path(&profile)?;
-    // Fail before disabling tracking so a wrong ID does not stop the live
-    // session and stream an empty archive.
+    // Always stop tracking first: this must remain possible even if the
+    // profile directory is gone or the ID was lost. `disable_tracking` is a
+    // no-op when nothing is enabled, so a retry with the right ID streams the
+    // already-finalized profile.
+    tokio::task::spawn_blocking(rheaper::disable_tracking).await?;
+    // Fail explicitly instead of streaming an empty archive for a wrong ID.
     tokio::fs::metadata(&profile_dir).await?;
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
     tokio::task::spawn_blocking(move || {
-        rheaper::disable_tracking();
         let sink =
             PollSender::new(tx).sink_map_err(|_| std::io::Error::from(ErrorKind::BrokenPipe));
         let writer = tokio_util::io::SyncIoBridge::new(SinkWriter::new(CopyToBytes::new(sink)));
@@ -733,5 +736,68 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn disable_profile_heap_stops_live_session_and_streams_profile() {
+        // The tracker is process-global: this must stay the only test that
+        // enables tracking.
+        let profile_dir = rheaper::enable_tracking(rheaper::TrackerConfig {
+            max_stack_depth: 1,
+            max_trackers: 1,
+            tracker_event_buffer_size: 1,
+            sample_rate: 0.0,
+            profile_dir: PathBuf::from(HEAP_PROFILE_DIR),
+        })
+        .unwrap();
+        let profile = profile_dir
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        let app = axum::Router::new().route(
+            "/profile/heap/disable/:id",
+            axum::routing::post(disable_profile_heap),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/profile/heap/disable/{profile}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        std::fs::remove_dir_all(&profile_dir).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let mut archive = tar::Archive::new(&body[..]);
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().any(|e| e.trim_end_matches('/') == profile),
+            "tar entries: {entries:?}"
+        );
+        // Tracking is off again, so enabling must succeed and be cleaned up.
+        let again = rheaper::enable_tracking(rheaper::TrackerConfig {
+            max_stack_depth: 1,
+            max_trackers: 1,
+            tracker_event_buffer_size: 1,
+            sample_rate: 0.0,
+            profile_dir: PathBuf::from(HEAP_PROFILE_DIR),
+        })
+        .unwrap();
+        rheaper::disable_tracking();
+        std::fs::remove_dir_all(&again).unwrap();
+        // Only removes the parent if nothing else is in it.
+        let _ = std::fs::remove_dir(HEAP_PROFILE_DIR);
     }
 }
