@@ -89,7 +89,7 @@ crossbeam = "0.8.4"
 async-recursion = "1"
 mimalloc = "0.1.42"
 rheaper = { git = "https://github.com/MarinPostma/rheaper.git", tag = "v0.2.0", default-features = false, features = ["allocator"] }
-tar = "0.4.41"
+tar = "0.4.45"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 aws-smithy-runtime = "1.6.2"
