@@ -13,7 +13,7 @@ prost = "0.12"
 libsql-sys = { workspace = true, default-features = false, features = ["wal", "rusqlite", "api"] }
 rusqlite = { workspace = true }
 parking_lot = "0.12.1"
-bytes = { version = "1.5.0", features = ["serde"] } 
+bytes = { version = "1.11.1", features = ["serde"] } 
 serde = { version = "1.0.189", features = ["derive"] }
 thiserror = "1.0.49"
 tracing = "0.1.40"
