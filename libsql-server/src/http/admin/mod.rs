@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::OnceCell;
 use std::convert::Infallible;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -585,10 +585,15 @@ async fn enable_profile_heap(Json(req): Json<EnableHeapProfileRequest>) -> crate
 }
 
 fn heap_profile_path(profile: &str) -> crate::Result<PathBuf> {
-    let Some(timestamp) = profile.strip_prefix("rip-") else {
-        return Err(Error::InvalidPath(profile.to_owned()));
-    };
-    if timestamp.is_empty() || !timestamp.bytes().all(|c| c.is_ascii_digit()) {
+    let mut components = FsPath::new(profile).components();
+    let is_safe_basename = !profile.is_empty()
+        && !profile
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '\0' | ':'))
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none();
+
+    if !is_safe_basename {
         return Err(Error::InvalidPath(profile.to_owned()));
     }
 
@@ -636,15 +641,22 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
-    fn heap_profile_path_accepts_generated_profile_ids() {
-        assert_eq!(
-            heap_profile_path("rip-1720000000").unwrap(),
-            PathBuf::from(HEAP_PROFILE_DIR).join("rip-1720000000")
-        );
+    fn heap_profile_path_accepts_safe_basenames() {
+        for profile in [
+            "rip-1720000000",
+            "future-profile-format",
+            "profile 1",
+            "café",
+        ] {
+            assert_eq!(
+                heap_profile_path(profile).unwrap(),
+                PathBuf::from(HEAP_PROFILE_DIR).join(profile)
+            );
+        }
     }
 
     #[test]
-    fn heap_profile_path_rejects_invalid_profile_ids() {
+    fn heap_profile_path_rejects_unsafe_basenames() {
         for profile in [
             "",
             ".",
@@ -654,10 +666,8 @@ mod tests {
             "rip-1720000000/..",
             "rip-1720000000/profile",
             "rip-1720000000\\profile",
-            "profile",
-            "rip-",
-            "rip-invalid",
-            "rip-+1720000000",
+            "rip-1720000000\0profile",
+            "C:profile",
         ] {
             assert!(
                 matches!(heap_profile_path(profile), Err(Error::InvalidPath(path)) if path == profile),
