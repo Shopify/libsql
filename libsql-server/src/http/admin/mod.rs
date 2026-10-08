@@ -604,6 +604,9 @@ async fn disable_profile_heap(
     Path(profile): Path<String>,
 ) -> crate::Result<impl axum::response::IntoResponse> {
     let profile_dir = heap_profile_path(&profile)?;
+    // Fail before disabling tracking so a wrong ID does not stop the live
+    // session and stream an empty archive.
+    tokio::fs::metadata(&profile_dir).await?;
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
     tokio::task::spawn_blocking(move || {
         rheaper::disable_tracking();
@@ -709,5 +712,26 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn disable_profile_heap_fails_for_missing_profile() {
+        let app = axum::Router::new().route(
+            "/profile/heap/disable/:id",
+            axum::routing::post(disable_profile_heap),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/profile/heap/disable/rip-0-missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
