@@ -5,9 +5,10 @@
 //!
 //! - [`DumpImporterKind::Buffered`]: the historical importer. Reads the whole dump into memory,
 //!   parses it, and executes each statement. Memory usage is proportional to the dump size.
-//! - [`DumpImporterKind::Streaming`]: frames complete statements incrementally with
-//!   `sqlite3_complete()` and executes them on a dedicated blocking thread while the dump is
-//!   still being read. Memory usage is bounded by [`DumpImportConfig`] plus the largest statement.
+//! - [`DumpImporterKind::Streaming`]: frames complete statements incrementally with a resumable
+//!   port of SQLite's `sqlite3_complete()` state machine and executes them on a dedicated blocking
+//!   thread while the dump is still being read. Memory usage is bounded by [`DumpImportConfig`]
+//!   plus the largest statement.
 //!
 //! See `docs/STREAMING_DUMP_IMPORT_DESIGN.md` for the full design.
 
