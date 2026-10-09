@@ -88,6 +88,7 @@ replication = [
   "dep:bytes",
   "dep:uuid",
   "dep:tokio-stream",
+  "dep:tokio-util",
   "dep:parking_lot",
   "dep:tokio",
   "dep:tonic",

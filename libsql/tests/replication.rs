@@ -1,5 +1,7 @@
 #![allow(deprecated)]
 
+use std::sync::Arc;
+
 use libsql::{replication::Frames, Database};
 use libsql_replication::{
     frame::{FrameBorrowed, FrameHeader, FrameMut},
@@ -7,6 +9,67 @@ use libsql_replication::{
 };
 
 const DB: &[u8] = include_bytes!("test.db");
+
+#[tokio::test]
+async fn cancel_current_sync_for_shutdown_without_active_sync_returns_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open_with_local_sync(tmp.path().join("data").to_str().unwrap(), None)
+        .await
+        .unwrap();
+
+    assert!(!db.cancel_current_sync_for_shutdown().unwrap());
+}
+
+#[tokio::test]
+async fn cancel_current_sync_for_shutdown_cancels_active_remote_sync_and_clears_token() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((_stream, _peer)) = listener.accept().await else {
+                break;
+            };
+        }
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        Database::open_with_remote_sync(
+            tmp.path().join("data").to_str().unwrap(),
+            format!("http://{addr}"),
+            "token",
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let syncing = db.clone();
+    let sync = tokio::spawn(async move { syncing.sync().await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if db.cancel_current_sync_for_shutdown().unwrap() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sync did not register a cancellable token");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), sync)
+        .await
+        .expect("sync did not finish after cancellation")
+        .unwrap();
+    assert!(matches!(
+        result.unwrap_err(),
+        libsql::Error::SyncCancelledForShutdown
+    ));
+    assert!(!db.cancel_current_sync_for_shutdown().unwrap());
+
+    server.abort();
+}
 
 #[tokio::test]
 async fn inject_frames() {

@@ -47,6 +47,8 @@ pub enum Error {
     RemoteSqliteFailure(i32, i32, String),
     #[error("replication error: {0}")]
     Replication(crate::BoxError),
+    #[error("sync cancelled for terminal shutdown")]
+    SyncCancelledForShutdown,
     #[error("path has invalid UTF-8")]
     InvalidUTF8Path,
     #[error("freeze is not supported in {0} mode.")]
