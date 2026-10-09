@@ -223,6 +223,13 @@ impl MetaStoreInner {
                 if !entry.path().is_dir() {
                     continue;
                 }
+                if entry.path().join(super::INCOMPLETE_MARKER).try_exists()? {
+                    tracing::warn!(
+                        "skipping `{}`: left by an interrupted namespace creation",
+                        entry.path().display()
+                    );
+                    continue;
+                }
                 let config_path = entry.path().join("config.json");
                 let name =
                     NamespaceName::from_string(entry.file_name().to_str().unwrap().to_string())?;

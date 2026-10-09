@@ -21,7 +21,7 @@ use crate::namespace::{
 use crate::run_periodic_checkpoint;
 use crate::schema::{has_pending_migration_task, setup_migration_table};
 
-use super::helpers::cleanup_primary;
+use super::helpers::{cleanup_primary, discard_incomplete, FreshDir};
 use super::{BaseNamespaceConfig, ConfigureNamespace, PrimaryConfig};
 
 pub struct PrimaryConfigurator {
@@ -129,33 +129,31 @@ impl ConfigureNamespace for PrimaryConfigurator {
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
         Box::pin(async move {
             let db_path: Arc<Path> = self.base.base_path.join("dbs").join(name.as_str()).into();
-            let fresh_namespace = !db_path.try_exists()?;
-            // FIXME: make that truly atomic. explore the idea of using temp directories, and it's implications
-            match self
+            // A brand-new directory is removed again if setup fails or this future is dropped.
+            let fresh = FreshDir::begin(&db_path).await?;
+            let ns = self
                 .try_new_primary(
                     name.clone(),
                     meta_store_handle,
                     restore_option,
                     resolve_attach_path,
-                    db_path.clone(),
+                    db_path,
                     broadcaster,
                     self.base.encryption_config.clone(),
                 )
-                .await
-            {
-                Ok(this) => Ok(this),
-                Err(e) if fresh_namespace => {
-                    tracing::error!(
-                        "an error occured while deleting creating namespace, cleaning..."
-                    );
-                    if let Err(e) = tokio::fs::remove_dir_all(&db_path).await {
-                        tracing::error!("failed to remove dirty namespace directory: {e}")
-                    }
-                    Err(e)
-                }
-                Err(e) => Err(e),
+                .await?;
+            if let Some(fresh) = fresh {
+                fresh.keep();
             }
+            Ok(ns)
         })
+    }
+
+    fn discard_incomplete<'a>(
+        &'a self,
+        namespace: &'a NamespaceName,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>> {
+        Box::pin(discard_incomplete(&self.base, namespace))
     }
 
     fn cleanup<'a>(
