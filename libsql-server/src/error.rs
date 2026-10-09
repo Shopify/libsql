@@ -296,6 +296,16 @@ pub enum LoadDumpError {
     NotAFile,
     #[error("The passed dump sql is invalid: {0}")]
     InvalidSqlInput(String),
+    #[error("`dump_importer` requires `dump_url`")]
+    ImporterWithoutDumpUrl,
+    #[error(
+        "A dump statement starting at line {line}, column {column} exceeds the maximum allowed size ({limit} bytes)"
+    )]
+    StatementTooLarge {
+        line: u64,
+        column: usize,
+        limit: usize,
+    },
 }
 
 impl ResponseError for LoadDumpError {}
@@ -315,7 +325,9 @@ impl IntoResponse for &LoadDumpError {
             | NoCommit
             | NotAFile
             | DumpFilePathNotAbsolute
+            | ImporterWithoutDumpUrl
             | InvalidSqlInput(_) => self.format_err(StatusCode::BAD_REQUEST),
+            StatementTooLarge { .. } => self.format_err(StatusCode::PAYLOAD_TOO_LARGE),
         }
     }
 }

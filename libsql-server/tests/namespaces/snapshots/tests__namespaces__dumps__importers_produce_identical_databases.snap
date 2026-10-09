@@ -1,0 +1,23 @@
+---
+source: libsql-server/tests/namespaces/dumps.rs
+expression: streaming
+---
+PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE IF NOT EXISTS plain (a, b REAL, c BLOB, d TEXT);
+INSERT INTO plain(rowid,a,b,c,d) VALUES(1,1,10000000000,X'00ff10','it''s "quoted"');
+INSERT INTO plain(rowid,a,b,c,d) VALUES(2,NULL,-0.5,X'',replace('multi\nline','\n',char(10)));
+INSERT INTO plain(rowid,a,b,c,d) VALUES(3,3,2.5,NULL,'tab	inside');
+CREATE TABLE IF NOT EXISTS seq (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+INSERT INTO seq(rowid,id,v) VALUES(1,1,'one');
+INSERT INTO seq(rowid,id,v) VALUES(5,5,'five');
+CREATE TABLE IF NOT EXISTS norowid (k TEXT PRIMARY KEY, v) WITHOUT ROWID;
+INSERT INTO norowid VALUES('k1',1);
+CREATE TABLE IF NOT EXISTS "rowid_preserved"(rowid_ INTEGER, v);
+INSERT INTO rowid_preserved(rowid,rowid_,v) VALUES(7,70,'seven');
+DELETE FROM sqlite_sequence;
+INSERT INTO sqlite_sequence(rowid,name,seq) VALUES(1,'seq',5);
+CREATE INDEX plain_a ON plain(a);
+CREATE VIEW v_plain AS SELECT a, d FROM plain WHERE a IS NOT NULL;
+CREATE TRIGGER tr AFTER INSERT ON seq BEGIN UPDATE seq SET v = v || '!' WHERE id = NEW.id; END;
+COMMIT;

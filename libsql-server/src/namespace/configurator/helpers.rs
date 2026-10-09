@@ -5,23 +5,15 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use bottomless::replicator::Options;
-use bytes::Bytes;
 use enclose::enclose;
-use fallible_iterator::FallibleIterator;
-use futures::Stream;
 use libsql_sys::EncryptionConfig;
-use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-use sqlite3_parser::ast::{Cmd, Stmt};
-use sqlite3_parser::lexer::sql::{Parser, ParserError};
-use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
-use tokio_util::io::StreamReader;
 
 use crate::connection::config::DatabaseConfig;
 use crate::connection::connection_manager::InnerWalManager;
 use crate::connection::legacy::MakeLegacyConnection;
 use crate::connection::{Connection as _, MakeConnection, MakeThrottledConnection};
-use crate::database::{PrimaryConnection, PrimaryConnectionMaker};
+use crate::database::PrimaryConnectionMaker;
 use crate::error::LoadDumpError;
 use crate::namespace::broadcasters::BroadcasterHandle;
 use crate::namespace::meta_store::MetaStoreHandle;
@@ -201,11 +193,19 @@ pub(super) async fn make_primary_connection_maker(
         RestoreOption::Dump(_) if !is_fresh_db => {
             Err(LoadDumpError::LoadDumpExistingDb)?;
         }
-        RestoreOption::Dump(dump) => {
+        RestoreOption::Dump(source) => {
             let conn = connection_maker.create().await?;
-            tracing::debug!("Loading dump");
-            load_dump(dump, conn).await?;
-            tracing::debug!("Done loading dump");
+            let kind = source
+                .importer
+                .unwrap_or(base_config.dump_import.default_importer);
+            crate::namespace::dump_import::load_dump(
+                kind,
+                source.stream,
+                conn,
+                &base_config.dump_import,
+                name,
+            )
+            .await?;
         }
         _ => { /* other cases were already handled when creating bottomless */ }
     }
@@ -288,110 +288,6 @@ async fn run_periodic_compactions(logger: Arc<ReplicationLogger>) -> anyhow::Res
             .expect("Compaction task crashed")
             .context("Compaction failed")?;
     }
-}
-
-async fn load_dump<S>(dump: S, conn: PrimaryConnection) -> crate::Result<(), LoadDumpError>
-where
-    S: Stream<Item = std::io::Result<Bytes>> + Unpin,
-{
-    let mut reader = tokio::io::BufReader::new(StreamReader::new(dump));
-    let mut dump_content = String::new();
-    reader
-        .read_to_string(&mut dump_content)
-        .await
-        .map_err(|e| LoadDumpError::Internal(format!("Failed to read dump content: {}", e)))?;
-
-    if dump_content.to_lowercase().contains("attach") {
-        return Err(LoadDumpError::InvalidSqlInput(
-            "attach statements are not allowed in dumps".to_string(),
-        ));
-    }
-
-    let mut parser = Box::new(Parser::new(dump_content.as_bytes()));
-    let mut skipped_wasm_table = false;
-    let mut n_stmt = 0;
-
-    loop {
-        match parser.next() {
-            Ok(Some(cmd)) => {
-                n_stmt += 1;
-
-                if !skipped_wasm_table {
-                    if let Cmd::Stmt(Stmt::CreateTable { tbl_name, .. }) = &cmd {
-                        if tbl_name.name.0 == "libsql_wasm_func_table" {
-                            skipped_wasm_table = true;
-                            tracing::debug!("Skipping WASM table creation");
-                            continue;
-                        }
-                    }
-                }
-
-                if n_stmt > 2 && conn.is_autocommit().await.unwrap() {
-                    return Err(LoadDumpError::NoTxn);
-                }
-
-                let stmt_sql = cmd.to_string();
-                tokio::task::spawn_blocking({
-                    let conn = conn.clone();
-                    move || -> crate::Result<(), LoadDumpError> {
-                        conn.with_raw(|conn| {
-                            conn.authorizer(Some(|auth: AuthContext<'_>| match auth.action {
-                                AuthAction::Attach { filename: _ } => Authorization::Deny,
-                                _ => Authorization::Allow,
-                            }));
-                            conn.execute(&stmt_sql, ())
-                        })
-                        .map_err(|e| match e {
-                            rusqlite::Error::SqlInputError {
-                                msg, sql, offset, ..
-                            } => LoadDumpError::InvalidSqlInput(format!(
-                                "msg: {}, sql: {}, offset: {}",
-                                msg, sql, offset
-                            )),
-                            e => LoadDumpError::Internal(format!(
-                                "statement: {}, error: {}",
-                                n_stmt, e
-                            )),
-                        })?;
-                        Ok(())
-                    }
-                })
-                .await??;
-            }
-            Ok(None) => break,
-            Err(e) => {
-                let error_msg = match e {
-                    sqlite3_parser::lexer::sql::Error::ParserError(
-                        ParserError::SyntaxError { token_type, found },
-                        Some((line, col)),
-                    ) => {
-                        let near_token = found.as_deref().unwrap_or(&token_type);
-                        format!(
-                            "syntax error near '{}' at line {}, column {}",
-                            near_token, line, col
-                        )
-                    }
-                    _ => format!("parse error: {}", e),
-                };
-
-                return Err(LoadDumpError::InvalidSqlInput(error_msg));
-            }
-        }
-    }
-
-    if !conn.is_autocommit().await.unwrap() {
-        tokio::task::spawn_blocking({
-            let conn = conn.clone();
-            move || -> crate::Result<(), LoadDumpError> {
-                conn.with_raw(|conn| conn.execute("rollback", ()))?;
-                Ok(())
-            }
-        })
-        .await??;
-        return Err(LoadDumpError::NoCommit);
-    }
-
-    Ok(())
 }
 
 fn check_fresh_db(path: &Path) -> crate::Result<bool> {

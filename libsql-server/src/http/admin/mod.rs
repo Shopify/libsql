@@ -26,7 +26,8 @@ use crate::auth::parse_jwt_keys;
 use crate::connection::config::{DatabaseConfig, DurabilityMode};
 use crate::error::{Error, LoadDumpError};
 use crate::hrana;
-use crate::namespace::{DumpStream, NamespaceName, NamespaceStore, RestoreOption};
+use crate::namespace::dump_import::DumpImporterKind;
+use crate::namespace::{DumpSource, DumpStream, NamespaceName, NamespaceStore, RestoreOption};
 use crate::net::Connector;
 use crate::LIBSQL_PAGE_SIZE;
 
@@ -373,6 +374,10 @@ async fn handle_post_config<C>(
 #[derive(Debug, Deserialize)]
 struct CreateNamespaceReq {
     dump_url: Option<Url>,
+    /// Which importer loads `dump_url`: `"buffered"` (historical, whole dump in memory) or
+    /// `"streaming"` (memory-bounded). Defaults to the server's `--dump-importer`.
+    #[serde(default)]
+    dump_importer: Option<DumpImporterKind>,
     max_db_size: Option<bytesize::ByteSize>,
     heartbeat_url: Option<String>,
     bottomless_db_id: Option<String>,
@@ -410,6 +415,10 @@ async fn handle_create_namespace<C: Connector>(
         ));
     }
 
+    if req.dump_importer.is_some() && req.dump_url.is_none() {
+        return Err(LoadDumpError::ImporterWithoutDumpUrl.into());
+    }
+
     if let Some(ns) = req.shared_schema_name {
         if req.shared_schema {
             return Err(Error::SharedSchemaCreationError(
@@ -425,9 +434,10 @@ async fn handle_create_namespace<C: Connector>(
     }
 
     let dump = match req.dump_url {
-        Some(ref url) => {
-            RestoreOption::Dump(dump_stream_from_url(url, app_state.connector.clone()).await?)
-        }
+        Some(ref url) => RestoreOption::Dump(
+            DumpSource::new(dump_stream_from_url(url, app_state.connector.clone()).await?)
+                .with_importer(req.dump_importer),
+        ),
         None => RestoreOption::Latest,
     };
 
@@ -476,6 +486,9 @@ async fn handle_fork_namespace<C>(
     Ok(())
 }
 
+/// Read `file:` dumps in reasonably large chunks; both importers consume the resulting stream.
+const DUMP_FILE_READ_CHUNK_SIZE: usize = 64 * 1024;
+
 async fn dump_stream_from_url<C>(url: &Url, connector: C) -> Result<DumpStream, LoadDumpError>
 where
     C: Connector,
@@ -509,7 +522,10 @@ where
 
             let f = tokio::fs::File::open(path).await?;
 
-            Ok(Box::new(ReaderStream::new(f)))
+            Ok(Box::new(ReaderStream::with_capacity(
+                f,
+                DUMP_FILE_READ_CHUNK_SIZE,
+            )))
         }
         scheme => Err(LoadDumpError::UnsupportedUrlScheme(scheme.to_string())),
     }

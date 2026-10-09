@@ -38,6 +38,7 @@ itertools = "0.10.5"
 jsonwebtoken = "9"
 libsql = { path = "../libsql/", optional = true }
 libsql_replication = { path = "../libsql-replication" }
+memchr = "2"
 metrics = "0.21.1"
 metrics-util = "0.15"
 metrics-exporter-prometheus = "0.12.2"

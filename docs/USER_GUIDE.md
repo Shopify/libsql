@@ -246,6 +246,32 @@ For example, to create a database named `db1`, send the following HTTP request:
 curl -X POST http://localhost:8080/v1/namespaces/db1/create
 ```
 
+### Creating a database from a SQLite dump
+
+A new database can be initialized from a SQL dump produced by `sqlite3 source.db .dump` (or by
+this server's `GET /dump` endpoint):
+
+```shell
+sqlite3 source.db .dump > /srv/dumps/db1.sql
+curl -X POST http://localhost:9090/v1/namespaces/db1/create \
+  -H 'content-type: application/json' \
+  -d '{"dump_url": "file:///srv/dumps/db1.sql", "dump_importer": "streaming"}'
+```
+
+Two importers are available. `buffered` (the default) reads the whole dump into memory before
+executing it. `streaming` executes statements as they arrive and keeps memory usage independent
+of the dump size; it is selected per request with `dump_importer` or server-wide with
+`--dump-importer streaming` (`SQLD_DUMP_IMPORTER`). The streaming importer is tuned with:
+
+- `--dump-import-max-statement-size` (`SQLD_DUMP_IMPORT_MAX_STATEMENT_SIZE`, default `64MiB`):
+  a single statement larger than this fails the import with HTTP 413.
+- `--dump-import-queue-bytes` (`SQLD_DUMP_IMPORT_QUEUE_BYTES`, default `16MiB`) and
+  `--dump-import-queue-depth` (`SQLD_DUMP_IMPORT_QUEUE_DEPTH`, default `256`): how many
+  framed-but-not-yet-executed statements may be in flight.
+
+Either way the dump runs as one transaction, so the WAL and the replication log grow to roughly
+the database size before the final `COMMIT`; make sure the disk has room for that.
+
 The name of the database is determined from the `Host` header in the HTTP request.
 
 For example, if you have the following entries in your `/etc/hosts` file:
