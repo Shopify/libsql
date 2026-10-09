@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use async_lock::RwLock;
+use async_lock::{RwLock, RwLockWriteGuardArc};
 use chrono::NaiveDateTime;
 use futures::TryFutureExt;
 use moka::future::Cache;
@@ -26,6 +26,86 @@ use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
 type NamespaceEntry = Arc<RwLock<Option<Namespace>>>;
+
+/// A namespace name reserved for a creation (or fork) in progress.
+///
+/// Holding a reservation holds the name's cache entry write-locked, so every other access to
+/// the name — user requests, a second create, destroy, shutdown — waits until the outcome is
+/// known. [`publish`](Self::publish) installs the finished namespace. Dropping the reservation
+/// unpublished (error, or the creating request was cancelled) removes the namespace's in-memory
+/// config and only then releases the lock, so waiters observe a namespace that does not exist,
+/// never a half-built one.
+///
+/// The metastore row is only written after setup succeeds (see `create`), so the row's presence
+/// implies a complete namespace. See `docs/ATOMIC_NAMESPACE_CREATE_DESIGN.md`.
+struct Reservation {
+    guard: Option<RwLockWriteGuardArc<Option<Namespace>>>,
+    metadata: MetaStore,
+    name: NamespaceName,
+}
+
+impl Reservation {
+    /// Fails with `NamespaceAlreadyExist` if the namespace is loaded or known to the metastore.
+    ///
+    /// Must be called before `MetaStore::handle(name)`: `handle` inserts the name into the
+    /// in-memory config map that `exists` reads, so the name becomes visible only while it is
+    /// already locked here.
+    async fn acquire(store: &NamespaceStore, name: NamespaceName) -> crate::Result<Self> {
+        let entry = store
+            .inner
+            .store
+            .get_with(name.clone(), async { Default::default() })
+            .await;
+        let guard = entry.write_arc().await;
+        if guard.is_some() || store.inner.metadata.exists(&name).await {
+            return Err(Error::NamespaceAlreadyExist(name.to_string()));
+        }
+        Ok(Self {
+            guard: Some(guard),
+            metadata: store.inner.metadata.clone(),
+            name,
+        })
+    }
+
+    /// Install the finished namespace and release the lock.
+    fn publish(mut self, ns: Namespace) {
+        self.guard
+            .take()
+            .expect("a reservation is published at most once")
+            .replace(ns);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        tracing::warn!(
+            namespace = %self.name,
+            "namespace creation did not complete; discarding it"
+        );
+        metrics::increment_counter!("libsql_server_namespace_create_aborted");
+        let metadata = self.metadata.clone();
+        let name = self.name.clone();
+        let cleanup = move || {
+            // Removes the in-memory config and the metastore row, if any was written.
+            if let Err(e) = metadata.remove(name.clone()) {
+                tracing::error!(namespace = %name, "failed to discard namespace config: {e}");
+            }
+            // Release the lock only once the name no longer exists.
+            drop(guard);
+        };
+        // `MetaStore::remove` takes blocking locks, and we may be running inside a future that
+        // is being dropped: hand the work to the blocking pool instead of blocking in place.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn_blocking(cleanup);
+            }
+            Err(_) => cleanup(),
+        }
+    }
+}
 
 /// Stores and manage a set of namespaces.
 pub struct NamespaceStore {
@@ -225,15 +305,7 @@ impl NamespaceStore {
             return Err(crate::error::Error::NamespaceDoesntExist(from.to_string()));
         }
 
-        let to_entry = self
-            .inner
-            .store
-            .get_with(to.clone(), async { Default::default() })
-            .await;
-        let mut to_lock = to_entry.write().await;
-        if to_lock.is_some() {
-            return Err(crate::error::Error::NamespaceAlreadyExist(to.to_string()));
-        }
+        let reservation = Reservation::acquire(self, to.clone()).await?;
 
         // FIXME: we could potentially delete the namespace while trying to fork it
         if !self.inner.metadata.exists(&from).await {
@@ -249,33 +321,8 @@ impl NamespaceStore {
             return Err(crate::error::Error::NamespaceDoesntExist(from.to_string()));
         };
 
-        struct Bomb {
-            store: MetaStore,
-            ns: NamespaceName,
-            should_delete: bool,
-        }
-
-        impl Drop for Bomb {
-            fn drop(&mut self) {
-                if self.should_delete {
-                    // we need to block in place because the inner connection may blocking, or
-                    // unsing tokio's blocking methods (bottomless), which would cause a panic.
-                    if let Err(e) =
-                        tokio::task::block_in_place(|| self.store.remove(self.ns.clone()))
-                    {
-                        tracing::error!("failed to clean handle while forking: {e}");
-                    }
-                }
-            }
-        }
-
-        let mut bomb = Bomb {
-            store: self.inner.metadata.clone(),
-            ns: to.clone(),
-            should_delete: true,
-        };
-
         let handle = self.inner.metadata.handle(to.clone()).await;
+        // In memory only: the fork reads it; nothing is persisted until it succeeded.
         handle
             .store_and_maybe_flush(Some(to_config.into()), false)
             .await?;
@@ -291,10 +338,8 @@ impl NamespaceStore {
             )
             .await?;
 
-        to_lock.replace(to_ns);
         handle.flush().await?;
-        // defuse
-        bomb.should_delete = false;
+        reservation.publish(to_ns);
 
         Ok(())
     }
@@ -394,6 +439,11 @@ impl NamespaceStore {
             let ns = self
                 .make_namespace(namespace, db_config, restore_option)
                 .await?;
+            // A namespace opened from the metastore is complete by definition; this only removes
+            // a marker left by a crash between persisting the config and removing it.
+            if let Err(e) = ns.mark_complete().await {
+                tracing::warn!(namespace = %namespace, "could not remove creation marker: {e}");
+            }
             Ok(Some(ns))
         };
 
@@ -430,24 +480,46 @@ impl NamespaceStore {
                 .await;
         };
 
-        // With namespaces disabled, the default namespace can be auto-created,
-        // otherwise it's an error.
+        // With namespaces disabled, the default namespace always exists and `create` is an
+        // idempotent config upsert of it. Creating *from a dump* is not: the dump must never be
+        // skipped because the namespace happens to be loaded already, so that case takes the
+        // reserving path below like any other creation.
         // FIXME: move the default namespace check out of this function.
-        if self.inner.allow_lazy_creation || namespace == NamespaceName::default() {
+        if (self.inner.allow_lazy_creation || namespace == NamespaceName::default())
+            && matches!(restore_option, RestoreOption::Latest)
+        {
             tracing::trace!("auto-creating the namespace");
-        } else if self.inner.metadata.exists(&namespace).await {
-            return Err(Error::NamespaceAlreadyExist(namespace.to_string()));
+            let handle = self.inner.metadata.handle(namespace.clone()).await;
+            handle.store(Arc::new(db_config)).await?;
+            self.load_namespace(&namespace, handle, restore_option)
+                .await?;
+            return Ok(());
         }
 
-        let db_config = Arc::new(db_config);
+        // Nothing below is visible or durable until the namespace is complete:
+        // - the reservation locks the name; dropping it unpublished undoes the in-memory config;
+        // - the configurator removes a brand-new directory if setup fails or is cancelled;
+        // - the metastore row is written last, so its presence implies a complete namespace.
+        let reservation = Reservation::acquire(self, namespace.clone()).await?;
         let handle = self.inner.metadata.handle(namespace.clone()).await;
-        tracing::debug!("storing db config");
-        handle.store(db_config).await?;
-        tracing::debug!("completed storing db config, loading namespace");
-        self.load_namespace(&namespace, handle, restore_option)
+        handle
+            .store_and_maybe_flush(Some(Arc::new(db_config)), false)
             .await?;
+        self.get_configurator(&handle.get())
+            .discard_incomplete(&namespace)
+            .await?;
+        tracing::debug!("setting up namespace");
+        let ns = self
+            .make_namespace(&namespace, handle.clone(), restore_option)
+            .await?;
+        tracing::debug!("storing db config");
+        handle.flush().await?;
+        if let Err(e) = ns.mark_complete().await {
+            tracing::warn!(namespace = %namespace, "could not remove creation marker: {e}");
+        }
+        reservation.publish(ns);
 
-        tracing::debug!("completed loading namespace");
+        tracing::debug!("completed creating namespace");
 
         Ok(())
     }

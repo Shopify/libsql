@@ -57,6 +57,12 @@ pub enum NamespaceBottomlessDbIdInit {
 }
 
 /// A namespace isolates the resources pertaining to a database of type T
+/// Marker file present in a namespace directory from its creation until the namespace's config
+/// has been persisted to the metastore. A directory that still carries it belongs to a creation
+/// that did not complete (the process crashed, or cleanup failed); the next attempt to create a
+/// namespace with that name discards it. See `docs/ATOMIC_NAMESPACE_CREATE_DESIGN.md`.
+pub(crate) const INCOMPLETE_MARKER: &str = ".incomplete";
+
 #[derive(Debug)]
 pub struct Namespace {
     pub db: Database,
@@ -71,6 +77,15 @@ pub struct Namespace {
 impl Namespace {
     pub(crate) fn name(&self) -> &NamespaceName {
         &self.name
+    }
+
+    /// Remove the [`INCOMPLETE_MARKER`]: the namespace is now persisted in the metastore (or was
+    /// opened from it, which implies the same).
+    pub(crate) async fn mark_complete(&self) -> std::io::Result<()> {
+        match tokio::fs::remove_file(self.path.join(INCOMPLETE_MARKER)).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     async fn destroy(mut self) -> anyhow::Result<()> {

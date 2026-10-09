@@ -17,11 +17,11 @@ use crate::common::http::{Client, Response};
 use crate::common::net::{TurmoilAcceptor, TurmoilConnector};
 use crate::namespaces::{make_primary, make_primary_with_db_config};
 
-const BUFFERED: Option<&str> = Some("buffered");
-const STREAMING: Option<&str> = Some("streaming");
+pub(super) const BUFFERED: Option<&str> = Some("buffered");
+pub(super) const STREAMING: Option<&str> = Some("streaming");
 
 /// `POST /v1/namespaces/:ns/create` with `dump_url` and, optionally, `dump_importer`.
-async fn create_from_dump(
+pub(super) async fn create_from_dump(
     client: &Client,
     ns: &str,
     dump_url: &str,
@@ -39,17 +39,17 @@ async fn create_from_dump(
         .await
 }
 
-fn file_url(path: &Path) -> String {
+pub(super) fn file_url(path: &Path) -> String {
     format!("file:{}", path.display())
 }
 
-fn sim() -> Sim<'static> {
+pub(super) fn sim() -> Sim<'static> {
     Builder::new()
         .simulation_duration(Duration::from_secs(1000))
         .build()
 }
 
-async fn count_rows(ns: &str, table: &str) -> anyhow::Result<i64> {
+pub(super) async fn count_rows(ns: &str, table: &str) -> anyhow::Result<i64> {
     let db = Database::open_remote_with_connector(
         &format!("http://{ns}.primary:8080"),
         "",
@@ -69,7 +69,7 @@ fn make_dump_store(sim: &mut Sim, chunks: Vec<Result<Bytes, std::io::Error>>) {
 }
 
 /// Like [`make_dump_store`], pausing `pause` (simulated time) before each chunk.
-fn make_dump_store_paced(
+pub(super) fn make_dump_store_paced(
     sim: &mut Sim,
     chunks: Vec<Result<Bytes, std::io::Error>>,
     pause: Duration,
@@ -124,7 +124,39 @@ fn make_dump_store_chunked(sim: &mut Sim, dump: &'static str, chunk_size: usize)
     );
 }
 
-const SIMPLE_DUMP: &str = r#"
+/// Serve `dump` from `dump-store:8080` in 64-byte chunks, 100ms (simulated) apart: with
+/// turmoil's up-to-100ms message latency this keeps a creation in flight for a couple of
+/// seconds, long enough for other requests to be issued while it runs.
+pub(super) fn make_slow_dump_store(sim: &mut Sim, dump: &'static str) {
+    make_dump_store_paced(
+        sim,
+        dump.as_bytes()
+            .chunks(64)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect(),
+        Duration::from_millis(100),
+    );
+}
+
+/// Ten rows, importable by both importers (no "attach" anywhere), ~1.1 KB so that
+/// [`make_slow_dump_store`] delivers it in ~18 chunks.
+pub(super) const SLOW_DUMP: &str = r#"PRAGMA foreign_keys=OFF;
+BEGIN TRANSACTION;
+CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, note TEXT);
+INSERT INTO test VALUES (1, 'one', 'the first row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (2, 'two', 'the second row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (3, 'three', 'the third row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (4, 'four', 'the fourth row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (5, 'five', 'the fifth row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (6, 'six', 'the sixth row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (7, 'seven', 'the seventh row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (8, 'eight', 'the eighth row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (9, 'nine', 'the ninth row of a dump that takes a while to arrive');
+INSERT INTO test VALUES (10, 'ten', 'the tenth row of a dump that takes a while to arrive');
+COMMIT;
+"#;
+
+pub(super) const SIMPLE_DUMP: &str = r#"
         PRAGMA foreign_keys=OFF;
     BEGIN TRANSACTION;
     CREATE TABLE test (x);
@@ -745,7 +777,7 @@ fn load_dump_with_nested_case_streaming() {
 
 /// Exercises framing across arbitrary HTTP body chunk boundaries, including inside multibyte
 /// characters, string literals with semicolons, comments and a trigger body.
-const CHUNKY_DUMP: &str = r#"PRAGMA foreign_keys=OFF;
+pub(super) const CHUNKY_DUMP: &str = r#"PRAGMA foreign_keys=OFF;
 BEGIN TRANSACTION;
 -- a comment; with a semicolon
 CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);
@@ -1437,34 +1469,26 @@ fn streaming_failure_under_backpressure() {
     sim.run().unwrap();
 }
 
-/// The admin request is abandoned while the import is still streaming in. The executor thread
-/// must notice the closed channel, roll back and release the connection, so the server stays
-/// healthy and the namespace can be used afterwards instead of being wedged by a half-open
-/// transaction.
-#[test]
-fn streaming_cancelled_request_rolls_back() {
+/// The admin request is abandoned while the dump is still being transferred. The namespace
+/// must not survive in any form: the importer rolls back and releases its connection, the
+/// configurator removes the directory and the store never persists the config, so the name is
+/// immediately reusable (see `docs/ATOMIC_NAMESPACE_CREATE_DESIGN.md`).
+fn cancelled_create_leaves_no_trace_with(importer: Option<&'static str>) {
     let mut sim = sim();
     let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
     make_primary(&mut sim, tmp.path().to_path_buf());
 
-    // Deliver the dump slowly (64-byte chunks, 50ms apart) so the request is still in flight
-    // when it is abandoned. Few, large chunks also keep the number of unread segments below
-    // turmoil's simulated socket buffer once nobody reads them anymore.
-    make_dump_store_paced(
-        &mut sim,
-        CHUNKY_DUMP
-            .as_bytes()
-            .chunks(64)
-            .map(|c| Ok(Bytes::copy_from_slice(c)))
-            .collect(),
-        Duration::from_millis(50),
-    );
+    // Deliver the dump slowly so the request is still in flight when it is abandoned. Few,
+    // large chunks also keep the number of unread segments below turmoil's simulated socket
+    // buffer once nobody reads them anymore.
+    make_slow_dump_store(&mut sim, SLOW_DUMP);
 
     sim.client("client", async move {
         let client = Client::new();
         let aborted = tokio::time::timeout(
-            Duration::from_millis(100),
-            create_from_dump(&client, "foo", "http://dump-store:8080/", STREAMING),
+            Duration::from_millis(500),
+            create_from_dump(&client, "foo", "http://dump-store:8080/", importer),
         )
         .await;
         assert!(aborted.is_err(), "the request should still be in flight");
@@ -1473,32 +1497,31 @@ fn streaming_cancelled_request_rolls_back() {
         tokio::time::sleep(Duration::from_secs(2)).await;
         std::thread::sleep(Duration::from_millis(300));
 
-        // Depending on where the request was cut, the namespace was registered (pre-existing
-        // behavior: the metastore row survives a failed create) or not. Either way it must be
-        // usable now: no lingering write transaction, no partial data.
+        // The namespace does not exist, for the admin API, for users, and on disk.
         let resp = client
-            .post_raw("http://primary:9090/v1/namespaces/foo/create", json!({}))
+            .get("http://primary:9090/v1/namespaces/foo/config")
             .await?;
-        assert!(
-            resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST,
-            "unexpected status {}",
-            resp.status()
-        );
-        assert!(count_rows("foo", "test").await.is_err());
-        let db =
-            Database::open_remote_with_connector("http://foo.primary:8080", "", TurmoilConnector)?;
-        let conn = db.connect()?;
-        conn.execute("create table after_cancel (x)", ()).await?;
-        conn.execute("insert into after_cancel values (1)", ())
-            .await?;
-        assert_eq!(count_rows("foo", "after_cancel").await?, 1);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let err = count_rows("foo", "test").await.unwrap_err().to_string();
+        assert!(err.contains("doesn't exist"), "unexpected error: {err}");
+        super::lifecycle::wait_until_gone(&tmp_path.join("dbs").join("foo"));
 
-        // and other namespaces are unaffected
-        let resp = create_from_dump(&client, "bar", "http://dump-store:8080/", STREAMING).await?;
+        // ... so the same name can be created again, from the same dump.
+        let resp = create_from_dump(&client, "foo", "http://dump-store:8080/", importer).await?;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(count_rows("bar", "test").await?, 3);
+        assert_eq!(count_rows("foo", "test").await?, 10);
         Ok(())
     });
 
     sim.run().unwrap();
+}
+
+#[test]
+fn cancelled_create_leaves_no_trace() {
+    cancelled_create_leaves_no_trace_with(BUFFERED);
+}
+
+#[test]
+fn cancelled_create_leaves_no_trace_streaming() {
+    cancelled_create_leaves_no_trace_with(STREAMING);
 }

@@ -13,7 +13,9 @@ use crate::namespace::{
 };
 use crate::schema::SchedulerHandle;
 
-use super::helpers::{cleanup_primary, make_primary_connection_maker};
+use super::helpers::{
+    cleanup_primary, discard_incomplete, make_primary_connection_maker, FreshDir,
+};
 use super::{BaseNamespaceConfig, ConfigureNamespace, PrimaryConfig};
 
 pub struct SchemaConfigurator {
@@ -52,9 +54,10 @@ impl ConfigureNamespace for SchemaConfigurator {
     ) -> std::pin::Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
         Box::pin(async move {
             let mut join_set = JoinSet::new();
-            let db_path = self.base.base_path.join("dbs").join(name.as_str());
-
-            tokio::fs::create_dir_all(&db_path).await?;
+            let db_path: Arc<std::path::Path> =
+                self.base.base_path.join("dbs").join(name.as_str()).into();
+            // A brand-new directory is removed again if setup fails or this future is dropped.
+            let fresh = FreshDir::begin(&db_path).await?;
 
             let (connection_maker, wal_manager, stats) = make_primary_connection_maker(
                 &self.primary_config,
@@ -71,6 +74,10 @@ impl ConfigureNamespace for SchemaConfigurator {
                 self.base.encryption_config.clone(),
             )
             .await?;
+
+            if let Some(fresh) = fresh {
+                fresh.keep();
+            }
 
             Ok(Namespace {
                 db: Database::Schema(SchemaDatabase::new(
@@ -89,9 +96,16 @@ impl ConfigureNamespace for SchemaConfigurator {
                 tasks: join_set,
                 stats,
                 db_config_store: db_config.clone(),
-                path: db_path.into(),
+                path: db_path,
             })
         })
+    }
+
+    fn discard_incomplete<'a>(
+        &'a self,
+        namespace: &'a NamespaceName,
+    ) -> std::pin::Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>> {
+        Box::pin(discard_incomplete(&self.base, namespace))
     }
 
     fn cleanup<'a>(

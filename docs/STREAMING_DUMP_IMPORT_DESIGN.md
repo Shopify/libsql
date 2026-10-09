@@ -585,12 +585,12 @@ Metrics (`metrics` 0.21 macros with labels):
 
 ## 13. Pre-existing issues this design does not fix (state them in the PR)
 
-1. `NamespaceStore::create` stores the namespace config in the metastore **before** loading. On import failure the directory is removed (`PrimaryConfigurator::setup`) but the metastore row stays, so a later request to the namespace lazily creates an **empty** database. Existing tests rely on this (`select … from test` errors because the table is missing, not because the namespace is missing).
-2. If the Admin HTTP request is cancelled mid-import, `setup`'s cleanup does not run (the future is dropped). The streaming executor still rolls back SQLite state, but the directory and `.sentinel` remain.
-3. No server-side timeout exists for dump imports; the Admin HTTP request stays open for the whole import. Clients must not time out, or must tolerate (2).
+1. ~~`NamespaceStore::create` stores the namespace config in the metastore **before** loading. On import failure the directory is removed (`PrimaryConfigurator::setup`) but the metastore row stays, so a later request to the namespace lazily creates an **empty** database.~~ **Fixed** by the stacked change described in `docs/ATOMIC_NAMESPACE_CREATE_DESIGN.md`: the config is persisted only after setup succeeds, and a failed or cancelled creation leaves nothing behind.
+2. ~~If the Admin HTTP request is cancelled mid-import, `setup`'s cleanup does not run (the future is dropped). The streaming executor still rolls back SQLite state, but the directory and `.sentinel` remain.~~ **Fixed**, same change (drop guards for the directory and the reservation of the name).
+3. No server-side timeout exists for dump imports; the Admin HTTP request stays open for the whole import. Clients must not time out; if they do, the creation is discarded and can be retried (see the creation contract in `docs/ADMIN_API.md`).
 4. Bottomless, if enabled, has its own frame buffering/backpressure outside this design.
 
-These are tracked by the DB Mover quarantine/fence work (Retail #35846/#35848).
+(3) and (4) are tracked by the DB Mover quarantine/fence work (Retail #35846/#35848).
 
 ---
 

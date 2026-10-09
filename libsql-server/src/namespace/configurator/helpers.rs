@@ -20,13 +20,100 @@ use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::replication_wal::{make_replication_wal_wrapper, ReplicationWalWrapper};
 use crate::namespace::{
     NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName, ResolveNamespacePathFn,
-    RestoreOption,
+    RestoreOption, INCOMPLETE_MARKER,
 };
 use crate::replication::ReplicationLogger;
 use crate::stats::Stats;
 use crate::{StatsSender, BLOCKING_RT, DB_CREATE_TIMEOUT, DEFAULT_AUTO_CHECKPOINT};
 
 use super::{BaseNamespaceConfig, PrimaryConfig};
+
+/// The directory of a namespace that does not exist yet.
+///
+/// Created (with the [`INCOMPLETE_MARKER`]) by [`begin`](Self::begin) and removed again when the
+/// guard is dropped before [`keep`](Self::keep) is called: on error, or when the request that was
+/// creating the namespace is cancelled and its future dropped. The marker itself is removed by
+/// the namespace store once the namespace's config is persisted.
+pub(super) struct FreshDir {
+    path: Option<Arc<Path>>,
+}
+
+impl FreshDir {
+    /// Returns `None` when a namespace directory already exists at `db_path`.
+    pub(super) async fn begin(db_path: &Arc<Path>) -> crate::Result<Option<Self>> {
+        if db_path.try_exists()? {
+            return Ok(None);
+        }
+        tokio::fs::create_dir_all(db_path).await?;
+        tokio::fs::File::create(db_path.join(INCOMPLETE_MARKER)).await?;
+        Ok(Some(Self {
+            path: Some(db_path.clone()),
+        }))
+    }
+
+    /// The namespace was set up; the directory stays.
+    pub(super) fn keep(mut self) {
+        self.path.take();
+    }
+}
+
+impl Drop for FreshDir {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        tracing::warn!(
+            path = %path.display(),
+            "namespace creation did not complete; removing its directory"
+        );
+        // Dropping may happen while the creating future is being torn down (cancellation), so
+        // the removal is handed to the runtime rather than awaited here. Should it fail, the
+        // directory still carries the marker and the next creation of this namespace discards it.
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    if let Err(e) = tokio::fs::remove_dir_all(&*path).await {
+                        log_remove_error(&path, e);
+                    }
+                });
+            }
+            Err(_) => {
+                if let Err(e) = std::fs::remove_dir_all(&*path) {
+                    log_remove_error(&path, e);
+                }
+            }
+        }
+    }
+}
+
+fn log_remove_error(path: &Path, e: std::io::Error) {
+    if e.kind() != std::io::ErrorKind::NotFound {
+        tracing::error!(
+            path = %path.display(),
+            "failed to remove unfinished namespace directory: {e}"
+        );
+    }
+}
+
+/// Remove `dbs/<namespace>` if it was left behind by a creation that never completed, i.e. if it
+/// still carries the [`INCOMPLETE_MARKER`]. Directories without the marker are left alone.
+pub(super) async fn discard_incomplete(
+    base: &BaseNamespaceConfig,
+    namespace: &NamespaceName,
+) -> crate::Result<()> {
+    let db_path = base.base_path.join("dbs").join(namespace.as_str());
+    if !db_path.join(INCOMPLETE_MARKER).try_exists()? {
+        return Ok(());
+    }
+    tracing::warn!(
+        namespace = %namespace,
+        path = %db_path.display(),
+        "discarding namespace directory left by an interrupted creation"
+    );
+    metrics::increment_counter!("libsql_server_namespace_create_discarded_incomplete");
+    tokio::fs::remove_dir_all(&db_path).await?;
+    Ok(())
+}
 
 #[tracing::instrument(skip_all)]
 pub(super) async fn make_primary_connection_maker(
@@ -404,4 +491,102 @@ pub(super) async fn cleanup_primary(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    async fn settle() {
+        // the removal is spawned; give it a chance to run
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_dir_is_removed_unless_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = tmp.path().join("dbs").join("ns").into();
+
+        let fresh = FreshDir::begin(&path).await.unwrap().expect("fresh");
+        assert!(path.join(INCOMPLETE_MARKER).exists());
+        drop(fresh);
+        settle().await;
+        assert!(!path.exists(), "dropped before keep: removed");
+
+        let fresh = FreshDir::begin(&path).await.unwrap().expect("fresh again");
+        fresh.keep();
+        settle().await;
+        assert!(
+            path.join(INCOMPLETE_MARKER).exists(),
+            "kept: stays, marker included"
+        );
+
+        assert!(
+            FreshDir::begin(&path).await.unwrap().is_none(),
+            "an existing directory is not fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_dir_is_removed_when_its_future_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path: Arc<Path> = tmp.path().join("dbs").join("ns").into();
+
+        let setup = {
+            let path = path.clone();
+            async move {
+                let fresh = FreshDir::begin(&path).await.unwrap();
+                std::future::pending::<()>().await; // "the import"
+                fresh.map(FreshDir::keep);
+            }
+        };
+        let aborted = tokio::time::timeout(Duration::from_millis(50), setup).await;
+        assert!(aborted.is_err());
+        settle().await;
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn discard_incomplete_only_removes_marked_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = BaseNamespaceConfig {
+            base_path: tmp.path().into(),
+            extensions: Arc::new([]),
+            stats_sender: tokio::sync::mpsc::channel(1).0,
+            max_response_size: 0,
+            max_total_response_size: 0,
+            max_concurrent_connections: Arc::new(tokio::sync::Semaphore::new(1)),
+            max_concurrent_requests: 0,
+            encryption_config: None,
+            connection_creation_timeout: None,
+            disable_intelligent_throttling: false,
+            dump_import: Default::default(),
+        };
+        let marked = tmp.path().join("dbs").join("marked");
+        let unmarked = tmp.path().join("dbs").join("unmarked");
+        for dir in [&marked, &unmarked] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("data"), b"junk").unwrap();
+        }
+        std::fs::write(marked.join(INCOMPLETE_MARKER), b"").unwrap();
+
+        discard_incomplete(&base, &NamespaceName::from_string("marked".into()).unwrap())
+            .await
+            .unwrap();
+        discard_incomplete(
+            &base,
+            &NamespaceName::from_string("unmarked".into()).unwrap(),
+        )
+        .await
+        .unwrap();
+        discard_incomplete(&base, &NamespaceName::from_string("absent".into()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(!marked.exists());
+        assert!(unmarked.join("data").exists());
+    }
 }
