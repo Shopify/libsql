@@ -153,6 +153,44 @@ impl NamespaceStore {
         Ok(())
     }
 
+    /// Run `PRAGMA quick_check` (or `integrity_check` if `full=true`) on
+    /// the namespace's live DB and return the result string. Takes only
+    /// a read lock on the namespace; other operations (including other
+    /// namespaces on this pod) are unaffected.
+    ///
+    /// A healthy DB returns `"ok"`. Any other text is diagnostic output
+    /// from SQLite. Use this to classify Mode A (wallog/snapshot
+    /// corruption, live DB OK) vs Mode B (live DB corruption) before
+    /// deciding on a recovery procedure.
+    pub async fn integrity_check(
+        &self,
+        namespace: NamespaceName,
+        full: bool,
+    ) -> crate::Result<String> {
+        if !self.inner.metadata.exists(&namespace).await {
+            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+        }
+        // Force-load the namespace so we can run a query against it.
+        let db_config = self.inner.metadata.handle(namespace.clone()).await;
+        let _ = self
+            .load_namespace(&namespace, db_config, RestoreOption::Latest)
+            .await?;
+
+        let entry = self
+            .inner
+            .store
+            .get_with(namespace.clone(), async { Default::default() })
+            .await;
+        let lock = entry.read().await;
+        if let Some(ns) = &*lock {
+            ns.integrity_check(full)
+                .await
+                .map_err(|e| Error::Internal(format!("integrity_check: {e}")))
+        } else {
+            Err(Error::NamespaceDoesntExist(namespace.to_string()))
+        }
+    }
+
     pub async fn reset(
         &self,
         namespace: NamespaceName,
@@ -189,6 +227,200 @@ impl NamespaceStore {
         lock.replace(ns);
 
         Ok(())
+    }
+
+    /// Rebuild the replication log for a namespace from its live DB file,
+    /// without wiping the DB or the metastore config.
+    ///
+    /// Use this when the replication artifacts (wallog, snapshots/,
+    /// to_compact/) are corrupt but the live `data` file (and metastore
+    /// config) are intact.
+    ///
+    /// Semantics:
+    /// 1. Acquire the single-namespace write lock (other namespaces on this
+    ///    pod are unaffected).
+    /// 2. Checkpoint the current WAL into `data` so nothing in-flight is
+    ///    lost.
+    /// 3. Destroy the in-memory namespace (closes connections, stops tasks).
+    ///    This does NOT touch any files on disk.
+    /// 4. Remove only `wallog`, `snapshots/`, `to_compact/`.
+    /// 5. Create `.sentinel`.
+    /// 6. Re-initialize the namespace via `make_namespace()`. The
+    ///    `PrimaryConfigurator` sees `.sentinel` → opens
+    ///    `ReplicationLogger` with `dirty=true` → `recover()` rebuilds the
+    ///    wallog page-by-page from the restored `data` file, mints a fresh
+    ///    `log_id`, and wipes `snapshots/` + `to_compact/`.
+    ///
+    /// Effects for clients:
+    /// - connected embedded replicas see `LogIncompatible` on next sync
+    ///   (new log_id) and self-reset (wipe local + re-bootstrap).
+    /// - fresh bootstrap succeeds against the rebuilt history.
+    /// - live DB data is fully preserved.
+    /// - metastore config (jwt_key, block_writes, bottomless_db_id, etc.)
+    ///   is fully preserved.
+    ///
+    /// Brief unavailability window: from the moment we take the write lock
+    /// until `make_namespace` returns. Other namespaces on the pod are
+    /// completely unaffected.
+    pub async fn reset_replication(&self, namespace: NamespaceName) -> crate::Result<u64> {
+        if self.inner.has_shutdown.load(Ordering::Relaxed) {
+            return Err(Error::NamespaceStoreShutdown);
+        }
+
+        // reset-replication rebuilds the primary's replication log from
+        // its live data file. On a replica node the `.sentinel` sentinel
+        // is not consumed by `ReplicaConfigurator`, so the re-init path
+        // does nothing useful and we'd only destroy wallog/snapshots that
+        // the replica still needs. Reject the call with 400 NotAPrimary
+        // instead of producing confusing behavior.
+        if !matches!(self.inner.db_kind, DatabaseKind::Primary) {
+            return Err(Error::NotAPrimary);
+        }
+
+        if !self.inner.metadata.exists(&namespace).await {
+            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+        }
+
+        let start = Instant::now();
+        tracing::info!("reset_replication: starting for namespace {namespace}");
+
+        // Load the namespace first so we can resolve its on-disk path
+        // cleanly. This is effectively a no-op if it's already hot.
+        let db_config = self.inner.metadata.handle(namespace.clone()).await;
+        let _ = self
+            .load_namespace(&namespace, db_config.clone(), RestoreOption::Latest)
+            .await?;
+
+        let entry = self
+            .inner
+            .store
+            .get_with(namespace.clone(), async { Default::default() })
+            .await;
+        let mut lock = entry.write().await;
+
+        let ns_path: Arc<std::path::Path> = match lock.as_ref() {
+            Some(ns) => ns.path().clone(),
+            None => {
+                return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+            }
+        };
+
+        // (1) Checkpoint before we tear down in-memory state so the data
+        //     file has everything the WAL was holding.
+        //
+        //     If checkpoint fails with a `DatabaseCorrupt` / `malformed`
+        //     error, the live data file itself is corrupt. Rebuilding the
+        //     wallog from a corrupt data file would just propagate the
+        //     corruption — so bail out BEFORE we destroy the in-memory
+        //     namespace. The caller should fall back to a restore-from-
+        //     backup path (Mode B), not this endpoint.
+        if let Some(ns) = lock.as_ref() {
+            match ns.checkpoint().await {
+                Ok(()) => {}
+                Err(e) => {
+                    // TODO(follow-up): classify corruption via a typed
+                    // `rusqlite::ErrorCode` (DatabaseCorrupt / NotADatabase)
+                    // or a dedicated `Error::DatabaseCorrupt` variant. See
+                    // <https://github.com/tursodatabase/libsql/pull/2230>
+                    // review thread for the design. The current
+                    // `checkpoint()` path boxes through `anyhow::Error`
+                    // which erases the source type, so we match the
+                    // rendered message for now. False-positive risk here
+                    // is low: all substrings below come from SQLite's own
+                    // error text for genuine live-DB corruption.
+                    let msg = e.to_string();
+                    let is_live_db_corrupt = msg.contains("malformed")
+                        || msg.contains("DatabaseCorrupt")
+                        || msg.contains("database disk image")
+                        || msg.contains("file is not a database");
+                    if is_live_db_corrupt {
+                        return Err(Error::Internal(format!(
+                            "reset_replication: live data file appears corrupt \
+                             (checkpoint failed: {e}); refusing to rebuild \
+                             replication log from corrupt data. Use a \
+                             restore-from-backup procedure instead."
+                        )));
+                    }
+                    tracing::warn!(
+                        "reset_replication: checkpoint failed: {e}; proceeding anyway"
+                    );
+                }
+            }
+        }
+
+        // (2) Tear down in-memory namespace. Does not touch files.
+        if let Some(ns) = lock.take() {
+            if let Err(e) = ns.destroy().await {
+                // Best-effort: if we can't destroy cleanly, the next
+                // make_namespace will fail too, so surface the error now.
+                return Err(Error::Internal(format!(
+                    "reset_replication: destroy failed: {e}"
+                )));
+            }
+        }
+
+        // (3) Remove only replication artifacts. Keep `data` and
+        //     `data-wal`/`data-shm` + config.
+        for artifact in ["wallog"] {
+            let p = ns_path.join(artifact);
+            if let Err(e) = tokio::fs::remove_file(&p).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "reset_replication: remove_file {} failed: {e}",
+                        p.display()
+                    );
+                }
+            }
+        }
+        for artifact in ["snapshots", "to_compact"] {
+            let p = ns_path.join(artifact);
+            if let Err(e) = tokio::fs::remove_dir_all(&p).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "reset_replication: remove_dir_all {} failed: {e}",
+                        p.display()
+                    );
+                }
+            }
+        }
+
+        // (4) Drop any stale .sentinel left by prior shutdown, then mint a
+        //     fresh one so ReplicationLogger::open takes the dirty-recovery
+        //     path on the next init.
+        let sentinel = ns_path.join(".sentinel");
+        let _ = tokio::fs::remove_file(&sentinel).await;
+        // Ensure parent dir exists (it should, because data still lives
+        // there, but be defensive). Use async `try_exists` rather than the
+        // sync `Path::exists()` so we don't block the Tokio worker on a
+        // filesystem stat.
+        let parent_exists = tokio::fs::try_exists(&ns_path).await.unwrap_or(false);
+        if !parent_exists {
+            tokio::fs::create_dir_all(&ns_path).await.map_err(|e| {
+                Error::Internal(format!(
+                    "reset_replication: create_dir_all {} failed: {e}",
+                    ns_path.display()
+                ))
+            })?;
+        }
+        tokio::fs::File::create(&sentinel).await.map_err(|e| {
+            Error::Internal(format!(
+                "reset_replication: create .sentinel failed: {e}"
+            ))
+        })?;
+
+        // (5) Re-initialize the namespace. setup() sees .sentinel → opens
+        //     ReplicationLogger with dirty=true → recover() rebuilds the
+        //     wallog page-by-page from the intact `data` file.
+        let ns = self
+            .make_namespace(&namespace, db_config, RestoreOption::Latest)
+            .await?;
+        lock.replace(ns);
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            "reset_replication: rebuilt replication log for namespace {namespace} in {elapsed_ms}ms"
+        );
+        Ok(elapsed_ms)
     }
 
     // This is only called on replica
