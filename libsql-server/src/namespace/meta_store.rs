@@ -939,14 +939,21 @@ fn apply_fence_command(
     };
 
     let mut created_config = None;
+    let mut new_target_marker = None;
     if let Some(next) = &record {
         let previous = fence_store::stored_revision(&tx, ns)?;
         if let FenceCommand::CreateTargetQuarantined { config: target } = &request.command {
             // Section 10.1: the marker first, then the config row, the record and the receipt
             // in one transaction. A crash in between leaves a marker without rows, which only a
-            // replay of this command completes.
+            // replay of this command completes. A definite failure before the commit removes the
+            // marker of a new target again (`NewTargetMarker`).
             let logical = fence_store::target_database_config(target)?;
             fence_store::write_marker(&inner.dbs_path, next)?;
+            new_target_marker = Some(NewTargetMarker {
+                dbs_path: &inner.dbs_path,
+                namespace: ns,
+                armed: matches!(stored, StoredFence::None { .. }),
+            });
             fence_store::write_config_row(
                 &tx,
                 ns,
@@ -976,6 +983,10 @@ fn apply_fence_command(
         .or(stored.record())
         .map_or(request.operation_id, |r| r.operation_id);
     fence_store::prune_receipts(&tx, ns, owner, ctx.now_ms, inner.fence.receipt_retention)?;
+    // From here on the commit may happen even if it reports a failure: the marker stays.
+    if let Some(marker) = new_target_marker {
+        marker.keep();
+    }
     tx.commit()?;
     // The command established the fence from the durable state; whatever startup could not
     // recover about this name is settled.
@@ -995,6 +1006,39 @@ fn apply_fence_command(
         record: current,
         created_config,
     })
+}
+
+/// The marker `CreateTargetQuarantined` wrote for a target that had no fence state. If the command
+/// fails before its commit, the transaction rolls back and nothing but the marker would be left:
+/// the name would stay `UNKNOWN_UNAVAILABLE` until the same command is replayed, which a caller
+/// told of a definite failure has no reason to do. Dropping this removes the marker again. It is
+/// kept once the commit is attempted, because a commit that reports a failure may still have
+/// happened. A marker that was already there (a creation interrupted between its marker and its
+/// commit, which only a replay completes) is never removed: `armed` is false.
+struct NewTargetMarker<'a> {
+    dbs_path: &'a Path,
+    namespace: &'a NamespaceName,
+    armed: bool,
+}
+
+impl NewTargetMarker<'_> {
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NewTargetMarker<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(e) = fence_store::remove_marker(self.dbs_path, self.namespace) {
+            tracing::error!(
+                namespace = %self.namespace,
+                "failed to remove the marker of a target creation that failed: {e}"
+            );
+        }
+    }
 }
 
 /// Whether the marker has to be written after a commit: the record changed, or it had fallen
@@ -2315,6 +2359,74 @@ mod fence_tests {
                 },
             },
         )
+    }
+
+    /// A definite failure after the marker of a new target is written and before the commit
+    /// (here a statement of the transaction fails) removes the marker again: the name is absent,
+    /// not unavailable, and another command may create it. The marker of a creation that was
+    /// interrupted before, which only a replay completes, stays.
+    #[tokio::test]
+    async fn failed_target_creation_removes_its_new_marker() {
+        let dir = tempdir().unwrap();
+        let dbs = dir.path().join("dbs");
+        let store = open(dir.path(), true).await;
+        let conn = raw(dir.path()).await;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_fence_insert BEFORE INSERT ON namespace_fences \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+
+        let r = store
+            .apply_fence_command(create_target("tgt", 1), ctx(1_000))
+            .await;
+        assert!(matches!(r, Err(Error::RusqliteError(_))), "{r:?}");
+        assert!(fence_store::read_marker(&dbs, &"tgt".into())
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store.inspect_fence("tgt".into()).await.unwrap().fence,
+            StoredFence::None {
+                namespace_exists: false
+            }
+        ));
+
+        // A creation interrupted between its marker and its commit keeps its marker when its
+        // replay fails as well.
+        conn.execute_batch("DROP TRIGGER fail_fence_insert")
+            .unwrap();
+        store
+            .apply_fence_command(create_target("tgt2", 3), ctx(2_000))
+            .await
+            .unwrap();
+        for sql in [
+            "DELETE FROM namespace_fence_receipts WHERE namespace = 'tgt2'",
+            "DELETE FROM namespace_fences WHERE namespace = 'tgt2'",
+            "DELETE FROM namespace_configs WHERE namespace = 'tgt2'",
+        ] {
+            conn.execute(sql, ()).unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER fail_fence_insert BEFORE INSERT ON namespace_fences \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        let r = store
+            .apply_fence_command(create_target("tgt2", 3), ctx(3_000))
+            .await;
+        assert!(matches!(r, Err(Error::RusqliteError(_))), "{r:?}");
+        assert!(fence_store::read_marker(&dbs, &"tgt2".into())
+            .unwrap()
+            .is_some());
+
+        // With the failure gone, a new command creates the first name.
+        conn.execute_batch("DROP TRIGGER fail_fence_insert")
+            .unwrap();
+        let commit = store
+            .apply_fence_command(create_target("tgt", 2), ctx(4_000))
+            .await
+            .unwrap();
+        assert_eq!(commit.receipt.outcome, FenceOutcome::Applied);
     }
 
     #[tokio::test]
