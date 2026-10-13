@@ -717,10 +717,26 @@ fn process(msg: ChangeMsg, inner: Arc<MetaStoreInner>) {
 /// Forget `namespace` unconditionally: the row and schema links, if any were written, and the
 /// in-memory config. No consistency checks (unlike [`MetaStore::remove`]): this undoes a
 /// creation that did not complete, so nothing can depend on the namespace yet.
+///
+/// The one exception is fence state. A name that has any (a quarantined target, a fenced
+/// namespace, or state that cannot be established) was not created by the creation being undone,
+/// so nothing of it is removed: the fence's refusal is returned instead, checked inside the same
+/// transaction as the deletes (`docs/NAMESPACE_FENCE.md` section 13.5).
 fn discard(inner: &MetaStoreInner, namespace: &NamespaceName) -> Result<()> {
+    if let Some(e) = inner.recovery_denial(namespace) {
+        return Err(e.into());
+    }
     {
         let mut conn = inner.conn.blocking_lock();
         let tx = conn.transaction()?;
+        if inner.fence.tables {
+            let (stored, _) = fence_store::read_fence(&tx, &inner.dbs_path, namespace)
+                .map_err(fence_store_error)?;
+            if !matches!(stored, StoredFence::None { .. }) {
+                stored.permits(OperationClass::Lifecycle)?;
+                return Err(super::fence::target::name_in_use(namespace).into());
+            }
+        }
         tx.execute(
             "DELETE FROM shared_schema_links WHERE namespace = ?",
             [namespace.as_str()],

@@ -181,13 +181,27 @@ impl Reservation {
         Some(move || {
             // 1. The config: in memory and, if the commit happened but publishing didn't, the
             //    row. From here on lookups of the name are rejected before they reach the cache.
-            if let Err(e) = store.inner.metadata.discard_blocking(name.clone()) {
-                tracing::error!(namespace = %name, "failed to discard namespace config: {e}");
-            }
+            //    A name that has fence state is not ours: its config and directory stay.
+            let fenced = match store.inner.metadata.discard_blocking(name.clone()) {
+                Ok(()) => false,
+                Err(Error::NamespaceFence(e)) => {
+                    tracing::error!(
+                        namespace = %name,
+                        "not discarding the config or directory of a name with fence state: {e}"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(namespace = %name, "failed to discard namespace config: {e}");
+                    false
+                }
+            };
             // 2. The directory, if it is still marked incomplete (the configurator's own guard
             //    normally got it already; this covers forks and anything that guard missed).
-            if let Err(e) = store.get_configurator(&config).discard_incomplete(&name) {
-                tracing::error!(namespace = %name, "failed to discard namespace directory: {e}");
+            if !fenced {
+                if let Err(e) = store.get_configurator(&config).discard_incomplete(&name) {
+                    tracing::error!(namespace = %name, "failed to discard namespace directory: {e}");
+                }
             }
             // 3. Only now let anyone else at the name.
             unpin(&store.inner.in_flight, &name, &entry);
@@ -1607,6 +1621,58 @@ pub(crate) mod fence_tests {
             .await
             .unwrap();
         assert!(store.inner.metadata.exists(&name).await);
+    }
+
+    /// Undoing an unfinished creation never touches a name with fence state, which is not the
+    /// creation's: the config, fence record and directory of a quarantined target survive both
+    /// `discard` and an abandoned reservation of the same name (which also removes a directory
+    /// still marked incomplete).
+    #[tokio::test]
+    async fn abandoned_reservation_leaves_fenced_name_alone() {
+        use crate::namespace::fence::target::tests::{create_request, server};
+
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        let name = NamespaceName::from("ns");
+        store
+            .create_target_quarantined(create_request("ns", 1), server())
+            .await
+            .unwrap();
+        let dir = tmp.path().join("dbs").join("ns");
+        assert!(dir.exists());
+
+        let meta = store.inner.metadata.clone();
+        let discarded = {
+            let name = name.clone();
+            tokio::task::spawn_blocking(move || meta.discard_blocking(name))
+                .await
+                .unwrap()
+        };
+        match discarded {
+            Err(Error::NamespaceFence(e)) => {
+                assert_eq!(e.outcome(), FenceOutcome::MigrationTargetQuarantined, "{e}")
+            }
+            other => panic!("expected the fence to refuse, got {other:?}"),
+        }
+
+        // A reservation of the name that is abandoned, over a directory that also carries the
+        // incomplete marker (as if that creation had made it).
+        std::fs::File::create(dir.join(crate::namespace::incomplete::INCOMPLETE_MARKER)).unwrap();
+        let entry: NamespaceEntry = Default::default();
+        let reservation = Reservation {
+            guard: Some(entry.write_arc().await),
+            entry,
+            store: store.clone(),
+            name: name.clone(),
+            config: Arc::new(DatabaseConfig::default()),
+        };
+        reservation.abort().await;
+
+        assert!(store.inner.metadata.exists(&name).await);
+        assert!(dir.join(fence_store::MARKER_FILE_NAME).exists());
+        let gate = store.fence_controller(&name).gate();
+        assert_eq!(gate.state(), FenceState::TargetQuarantined);
+        assert_eq!(gate.revision(), 1);
     }
 
     #[tokio::test]
