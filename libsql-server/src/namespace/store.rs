@@ -1213,10 +1213,16 @@ impl NamespaceStore {
         maker.inner().make_capability_connection(capability).await
     }
 
-    /// Whether the server already knows `namespace`: its config is in memory, or the namespace
-    /// cache holds it (a loaded namespace, or a fork in flight, which holds its entry locked).
+    /// Whether the server already knows `namespace`: its config is in memory, a create, fork or
+    /// reset holds it reserved, or the namespace cache holds it (a loaded namespace, or a fork in
+    /// flight, which holds its entry locked). A reserved name is looked up in `in_flight` rather
+    /// than the cache: the cache may have evicted the reserved entry, and a target created over
+    /// a reservation would have its config row deleted when that reservation is undone.
     async fn name_in_use(&self, namespace: &NamespaceName) -> bool {
         if self.inner.metadata.exists(namespace).await {
+            return true;
+        }
+        if self.inner.in_flight.lock().contains_key(namespace) {
             return true;
         }
         match self.inner.store.get(namespace).await {
@@ -1484,6 +1490,46 @@ pub(crate) mod fence_tests {
             .get(&NamespaceName::from("lost"))
             .await
             .is_none());
+    }
+
+    /// A name reserved by a create, fork or reset in progress is refused as a migration target
+    /// even when its entry is no longer in the namespace cache.
+    #[tokio::test]
+    async fn target_refused_while_name_reserved() {
+        use crate::namespace::fence::target::tests::{create_request, server};
+
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        let name = NamespaceName::from("ns");
+        // What `Reservation::acquire` leaves before `create` puts the config in memory, with the
+        // cache entry already evicted.
+        store
+            .inner
+            .in_flight
+            .lock()
+            .insert(name.clone(), Default::default());
+        assert!(!store.inner.metadata.exists(&name).await);
+        assert!(store.inner.store.get(&name).await.is_none());
+
+        match store
+            .create_target_quarantined(create_request("ns", 1), server())
+            .await
+        {
+            Err(Error::NamespaceFence(e)) => {
+                assert_eq!(e.outcome(), FenceOutcome::FencePreconditionFailed);
+                assert_eq!(e.detail(), Some(FenceDetail::NamespaceExists));
+            }
+            other => panic!("expected the name to be in use, got {other:?}"),
+        }
+        assert!(!store.inner.metadata.exists(&name).await);
+
+        // Once the reservation is gone the same command creates the target.
+        store.inner.in_flight.lock().remove(&name);
+        store
+            .create_target_quarantined(create_request("ns", 1), server())
+            .await
+            .unwrap();
+        assert!(store.inner.metadata.exists(&name).await);
     }
 
     #[tokio::test]
