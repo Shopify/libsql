@@ -130,9 +130,13 @@ impl ForkTask {
         let dest_namespace = self.to_namespace.clone();
         match self.try_fork().await {
             Err(e) => {
-                let _ =
-                    tokio::fs::remove_dir_all(base_path.join("dbs").join(dest_namespace.as_str()))
-                        .await;
+                // Only what this fork put there (the renamed, marked temp dir); a directory that
+                // was already at the destination is not ours to remove.
+                if let Err(e) =
+                    crate::namespace::incomplete::discard_if_incomplete(&base_path, &dest_namespace)
+                {
+                    tracing::error!(namespace = %dest_namespace, "failed to discard fork directory: {e}");
+                }
                 Err(e)
             }
             Ok(ns) => Ok(ns),
@@ -145,6 +149,9 @@ impl ForkTask {
         let temp_dir = BLOCKING_RT
             .spawn_blocking(move || tempfile::tempdir_in(base_path))
             .await??;
+        // Marked incomplete until the store has persisted the namespace's config, so that a
+        // fork that does not complete is discarded like any other unfinished creation.
+        crate::namespace::incomplete::mark_incomplete(temp_dir.path())?;
         let db_path = temp_dir.path().join("data");
 
         if let Some(restore) = self.restore_to {

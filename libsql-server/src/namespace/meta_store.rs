@@ -30,12 +30,23 @@ use crate::{
 
 use super::NamespaceName;
 
-type ChangeMsg = (
-    NamespaceName,
-    Option<Arc<DatabaseConfig>>,
-    oneshot::Sender<Result<()>>,
-    bool, // flush
-);
+enum ChangeMsg {
+    /// Set the in-memory config of a namespace (`config: Some`) and/or persist its current
+    /// in-memory config (`flush`).
+    Update {
+        namespace: NamespaceName,
+        config: Option<Arc<DatabaseConfig>>,
+        ret: oneshot::Sender<Result<()>>,
+        flush: bool,
+    },
+    /// Forget a namespace whose creation did not complete: drop its in-memory config and
+    /// whatever was persisted for it, unconditionally. Goes through the same queue as updates
+    /// so that it is ordered after any update to the same namespace that is still queued.
+    Discard {
+        namespace: NamespaceName,
+        ret: oneshot::Sender<Result<()>>,
+    },
+}
 type MetaStoreWalManager = WalWrapper<Option<BottomlessWalWrapper>, Sqlite3WalManager>;
 pub type MetaStoreConnection =
     libsql_sys::Connection<WrappedWal<Option<BottomlessWalWrapper>, Sqlite3Wal>>;
@@ -223,6 +234,17 @@ impl MetaStoreInner {
                 if !entry.path().is_dir() {
                     continue;
                 }
+                if entry
+                    .path()
+                    .join(super::incomplete::INCOMPLETE_MARKER)
+                    .try_exists()?
+                {
+                    tracing::warn!(
+                        "skipping `{}`: left by an interrupted namespace creation",
+                        entry.path().display()
+                    );
+                    continue;
+                }
                 let config_path = entry.path().join("config.json");
                 let name =
                     NamespaceName::from_string(entry.file_name().to_str().unwrap().to_string())?;
@@ -306,7 +328,18 @@ impl MetaStoreInner {
 /// Handles config change updates by inserting them into the database and in-memory
 /// cache of configs.
 fn process(msg: ChangeMsg, inner: Arc<MetaStoreInner>) {
-    let (namespace, config, ret_chan, flush) = msg;
+    let (namespace, config, ret_chan, flush) = match msg {
+        ChangeMsg::Update {
+            namespace,
+            config,
+            ret,
+            flush,
+        } => (namespace, config, ret, flush),
+        ChangeMsg::Discard { namespace, ret } => {
+            let _ = ret.send(discard(&inner, &namespace));
+            return;
+        }
+    };
     if let Some(config) = config {
         let ret = if flush {
             try_process(&inner, &namespace, &config)
@@ -330,18 +363,43 @@ fn process(msg: ChangeMsg, inner: Arc<MetaStoreInner>) {
         let _ = ret_chan.send(ret);
     } else {
         let ret = if flush {
-            let mut configs = inner.configs.blocking_lock();
-            if let Some(config_watch) = configs.get_mut(&namespace) {
-                let config = config_watch.subscribe().borrow().clone();
-                try_process(&inner, &namespace, &config.config)
-            } else {
-                Ok(())
+            // Lock order: `remove` takes `conn` before `configs`; `try_process` takes `conn`,
+            // so `configs` must not be held across it.
+            let current = inner
+                .configs
+                .blocking_lock()
+                .get(&namespace)
+                .map(|config_watch| config_watch.borrow().config.clone());
+            match current {
+                Some(config) => try_process(&inner, &namespace, &config),
+                None => Ok(()),
             }
         } else {
             Ok(())
         };
         let _ = ret_chan.send(ret);
     }
+}
+
+/// Forget `namespace` unconditionally: the row and schema links, if any were written, and the
+/// in-memory config. No consistency checks (unlike [`MetaStore::remove`]): this undoes a
+/// creation that did not complete, so nothing can depend on the namespace yet.
+fn discard(inner: &MetaStoreInner, namespace: &NamespaceName) -> Result<()> {
+    {
+        let mut conn = inner.conn.blocking_lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM shared_schema_links WHERE namespace = ?",
+            [namespace.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM namespace_configs WHERE namespace = ?",
+            [namespace.as_str()],
+        )?;
+        tx.commit()?;
+    }
+    inner.configs.blocking_lock().remove(namespace);
+    Ok(())
 }
 
 fn try_process(
@@ -506,6 +564,31 @@ impl MetaStore {
             namespace,
             inner: HandleState::External(change_tx, rx),
         }
+    }
+
+    /// Handle of a namespace the store knows; `None` otherwise. Unlike [`handle`](Self::handle)
+    /// this never registers the namespace, so it is the lookup for anything that must not
+    /// bring a namespace into existence as a side effect.
+    pub async fn existing_handle(&self, namespace: NamespaceName) -> Option<MetaStoreHandle> {
+        let configs = self.inner.configs.lock().await;
+        let rx = configs.get(&namespace)?.subscribe();
+        Some(MetaStoreHandle {
+            namespace,
+            inner: HandleState::External(self.changes_tx.clone(), rx),
+        })
+    }
+
+    /// Forget a namespace whose creation did not complete (see [`ChangeMsg::Discard`]).
+    ///
+    /// Blocking: meant for the blocking pool (the cleanup runs where the creating future is
+    /// being dropped).
+    pub fn discard_blocking(&self, namespace: NamespaceName) -> Result<()> {
+        let (ret, rcv) = oneshot::channel();
+        self.changes_tx
+            .blocking_send(ChangeMsg::Discard { namespace, ret })
+            .map_err(|e| Error::MetaStoreUpdateFailure(e.into()))?;
+        rcv.blocking_recv()
+            .map_err(|e| Error::MetaStoreUpdateFailure(e.into()))?
     }
 
     pub fn remove(&self, namespace: NamespaceName) -> Result<Option<Arc<DatabaseConfig>>> {
@@ -708,7 +791,12 @@ impl MetaStoreHandle {
 
                 let (snd, rcv) = oneshot::channel();
                 changes_tx
-                    .send((self.namespace.clone(), new_config, snd, flush))
+                    .send(ChangeMsg::Update {
+                        namespace: self.namespace.clone(),
+                        config: new_config,
+                        ret: snd,
+                        flush,
+                    })
                     .await
                     .map_err(|e| Error::MetaStoreUpdateFailure(e.into()))?;
 

@@ -131,6 +131,16 @@ pub trait ConfigureNamespace {
         bottomless_db_id_init: NamespaceBottomlessDbIdInit,
     ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>>;
 
+    /// Discard whatever a creation of `namespace` that did not complete left on disk, so that
+    /// the name starts from nothing. Only called for a name that is neither loaded nor known to
+    /// the metastore; must leave anything that does not carry the
+    /// [`INCOMPLETE_MARKER`](super::incomplete::INCOMPLETE_MARKER) alone. Synchronous so that
+    /// it can run while a creating future is being dropped (see `NamespaceStore`).
+    fn discard_incomplete(&self, namespace: &NamespaceName) -> crate::Result<()> {
+        let _ = namespace;
+        Ok(())
+    }
+
     fn fork<'a>(
         &'a self,
         from_ns: &'a Namespace,
