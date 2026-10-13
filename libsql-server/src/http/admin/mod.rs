@@ -34,6 +34,55 @@ use crate::LIBSQL_PAGE_SIZE;
 pub mod fence;
 pub mod stats;
 
+/// Headers whose values are secrets: the admin key and the fence adoption key never reach the
+/// request log, whatever the log filter (which `POST /log-filter` lets an admin change).
+const REDACTED_HEADERS: [&str; 2] = ["authorization", fence::ADOPTION_KEY_HEADER];
+
+/// The request headers for the debug log, with the values of [`REDACTED_HEADERS`] replaced.
+struct RedactedHeaders<'a>(&'a hyper::HeaderMap);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(name, value)| {
+                let shown: &dyn std::fmt::Debug = if REDACTED_HEADERS.contains(&name.as_str()) {
+                    &"<redacted>"
+                } else {
+                    value
+                };
+                (name, shown)
+            }))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod redacted_headers_tests {
+    use super::*;
+
+    #[test]
+    fn secrets_are_redacted_from_the_request_log() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Basic c2VjcmV0LWFkbWluLWtleQ==".parse().unwrap(),
+        );
+        headers.insert(
+            fence::ADOPTION_KEY_HEADER,
+            "secret-adoption-key".parse().unwrap(),
+        );
+        headers.insert("x-request-id", "abc".parse().unwrap());
+        let logged = format!("{:?}", RedactedHeaders(&headers));
+        assert!(!logged.contains("c2VjcmV0LWFkbWluLWtleQ=="), "{logged}");
+        assert!(!logged.contains("secret-adoption-key"), "{logged}");
+        assert!(
+            logged.contains("\"authorization\": \"<redacted>\""),
+            "{logged}"
+        );
+        assert!(logged.contains("\"x-request-id\": \"abc\""), "{logged}");
+    }
+}
+
 #[derive(Clone)]
 struct Metrics {
     handle: Option<PrometheusHandle>,
@@ -136,7 +185,12 @@ where
     fn trace_request<B>(req: &Request<B>, span: &tracing::Span) {
         let _s = span.enter();
 
-        tracing::debug!("{} {} {:?}", req.method(), req.uri(), req.headers());
+        tracing::debug!(
+            "{} {} {:?}",
+            req.method(),
+            req.uri(),
+            RedactedHeaders(req.headers())
+        );
     }
 
     metrics::increment_counter!("libsql_server_count");
