@@ -1,6 +1,7 @@
 #![allow(deprecated)]
 
 mod dumps;
+mod lifecycle;
 mod meta;
 mod shared_schema;
 
@@ -16,6 +17,16 @@ use tempfile::tempdir;
 use turmoil::{Builder, Sim};
 
 fn make_primary(sim: &mut Sim, path: PathBuf) {
+    make_primary_with(sim, path, false);
+}
+
+/// A primary running in single-namespace mode (`--disable-namespaces`): only the default
+/// namespace exists, and it is created at startup.
+fn make_single_namespace_primary(sim: &mut Sim, path: PathBuf) {
+    make_primary_with(sim, path, true);
+}
+
+fn make_primary_with(sim: &mut Sim, path: PathBuf, single_namespace: bool) {
     init_tracing();
     sim.host("primary", move || {
         let path = path.clone();
@@ -35,8 +46,8 @@ fn make_primary(sim: &mut Sim, path: PathBuf) {
                     acceptor: TurmoilAcceptor::bind(([0, 0, 0, 0], 4567)).await?,
                     tls_config: None,
                 }),
-                disable_namespaces: false,
-                disable_default_namespace: true,
+                disable_namespaces: single_namespace,
+                disable_default_namespace: !single_namespace,
                 ..Default::default()
             };
 
