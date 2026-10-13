@@ -1287,12 +1287,18 @@ impl MetaStore {
         }
         let change_tx = self.changes_tx.clone();
 
-        let mut configs = self.inner.configs.lock().await;
-        if !configs.contains_key(&namespace) {
-            if let Some(e) = marker_denial(&self.inner.dbs_path, &namespace)? {
+        // The marker of a name the store does not know yet is read on the blocking pool, and
+        // without the configs lock, which every lookup and creation takes. A target created in
+        // between publishes its config before it can be served, and then this returns its handle.
+        if !self.inner.configs.lock().await.contains_key(&namespace) {
+            let (dbs_path, name) = (self.inner.dbs_path.clone(), namespace.clone());
+            if let Some(e) =
+                tokio::task::spawn_blocking(move || marker_denial(&dbs_path, &name)).await??
+            {
                 return Err(e.into());
             }
         }
+        let mut configs = self.inner.configs.lock().await;
         let sender = configs.entry(namespace.clone()).or_insert_with(|| {
             // TODO(lucio): if no entry exists we need to ensure we send the update to
             // the bg channel.
