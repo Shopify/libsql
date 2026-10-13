@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use sqlite3_parser::lexer::sql::ParserError;
 
-use crate::database::PrimaryConnection;
+use crate::connection::Connection;
 use crate::error::LoadDumpError;
 use crate::namespace::{DumpStream, NamespaceName};
 
@@ -163,10 +163,10 @@ impl From<LoadDumpError> for ImportFailure {
 /// Load `stream` into the fresh database behind `conn` using the requested importer.
 ///
 /// On error the dump transaction has been rolled back (or was never started).
-pub(crate) async fn load_dump(
+pub(crate) async fn load_dump<C: Connection>(
     kind: DumpImporterKind,
     stream: DumpStream,
-    conn: PrimaryConnection,
+    conn: C,
     cfg: &DumpImportConfig,
     namespace: &NamespaceName,
 ) -> Result<DumpImportStats, LoadDumpError> {

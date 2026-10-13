@@ -13,19 +13,21 @@ use sqlite3_parser::lexer::sql::Parser;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::StreamReader;
 
-use crate::connection::Connection as _;
-use crate::database::PrimaryConnection;
+use crate::connection::Connection;
 use crate::error::LoadDumpError;
 
 use super::{map_exec_error, map_parse_error, DumpImportStats};
 
-pub(super) async fn load_dump_buffered<S>(
+pub(super) async fn load_dump_buffered<S, C>(
     dump: S,
-    conn: PrimaryConnection,
+    conn: C,
 ) -> crate::Result<DumpImportStats, LoadDumpError>
 where
     S: Stream<Item = std::io::Result<Bytes>> + Unpin,
+    C: Connection,
 {
+    // Shared with the blocking task that runs each statement.
+    let conn = std::sync::Arc::new(conn);
     let mut stats = DumpImportStats::default();
     let mut reader = tokio::io::BufReader::new(StreamReader::new(dump));
     let mut dump_content = String::new();

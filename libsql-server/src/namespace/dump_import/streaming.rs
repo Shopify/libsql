@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!          async (tokio runtime)                                blocking thread (BLOCKING_RT)
-//! DumpStream ──chunks──▶ StatementFramer ──frames──▶ mpsc + byte budget ──▶ run_executor ──▶ PrimaryConnection
+//! DumpStream ──chunks──▶ StatementFramer ──frames──▶ mpsc + byte budget ──▶ run_executor ──▶ Connection
 //! ```
 //!
 //! The reader task drives the stream, frames statements and hands them to a single executor
@@ -21,8 +21,7 @@ use sqlite3_parser::ast::{Cmd, Stmt};
 use sqlite3_parser::lexer::sql::Parser;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
-use crate::connection::Connection as _;
-use crate::database::PrimaryConnection;
+use crate::connection::Connection;
 use crate::error::LoadDumpError;
 use crate::namespace::DumpStream;
 use crate::BLOCKING_RT;
@@ -68,9 +67,9 @@ impl From<FrameError> for LoadDumpError {
     }
 }
 
-pub(super) async fn load_dump_streaming(
+pub(super) async fn load_dump_streaming<C: Connection>(
     mut stream: DumpStream,
-    conn: PrimaryConnection,
+    conn: C,
     cfg: &DumpImportConfig,
 ) -> Result<DumpImportStats, ImportFailure> {
     // `DumpImportConfig::validate` runs for CLI-built configs only; never panic on a
@@ -157,8 +156,8 @@ async fn send_frame(
 /// How often the executor logs progress while an import is running.
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
-struct Executor {
-    conn: PrimaryConnection,
+struct Executor<C> {
+    conn: C,
     n_stmt: u64,
     skipped_wasm_table: bool,
     stats: DumpImportStats,
@@ -173,8 +172,8 @@ struct Executor {
 ///
 /// Returns the outcome together with the statistics accumulated so far, so a failure can report
 /// how far the import got.
-fn run_executor(
-    conn: PrimaryConnection,
+fn run_executor<C: Connection>(
+    conn: C,
     mut rx: mpsc::Receiver<Msg>,
 ) -> (Result<(), LoadDumpError>, DumpImportStats) {
     let now = Instant::now();
@@ -204,7 +203,7 @@ fn run_executor(
     (res, std::mem::take(&mut ex.stats))
 }
 
-impl Executor {
+impl<C: Connection> Executor<C> {
     fn run(&mut self, rx: &mut mpsc::Receiver<Msg>) -> Result<(), LoadDumpError> {
         loop {
             match rx.blocking_recv() {
