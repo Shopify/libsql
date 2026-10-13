@@ -111,14 +111,16 @@ Rules:
 | `UNFENCED`, `RELEASED` | allow | allow | allow | existing policy | acquire only |
 | `SOURCE_DRAINING` | allow | allow | deny | deny | status, drain, release |
 | `SOURCE_WRITE_FENCED` | allow | allow | deny | deny | export/validation reads, status, read fence, release |
-| `SOURCE_READ_DRAINING`, `SOURCE_READ_FENCED` | deny | deny; open streams terminated | deny | deny | status, clear read fence |
+| `SOURCE_READ_DRAINING`, `SOURCE_READ_FENCED` | deny | deny; open streams terminated | deny | deny | status, read drain (`SOURCE_READ_DRAINING`), clear read fence |
 | `TARGET_QUARANTINED` | deny | deny | deny | deny | import capability, status, seal, abort |
-| `TARGET_IMPORT_DRAINING` | deny | deny | deny | deny | existing import writers finish; no new capability |
-| `TARGET_VALIDATING` | deny | deny | deny | deny | read-only validation capability, status |
-| `TARGET_WRITE_FENCED` | allow | allow | deny | deny | read-only validation, status, enable writes |
+| `TARGET_IMPORT_DRAINING` | deny | deny | deny | deny | existing import writers finish; no new capability; status, seal drain, abort |
+| `TARGET_VALIDATING` | deny | deny | deny | deny | read-only validation capability, record validation, publish (after a successful validation receipt), status, abort |
+| `TARGET_WRITE_FENCED` | allow | allow | deny | deny | read-only validation, status, enable writes, abort |
 | `TARGET_WRITABLE` | allow | allow | allow | existing policy | status and receipts |
 | `TARGET_ABORTED` | deny | deny | deny | deny except separately authorised cleanup | status |
-| `UNKNOWN_UNAVAILABLE` | deny | deny | deny | deny | status, adoption |
+| `UNKNOWN_UNAVAILABLE` | deny | deny | deny | deny | status, adoption (when the metastore is behind the marker) |
+
+The operation-owned column lists what the owning operation may run in that state; it matches the transitions of section 3.2, and `transition.rs` is the authority if they ever disagree. Adoption (section 12) is also permitted in every state owned by an unfinished operation; it changes the owner and nothing else, so it is not repeated per row.
 
 "Deny" on the lifecycle column covers: `POST /v1/namespaces/:ns/config`, delete, reset, fork (as source or destination), create over an existing record, restore of any kind, dump load, shared-schema linking and schema migration. Maintenance that cannot change logical contents is a separate class and continues in every state: WAL `TRUNCATE` checkpoint, bottomless WAL upload, the storage monitor, the replication logger's own connection and log compaction. **`VACUUM` is not maintenance** (it takes a write transaction and produces replicated frames) and is skipped in every state whose normal-write column is "deny".
 
@@ -582,6 +584,16 @@ Transport keepalive: when the fence is enabled (`--enable-namespace-fence`), the
 
 Replication calls denied by the fence are counted (`libsql_server_fence_denials_total{code, surface = "replication"}`) and logged at most once per namespace per minute, so repeated reconnects of replicas that do not understand the typed code are observable rather than noisy. Replica-side handling of the typed code (a local read denial, capped back-off) is described in section 6.2.
 
+### 9.1 Fast path for unfenced SQL reads
+
+Taking a registered lease costs a lock shared by all of the namespace's connections, an allocation for the cancel closure and a map insert and remove, for every SQL program on every namespace. Registration is only needed for the read drain to cancel the work at its deadline. So while the gate is in a state from which a read fence is at least two transitions away (`UNFENCED`, `RELEASED` or `TARGET_WRITABLE`, with nothing installing, indeterminate or closing reads), a `NormalRead` SQL lease is only counted, in an atomic counter (`FenceController::acquire_read_lease`).
+
+- The counter is part of the drain's lease count, so a read fence waits for these programs like any other. A program counts itself before it reads the fast-path flag, and every publication updates the flag before the drain counts, so a program either sees the fast path off and registers, or is counted.
+- A program on the fast path cannot be cancelled. If it is still running after the drain's deadline and grace, the answer is `DRAINING`, never a wrong `APPLIED`. Such a program was admitted before the write fence and is still running after the source was write-fenced and a read fence requested, which only a very long query does.
+- Dumps, replication streams, ATTACH leases taken for other classes, validation and capability reads, and every SQL read in any other state take the registered lease.
+
+Measured with `read_lease_cost` in `controller.rs` (an ignored test) on a debug build: 31 ns per read on the fast path against 596 ns registered on one thread, 139 ns against 1.53 µs across 8 threads sharing one namespace.
+
 Internal work that must keep running is classed `Maintenance` or `Observability` and holds no read lease: bottomless WAL upload, the storage monitor's read transaction, stats and metrics.
 
 This fence stops future service from the source. It cannot recall bytes a peer has already received, frames stored by an embedded replica, or data served by a replica server that is partitioned from the primary; the operation must prove client and replica convergence separately.
@@ -786,11 +798,19 @@ The two sets therefore never meet: acquisition reads the config row in the same 
 | Delete | In the metastore transaction of `MetaStore::remove`. |
 | Create over an existing record, with or without `dump_url`, and linking to a shared schema at creation | Before a dump is fetched (`http/admin/mod.rs`), first in `NamespaceStore::create`, and in the metastore transaction that stores the config. |
 | Fork, as source | Under the source's transition lock, held for the whole fork. A fork reads the source's log without a read lease; holding the lock means a write or read fence command on the source either finished before the check (and the fork is refused) or starts after the fork has finished. |
-| Fork, as destination | Before anything is stored, and again with the destination's namespace entry held, which no fence command can load past. Without it, a fork onto an existing fenced namespace that is not loaded would publish its config in memory and replace its directory. |
+| Fork, as destination | Before anything is stored, and again in the destination's reservation (`Reservation::acquire`), with its namespace entry held, which no fence command can load past. Without it, a fork onto an existing fenced namespace that is not loaded would publish its config in memory and replace its directory. |
 | Reset (the replica's reset callback) | Under the namespace's transition lock, before its entry is taken and its data destroyed. Reset writes nothing to the metastore, so this is its only check; a refused reset is logged. |
 | Schema migration | When the job is registered (section 13.4). |
 
-Lock order is transition lock, then namespace entry, everywhere: fence commands that load a namespace (`CreateTargetQuarantined`) take them in that order, `AcquireSourceWriteFence` releases the entry before it takes the transition lock, and fork and reset take the transition lock first.
+Lock order is transition lock, then namespace entry, everywhere: fence commands that load a namespace (`CreateTargetQuarantined`) take them in that order, `AcquireSourceWriteFence` releases the entry before it takes the transition lock, and fork and reset take the transition lock first. No code takes a transition lock while it holds a namespace entry.
+
+Fork is the only operation that holds locks of two namespaces. It takes the source's transition lock, then the destination's entry (its reservation), then the source's entry. This cannot form a cycle:
+
+- A task waiting for the source's transition lock holds no entry (previous paragraph), so it cannot be holding what the fork waits for.
+- The reservation refuses a destination that exists as soon as it holds the destination's entry, and releases it. So a fork holds its destination's entry exclusively while it waits for its source's entry only when the destination does not exist, and a namespace that does not exist is no other fork's source. In particular `fork(X→Y)` and `fork(Y→X)` cannot wait for each other: X and Y both exist, so both reservations are refused.
+- Reset, create and destroy hold one namespace's locks only.
+
+A fork holds the source's transition lock while it waits for the destination's entry, so a fence command on the source can wait behind a create, fork or reset of the destination for as long as that operation runs. It cannot deadlock.
 
 ## 14. Code-path coverage
 
@@ -858,7 +878,7 @@ Implementation (`namespace/fence/audit.rs`):
 
 ## 17. Acceptance tests map
 
-Every row of the issue's acceptance list, with the tests that cover it. Every named test is in this change and passes (`cargo nextest run -p libsql-server` and `-p libsql_replication`); where a requirement can only be partly proven in the test suite, the row says so and section 18 states the limit. Race tests use the `FenceTestHooks` points of section 16 or simulated time, never sleeps, for admission against persistence, drain against commit, restart and response loss. Tests named `tests::fence::*` are integration tests of `libsql-server/tests/fence/` against a running server; the rest are unit tests of the library.
+Every row of the issue's acceptance list, with the tests that cover it. Every named test is added by the stack PR that adds the behaviour it covers, and they all pass at the head of the stack (`cargo nextest run -p libsql-server` and `-p libsql_replication`); where a requirement can only be partly proven in the test suite, the row says so and section 18 states the limit. Race tests use the `FenceTestHooks` points of section 16 or simulated time, never sleeps, for admission against persistence, drain against commit, restart and response loss. Tests named `tests::fence::*` are integration tests of `libsql-server/tests/fence/` against a running server; the rest are unit tests of the library.
 
 | # | Requirement | Tests |
 |---|---|---|
