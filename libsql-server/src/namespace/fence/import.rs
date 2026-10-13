@@ -797,46 +797,53 @@ mod tests {
         out
     }
 
+    /// A source namespace `src` holding [`SCHEMA`], its dump, and its [`contents`].
+    async fn source_dump(store: &NamespaceStore) -> (Vec<u8>, Vec<String>) {
+        store
+            .create("src".into(), RestoreOption::Latest, Default::default())
+            .await
+            .unwrap();
+        let src = store
+            .with("src".into(), |ns| ns.db.connection_maker())
+            .await
+            .unwrap()
+            .create()
+            .await
+            .unwrap();
+        let (dump, expected) = tokio::task::spawn_blocking(move || {
+            src.with_raw(|c| {
+                c.execute_batch(SCHEMA).unwrap();
+                let mut dump = Vec::new();
+                crate::connection::dump::exporter::export_dump(c, &mut dump, false).unwrap();
+                (dump, contents(c))
+            })
+        })
+        .await
+        .unwrap();
+        let text = String::from_utf8(dump.clone()).unwrap();
+        assert!(text.contains("CREATE VIRTUAL TABLE"), "{text}");
+        (dump, expected)
+    }
+
+    /// `dump` as a stream of 64-byte chunks.
+    fn chunked(dump: &[u8]) -> impl Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin {
+        futures::stream::iter(
+            dump.chunks(64)
+                .map(|c| Ok(Bytes::copy_from_slice(c)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
     /// The server's own dump loader runs inside an import session: a dump exported from a
     /// source with a representative schema loads into the quarantined target, which then holds
     /// exactly what the source held, while nothing else could write to it.
     #[tokio::test(flavor = "multi_thread")]
     async fn import_session_loads_dump_into_quarantined_target() {
         let (_dir, store, fence) = target().await;
-        store
-            .create("src".into(), RestoreOption::Latest, Default::default())
-            .await
-            .unwrap();
-        let src = {
-            let maker = store
-                .with("src".into(), |ns| ns.db.connection_maker())
-                .await
-                .unwrap();
-            Arc::new(maker.create().await.unwrap())
-        };
-        let (dump, expected) = {
-            let src = src.clone();
-            tokio::task::spawn_blocking(move || {
-                src.with_raw(|c| {
-                    c.execute_batch(SCHEMA).unwrap();
-                    let mut dump = Vec::new();
-                    crate::connection::dump::exporter::export_dump(c, &mut dump, false).unwrap();
-                    (dump, contents(c))
-                })
-            })
-            .await
-            .unwrap()
-        };
-        let text = String::from_utf8(dump.clone()).unwrap();
-        assert!(text.contains("CREATE VIRTUAL TABLE"), "{text}");
+        let (dump, expected) = source_dump(&store).await;
 
         let mut session = store.open_import_session(tgt(), OP, 1).await.unwrap();
-        let stream = futures::stream::iter(
-            dump.chunks(64)
-                .map(|c| Ok(Bytes::copy_from_slice(c)))
-                .collect::<Vec<_>>(),
-        );
-        session.load_dump(stream).await.unwrap();
+        session.load_dump(chunked(&dump)).await.unwrap();
         assert_eq!(fence.gate().state(), FenceState::TargetQuarantined);
         // Nothing but the session could have written it.
         assert_fenced(
@@ -873,5 +880,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(imported, expected);
+    }
+
+    /// The same load through the memory-bounded streaming importer, which runs each statement's
+    /// original text: the target equals the source after the seal, and the importer reports
+    /// what it read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_import_session_loads_dump_into_quarantined_target() {
+        let (_dir, store, fence) = target().await;
+        let (dump, expected) = source_dump(&store).await;
+
+        let mut session = store.open_import_session(tgt(), OP, 1).await.unwrap();
+        let stats = session
+            .load_dump_with(
+                DumpImporterKind::Streaming,
+                &DumpImportConfig::default(),
+                chunked(&dump),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.bytes, dump.len() as u64);
+        assert!(stats.statements_executed > 0);
+        assert_eq!(fence.gate().state(), FenceState::TargetQuarantined);
+        assert_fenced(
+            raw(
+                &plain_conn(&store).await,
+                "insert into audit (what) values ('x')",
+            )
+            .await,
+        );
+        drop(session);
+
+        let commit = execute(&store, seal_request(10, 1, LONG))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(commit.receipt.outcome, FenceOutcome::Applied);
+        let conn = plain_conn(&store).await;
+        let imported = tokio::task::spawn_blocking(move || conn.with_raw(|c| contents(c)))
+            .await
+            .unwrap();
+        assert_eq!(imported, expected);
+    }
+
+    /// A streaming import whose caller goes away mid-dump (a cancelled request) leaves the
+    /// target empty and quarantined: dropping the session revokes its capability, and the
+    /// importer's executor, which tokio cannot cancel, rolls the dump transaction back. The
+    /// seal then waits for that rollback and applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_streaming_import_leaves_target_empty() {
+        let (_dir, store, fence) = target().await;
+        let session = store.open_import_session(tgt(), OP, 1).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
+        let import = tokio::spawn(async move {
+            let mut session = session;
+            session
+                .load_dump_with(
+                    DumpImporterKind::Streaming,
+                    &DumpImportConfig::default(),
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                )
+                .await
+        });
+        tx.send(Ok(Bytes::from_static(
+            b"BEGIN TRANSACTION; CREATE TABLE half (x); INSERT INTO half VALUES (1);",
+        )))
+        .await
+        .unwrap();
+        // Let the executor run what it was sent; the transaction stays open, waiting for more.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!import.is_finished());
+
+        import.abort();
+        assert!(import.await.unwrap_err().is_cancelled());
+        assert_eq!(fence.gate().state(), FenceState::TargetQuarantined);
+
+        let commit = execute(&store, seal_request(10, 1, LONG))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(commit.receipt.outcome, FenceOutcome::Applied);
+        let conn = plain_conn(&store).await;
+        let tables: i64 = tokio::task::spawn_blocking(move || {
+            conn.with_raw(|c| {
+                c.query_row(
+                    "select count(*) from sqlite_schema where name = 'half'",
+                    (),
+                    |r| r.get(0),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(tables, 0);
+        drop(tx);
     }
 }
