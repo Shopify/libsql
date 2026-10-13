@@ -689,10 +689,16 @@ impl ImportSession {
     /// refused is returned as that FenceError.
     pub async fn with_raw<R: Send + 'static>(&mut self,
         f: impl FnOnce(&mut rusqlite::Connection) -> R + Send + 'static) -> Result<R, FenceError>;
-    /// The server's dump loader (`load_dump_sql`, the loader a namespace created from a dump
-    /// uses) run inside `with_raw`. Dump errors are `Error::LoadDumpError`.
+    /// The server's buffered dump importer (`namespace::dump_import`, the importer a namespace
+    /// created from a dump uses by default) run under the capability. Dump errors are
+    /// `Error::LoadDumpError`.
     pub async fn load_dump<S>(&mut self, dump: S) -> crate::Result<()>
-        where S: Stream<Item = std::io::Result<Bytes>> + Unpin;
+        where S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static;
+    /// `load_dump` with a chosen importer (`Buffered` or the memory-bounded `Streaming`) and its
+    /// limits; returns the importer's statistics. The whole load counts as one import writer.
+    pub async fn load_dump_with<S>(&mut self, kind: DumpImporterKind, cfg: &DumpImportConfig,
+        dump: S) -> crate::Result<DumpImportStats>
+        where S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static;
 pub struct ValidationSession { /* capability, controller, query_only capability connection */ }
 impl ValidationSession {
     pub fn capability(&self) -> &MigrationCapability;
@@ -703,7 +709,7 @@ impl ValidationSession {
 }
 ```
 
-`FenceError` carries a `FenceOutcome` (section 6) and converts into the server's `Error`, so a route built on top returns the same codes. The import-writer count is of running calls: a session that is not running a call cannot start a write once the seal has moved the revision, and a transaction it left open holds the write slot, which the seal waits for as well (section 10.2). Dropping either session revokes its capability and closes its connection; dropping an `ImportSession` therefore rolls back a transaction it left open and releases the slot. Capability connections share the target's WAL and replication log and are not counted by the connection throttle. The loader holds the connection for the whole dump and re-renders each statement it runs (as it does for a namespace created from a dump), so the stored SQL text of schema objects differs from the source's in case and spacing. Streaming and memory bounds are not part of this series.
+`FenceError` carries a `FenceOutcome` (section 6) and converts into the server's `Error`, so a route built on top returns the same codes. The import-writer count is of running calls: a session that is not running a call cannot start a write once the seal has moved the revision, and a transaction it left open holds the write slot, which the seal waits for as well (section 10.2). Dropping either session revokes its capability and closes its connection; dropping an `ImportSession` therefore rolls back a transaction it left open and releases the slot. Capability connections share the target's WAL and replication log and are not counted by the connection throttle. The importer holds the connection for the whole dump. The buffered importer reads the whole dump into memory and re-renders each statement it runs (as it does for a namespace created from a dump), so the stored SQL text of schema objects differs from the source's in case and spacing; the streaming importer runs each statement's original text, with memory bounded by its queue and maximum statement size (`docs/STREAMING_DUMP_IMPORT_DESIGN.md`). The streamed HTTP route built on this API is not part of this series.
 
 ## 12. Incident adoption (Contract)
 
@@ -808,7 +814,7 @@ How each path that can reach namespace data or lifecycle is covered. File refere
 | `replication/replicator_client.rs`, `namespace/configurator/replica.rs` (replica servers) | A fence status from `hello`, `log_entries` or `snapshot`, or a stream ended with one, installs the local read denial (`FenceController::observe_primary`) and is returned as `PrimaryFenceRefusal`; the replication loop backs off 1 s → 15 s instead of reconnecting every second; an answered `hello` lifts the denial (section 6.2). A lazy creation whose first `hello` the primary refuses fails at once with the code and leaves no directory, metastore entry or controller behind (section 13.3). |
 | `admin_shell.rs` | Writes denied at the WAL (no capability); reads checked against the gate, and a read lease held, per query (cancelled through the connection's interrupt handle). |
 | `schema/scheduler.rs`, `database/schema.rs` | Shared schema excluded from fencing; registering a migration job is refused while the schema or a linked namespace denies lifecycle work (section 13.4); migration writes are WAL-gated; the scheduler's `block_writes` flag is not treated as drain evidence. |
-| `namespace/configurator/helpers.rs` `load_dump`, `http/admin/mod.rs` `dump_stream_from_url` | Restore options and dump URLs are refused for fenced namespaces before the dump is fetched (section 13.5); outside a capability the loader's writes are refused at the WAL. Import goes through `ImportSession::load_dump`, which runs the same loader (`load_dump_sql`) on the capability connection. |
+| `namespace/dump_import` `load_dump`, `http/admin/mod.rs` `dump_stream_from_url` | Restore options and dump URLs are refused for fenced namespaces before the dump is fetched (section 13.5); outside a capability the importers' writes are refused at the WAL. Import goes through `ImportSession::load_dump` or `load_dump_with`, which run the same importers on the capability connection. |
 | `connection/program.rs` ATTACH resolution | `check_program_auth` uses a non-creating lookup; the resolver returns the attached namespace's controller, the attachment is admitted as `NormalRead` of it with a read lease, and the connection keeps a lease on it for every later program until it is detached. |
 | `http/user/listen.rs` `/beta/listen` | `NormalRead`, read from the registry without loading the namespace; denied where reads are denied; the stream ends with an error event when reads are fenced. |
 | Raw internal connections (storage monitor, periodic checkpoint, shutdown checkpoint, replication logger, `checkpoint_db`, bottomless) | `Maintenance` / `Observability`; not leases; never blocked. |
