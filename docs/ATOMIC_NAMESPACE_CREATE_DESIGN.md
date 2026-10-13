@@ -6,6 +6,8 @@ Stacked on `tszymczyszyn/streaming-dump-importer` (PR #51). Fixes the pre-existi
 
 ## 1. Problem
 
+![Before and after](images/atomic-namespace-create-before-after.png)
+
 
 `NamespaceStore::create` persists the namespace config **first** and only then runs the configurator's `setup` (directory, logger, connections, dump import). Three resources are mutated without a common commit point:
 
@@ -29,6 +31,10 @@ Both dump importers run inside this sequence; the problem is independent of PR #
 Non-goals: a server-side import timeout; idempotency keys / async create jobs; bottomless (not used in our deployment; untested with this change). The moka eviction hazard shared with `reset`/`fork` turned out to need fixing (§8).
 
 ## 3. Design in one paragraph
+
+![Components and ownership](images/atomic-namespace-create-components.png)
+
+*Who owns what: numbered arrows are the happy path, dashed red the undo. The second diagram (§1) contrasts the old and new sequence.*
 
 
 Make the **metastore write the commit point** and make everything before it reversible. `create` reserves the name by write-locking its cache entry, puts the config in the metastore's *in-memory* map only (so `setup` can read it), runs `setup`, and only on success **flushes the row** and installs the namespace. A `Reservation` drop guard undoes the in-memory config if the future ends any other way — error *or* cancellation — and releases the lock only after that, so waiters never observe a half-built namespace. The filesystem gets the same treatment one layer down: `setup` wraps a brand-new directory in a `FreshDir` guard that removes it on drop. For crashes, a brand-new directory carries an `.incomplete` marker until the row is flushed; the next `create` of that name discards a marked directory.
