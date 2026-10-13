@@ -53,6 +53,25 @@ Both importers produce the same data. Known differences:
 - invalid UTF-8 or NUL bytes yield `400` (buffered: `500`), and statements that return rows are
   executed with their rows discarded (buffered: `500`).
 
+Creation is all-or-nothing. The namespace becomes visible, and its configuration is persisted,
+only after it has been fully set up (including the dump import). If the request fails, is
+cancelled by the client, or the server dies while it is in flight, the namespace either does not
+exist (its name can be created again right away — a failed attempt is fully undone before the
+error is returned) or is complete — never partially imported. Requests addressed to a namespace
+while it is being created wait for the outcome. Directories of creations the server died in the
+middle of are discarded at the next start (`<db-path>/.discarded/` holds them until they are
+deleted). For callers:
+
+- `2xx`: the namespace is complete;
+- any other outcome, including a lost connection: retry the same request; a
+  `400 Namespace already exists` on the retry means the earlier attempt did complete.
+
+In single-namespace mode (`--disable-namespaces`) creating the default namespace is a
+configuration upsert and always succeeds, except with a `dump_url`: a dump can only be imported
+into a namespace that does not exist yet, so that request is rejected like any other.
+
+See `docs/ATOMIC_NAMESPACE_CREATE_DESIGN.md`.
+
 ```HTTP
 DELETE /v1/namespaces/:namespace
 ```
