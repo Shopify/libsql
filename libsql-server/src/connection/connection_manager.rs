@@ -14,7 +14,7 @@ use rusqlite::ErrorCode;
 
 use super::connection_core::CoreConnection;
 use super::TXN_TIMEOUT;
-use crate::namespace::fence::controller::FenceConnState;
+use crate::namespace::fence::controller::{FenceConnState, WriteQueueWaker};
 use crate::namespace::fence::state::OperationClass;
 
 pub type ConnId = u64;
@@ -140,15 +140,19 @@ impl ConnectionManager {
     /// instead of waiting for the slot; one it admits (a checkpoint) queues again. The waker
     /// holds the manager weakly and reports `false` once it is gone, so the controller can
     /// forget it.
-    pub(crate) fn fence_waker(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
+    pub(crate) fn fence_waker(&self) -> WriteQueueWaker {
         let inner = Arc::downgrade(&self.inner);
-        Box::new(move || match inner.upgrade() {
-            Some(inner) => {
-                wake_queue_for_fence(&inner);
-                true
-            }
-            None => false,
-        })
+        let alive = inner.clone();
+        WriteQueueWaker::new(
+            move || match inner.upgrade() {
+                Some(inner) => {
+                    wake_queue_for_fence(&inner);
+                    true
+                }
+                None => false,
+            },
+            move || alive.strong_count() > 0,
+        )
     }
 
     #[cfg(test)]
@@ -164,6 +168,11 @@ pub(crate) struct WeakConnectionManager(std::sync::Weak<ConnectionManagerInner>)
 impl WeakConnectionManager {
     pub(crate) fn upgrade(&self) -> Option<ConnectionManager> {
         self.0.upgrade().map(|inner| ConnectionManager { inner })
+    }
+
+    /// Whether the manager still exists, without keeping it alive.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.strong_count() > 0
     }
 }
 

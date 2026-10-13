@@ -140,9 +140,33 @@ impl GateSnapshot {
     }
 }
 
-/// Wakes one connection manager's write queue after a write-generation change; returns `false`
-/// once the manager is gone.
-pub type WriteQueueWaker = Box<dyn Fn() -> bool + Send + Sync>;
+/// Wakes one connection manager's write queue after a write-generation change. It holds the
+/// manager weakly: waking returns `false` once the manager is gone, and `is_alive` tells without
+/// waking.
+pub struct WriteQueueWaker {
+    wake: Box<dyn Fn() -> bool + Send + Sync>,
+    alive: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl WriteQueueWaker {
+    pub fn new(
+        wake: impl Fn() -> bool + Send + Sync + 'static,
+        alive: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            wake: Box::new(wake),
+            alive: Box::new(alive),
+        }
+    }
+
+    fn wake(&self) -> bool {
+        (self.wake)()
+    }
+
+    fn is_alive(&self) -> bool {
+        (self.alive)()
+    }
+}
 
 /// The last frame committed to a namespace's replication log, `None` while it has none.
 pub type GetCurrentFrameNo = Arc<dyn Fn() -> Option<FrameNo> + Send + Sync + 'static>;
@@ -250,16 +274,22 @@ impl FenceController {
 
     /// Register a connection manager's write queue, to be woken after every change of the write
     /// generation so that queued writers re-check the gate instead of waiting for the slot.
-    /// Wakers whose manager is gone are dropped on the next change.
+    /// Wakers whose manager is gone are dropped on the next change, and before every
+    /// registration: a namespace that is evicted and reloaded again and again, fenced or not,
+    /// keeps only the queues of its live managers.
     pub fn register_write_queue(&self, waker: WriteQueueWaker) {
-        self.write_queues.lock().push(waker);
+        let mut queues = self.write_queues.lock();
+        queues.retain(WriteQueueWaker::is_alive);
+        queues.push(waker);
     }
 
     /// Register what the write drain needs from a primary connection maker of this namespace:
     /// its connection manager and its replication log. Sources whose manager is gone are
-    /// dropped the next time the drain looks.
+    /// dropped the next time the drain looks, and before every registration.
     pub fn register_write_drain(&self, source: WriteDrainSource) {
-        self.write_drains.lock().push(source);
+        let mut sources = self.write_drains.lock();
+        sources.retain(|source| source.manager.is_alive());
+        sources.push(source);
     }
 
     /// The write-drain sources whose manager is still alive, oldest first. The drain holds them
@@ -367,7 +397,7 @@ impl FenceController {
         }
         // After the gate is published, so that every woken writer re-checks against it.
         if generation_changed {
-            self.write_queues.lock().retain(|wake| wake());
+            self.write_queues.lock().retain(WriteQueueWaker::wake);
         }
     }
 }
@@ -837,6 +867,43 @@ pub(crate) mod tests {
     /// Registered write queues are woken after every change of the write generation, and only
     /// then; a waker whose manager is gone is forgotten.
     #[tokio::test]
+    async fn dead_write_queues_and_drains_are_dropped_on_registration() {
+        let controller = FenceController::unfenced("ns".into());
+        // A namespace evicted and reloaded many times, never fenced: each load registers its
+        // connection manager, and the previous one is gone.
+        for _ in 0..100 {
+            let manager = ConnectionManager::new(std::time::Duration::from_secs(1));
+            controller.register_write_queue(manager.fence_waker());
+            controller.register_write_drain(WriteDrainSource::new(
+                &manager,
+                Uuid::from_u128(1),
+                Arc::new(|| None),
+            ));
+        }
+        assert_eq!(controller.write_queues.lock().len(), 1);
+        assert_eq!(controller.write_drains.lock().len(), 1);
+
+        // Live managers stay registered.
+        let live = ConnectionManager::new(std::time::Duration::from_secs(1));
+        controller.register_write_queue(live.fence_waker());
+        controller.register_write_drain(WriteDrainSource::new(
+            &live,
+            Uuid::from_u128(2),
+            Arc::new(|| None),
+        ));
+        let other = ConnectionManager::new(std::time::Duration::from_secs(1));
+        controller.register_write_queue(other.fence_waker());
+        controller.register_write_drain(WriteDrainSource::new(
+            &other,
+            Uuid::from_u128(3),
+            Arc::new(|| None),
+        ));
+        assert_eq!(controller.write_queues.lock().len(), 2);
+        assert_eq!(controller.write_drains.lock().len(), 2);
+        assert_eq!(controller.live_write_drains().len(), 2);
+    }
+
+    #[tokio::test]
     async fn write_queues_are_woken_on_every_generation_change() {
         let tmp = tempdir().unwrap();
         let meta = open_metastore(tmp.path()).await;
@@ -845,27 +912,33 @@ pub(crate) mod tests {
 
         let woken = Arc::new(AtomicU64::new(0));
         let seen_generation = Arc::new(AtomicU64::new(0));
-        controller.register_write_queue(Box::new({
-            let woken = woken.clone();
-            let seen_generation = seen_generation.clone();
-            let controller = Arc::downgrade(&controller);
-            move || {
-                // The gate is already published when the queue is woken.
-                if let Some(c) = controller.upgrade() {
-                    seen_generation.store(c.write_generation(), Ordering::SeqCst);
+        controller.register_write_queue(WriteQueueWaker::new(
+            {
+                let woken = woken.clone();
+                let seen_generation = seen_generation.clone();
+                let controller = Arc::downgrade(&controller);
+                move || {
+                    // The gate is already published when the queue is woken.
+                    if let Some(c) = controller.upgrade() {
+                        seen_generation.store(c.write_generation(), Ordering::SeqCst);
+                    }
+                    woken.fetch_add(1, Ordering::SeqCst);
+                    true
                 }
-                woken.fetch_add(1, Ordering::SeqCst);
-                true
-            }
-        }));
+            },
+            || true,
+        ));
         let gone = Arc::new(AtomicU64::new(0));
-        controller.register_write_queue(Box::new({
-            let gone = gone.clone();
-            move || {
-                gone.fetch_add(1, Ordering::SeqCst);
-                false
-            }
-        }));
+        controller.register_write_queue(WriteQueueWaker::new(
+            {
+                let gone = gone.clone();
+                move || {
+                    gone.fetch_add(1, Ordering::SeqCst);
+                    false
+                }
+            },
+            || false,
+        ));
         assert_eq!(controller.write_queues.lock().len(), 2);
 
         fence_source(&meta, &controller, OP).await;
