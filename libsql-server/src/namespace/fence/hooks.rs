@@ -45,6 +45,8 @@ pub enum HookPoint {
     AfterTargetRowsCommitted,
     /// The gate is published; the answer is about to be returned.
     BeforeResponse,
+    /// A fork holds its source's transition lock and is about to reserve its destination.
+    AfterForkSourceTransition,
 }
 
 #[cfg(test)]

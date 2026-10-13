@@ -530,8 +530,10 @@ impl NamespaceStore {
         // (a write or read fence) either finished before this check, and the fork is refused,
         // or waits for the fork to finish (section 3.3, fork as source). The destination is
         // checked again by the reservation, under its entry lock.
-        let _from_transition = self.inner.fences.controller(&from).begin_transition().await;
+        let from_fence = self.inner.fences.controller(&from);
+        let _from_transition = from_fence.begin_transition().await;
         self.check_lifecycle(&from)?;
+        let _ = from_fence.hook(HookPoint::AfterForkSourceTransition).await;
 
         let to_config = Arc::new(to_config);
         let reservation = Reservation::acquire(self, to.clone(), to_config.clone()).await?;
@@ -1673,6 +1675,63 @@ pub(crate) mod fence_tests {
         let gate = store.fence_controller(&name).gate();
         assert_eq!(gate.state(), FenceState::TargetQuarantined);
         assert_eq!(gate.revision(), 1);
+    }
+
+    /// `fork(X→Y)` and `fork(Y→X)` at once, each holding its source's transition lock before
+    /// either reserves its destination, with neither namespace loaded: both are refused because
+    /// their destination exists, and neither waits for the other (`docs/NAMESPACE_FENCE.md`
+    /// section 13.5). Afterwards both namespaces take fence commands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reversed_forks_do_not_deadlock() {
+        use crate::namespace::fence::hooks::HookPoint;
+
+        let tmp = tempdir().unwrap();
+        let store = open_store(tmp.path()).await;
+        let (x, y) = (NamespaceName::from("x"), NamespaceName::from("y"));
+        for ns in [&x, &y] {
+            store
+                .create(ns.clone(), RestoreOption::Latest, Default::default())
+                .await
+                .unwrap();
+            store.inner.store.invalidate(ns).await;
+        }
+        store.inner.store.run_pending_tasks().await;
+
+        let x_fence = store.inner.fences.controller(&x);
+        let y_fence = store.inner.fences.controller(&y);
+        let x_held = x_fence
+            .hooks()
+            .pause_at(HookPoint::AfterForkSourceTransition);
+        let y_held = y_fence
+            .hooks()
+            .pause_at(HookPoint::AfterForkSourceTransition);
+        let fork = |from: &NamespaceName, to: &NamespaceName| {
+            let (store, from, to) = (store.clone(), from.clone(), to.clone());
+            tokio::spawn(async move { store.fork(from, to, Default::default(), None).await })
+        };
+        let x_to_y = fork(&x, &y);
+        let y_to_x = fork(&y, &x);
+        x_held.reached().await;
+        y_held.reached().await;
+        x_held.resume();
+        y_held.resume();
+
+        for forked in [x_to_y, y_to_x] {
+            let result = tokio::time::timeout(Duration::from_secs(30), forked)
+                .await
+                .expect("reversed forks must not wait for each other")
+                .unwrap();
+            assert!(
+                matches!(result, Err(Error::NamespaceAlreadyExist(_))),
+                "{result:?}"
+            );
+        }
+        for fence in [&x_fence, &y_fence] {
+            tokio::time::timeout(Duration::from_secs(30), fence.begin_transition())
+                .await
+                .expect("the transition lock was released");
+        }
+        assert!(store.exists(&x).await && store.exists(&y).await);
     }
 
     #[tokio::test]
