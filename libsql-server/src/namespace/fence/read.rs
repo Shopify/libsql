@@ -88,7 +88,9 @@ pub async fn set_source_read_fence(
 /// held are cancelled (SQL programs through their connection's cancel flag, dumps and streams
 /// through their own), and the drain keeps waiting for the actual releases for one more
 /// deadline, but at least [`FORCED_ROLLBACK_GRACE`]. `false` when leases are still held then:
-/// the answer is `DRAINING`, never a guess.
+/// the answer is `DRAINING`, never a guess. A SQL program admitted on the fast path while the
+/// namespace was unfenced (section 9.1) is counted but cannot be cancelled: the drain waits for
+/// it like any other lease, and answers `DRAINING` if it is still running after the grace.
 async fn drain_readers(controller: &FenceController, policy: DrainPolicy) -> bool {
     let namespace = controller.namespace().clone();
     let deadline_after = Duration::from_millis(policy.deadline_ms);
@@ -330,6 +332,8 @@ pub(crate) mod tests {
         );
         reached.recv().await.unwrap();
         assert_eq!(s.fence.read_lease_counts().sql, 1);
+        // Admitted while write-fenced: registered, so the drain can cancel it.
+        assert_eq!(s.fence.registered_read_leases(), 1);
 
         let fence = s.execute(read_fence(&s, 2, LONG));
         s.until_state(FenceState::SourceReadDraining).await;
@@ -343,6 +347,40 @@ pub(crate) mod tests {
         assert_ok(&steps);
         let fenced = fence.await.unwrap();
         assert_eq!(fence_outcome(&fenced), FenceOutcome::Applied);
+        assert_eq!(s.fence.gate().state(), FenceState::SourceReadFenced);
+        assert_eq!(s.fence.read_lease_counts().total(), 0);
+    }
+
+    /// A SQL program admitted while the namespace was unfenced takes the fast path (section 9.1):
+    /// counted, not registered. A read fence set two transitions later still waits for it, and
+    /// since it cannot be cancelled, a drain whose deadline has passed keeps waiting for it to end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_fence_waits_for_program_admitted_while_unfenced() {
+        let s = Source::new().await;
+        raw(&s.conn().await, "insert into t values (1), (2)")
+            .await
+            .unwrap();
+        let conn = s.conn().await;
+        let (mut reached, resume) = park(&conn);
+        let running = spawn_program(
+            &s,
+            "ns",
+            &conn,
+            &["select park()", "select count(*) from t"],
+        );
+        reached.recv().await.unwrap();
+        assert_eq!(s.fence.read_lease_counts().sql, 1);
+        assert_eq!(s.fence.registered_read_leases(), 0);
+
+        let acquired = s.execute(s.acquire(OP, 1, LONG)).await.unwrap();
+        assert_eq!(fence_outcome(&acquired), FenceOutcome::Applied);
+        let fence = s.execute(read_fence(&s, 2, NOW));
+        s.until_state(FenceState::SourceReadDraining).await;
+        assert!(!fence.is_finished());
+
+        resume.send(()).unwrap();
+        assert_ok(&running.await.unwrap().unwrap());
+        assert_eq!(fence_outcome(&fence.await.unwrap()), FenceOutcome::Applied);
         assert_eq!(s.fence.gate().state(), FenceState::SourceReadFenced);
         assert_eq!(s.fence.read_lease_counts().total(), 0);
     }

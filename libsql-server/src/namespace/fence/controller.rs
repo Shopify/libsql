@@ -11,7 +11,7 @@
 //! same controller.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -261,9 +261,10 @@ struct ReadLeaseSet {
 /// ([`FenceController::acquire_read_lease`]).
 pub struct ReadLease {
     controller: Arc<FenceController>,
-    id: u64,
+    /// `None` for a SQL lease taken on the fast path: counted, not registered.
+    id: Option<u64>,
     kind: LeaseKind,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl ReadLease {
@@ -277,7 +278,9 @@ impl ReadLease {
 
     /// Whether the read drain cancelled this lease's work at its deadline.
     pub fn cancelled_by_fence(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancelled
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Acquire))
     }
 }
 
@@ -293,7 +296,10 @@ impl std::fmt::Debug for ReadLease {
 
 impl Drop for ReadLease {
     fn drop(&mut self) {
-        self.controller.release_read_lease(self.id);
+        match self.id {
+            Some(id) => self.controller.release_read_lease(id),
+            None => self.controller.release_fast_read(),
+        }
     }
 }
 
@@ -309,6 +315,11 @@ pub struct FenceController {
     write_drains: Mutex<Vec<WriteDrainSource>>,
     /// The read leases held on the namespace (section 9).
     read_leases: Mutex<ReadLeaseSet>,
+    /// Whether SQL reads may take the fast path: the gate is in a state from which a read fence
+    /// is at least two transitions away (section 9.1). Kept in step with every publication.
+    fast_reads: AtomicBool,
+    /// SQL read leases taken on the fast path and not released yet.
+    fast_sql_reads: AtomicUsize,
     /// Notified whenever a read lease is released.
     read_released: Notify,
     #[cfg(test)]
@@ -328,17 +339,21 @@ impl FenceController {
     /// A controller whose gate starts from `fence`, as established by the metastore.
     pub fn new(namespace: NamespaceName, fence: StoredFence) -> Arc<Self> {
         let (gate, _) = watch::channel(GateSnapshot::new(fence));
-        Arc::new(Self {
+        let this = Arc::new(Self {
             namespace,
             transition_lock: Default::default(),
             gate,
             write_queues: Mutex::new(Vec::new()),
             write_drains: Mutex::new(Vec::new()),
             read_leases: Mutex::new(ReadLeaseSet::default()),
+            fast_reads: AtomicBool::new(false),
+            fast_sql_reads: AtomicUsize::new(0),
             read_released: Notify::new(),
             #[cfg(test)]
             hooks: FenceTestHooks::default(),
-        })
+        });
+        this.refresh_fast_reads();
+        this
     }
 
     /// A controller for a namespace without fence state.
@@ -418,12 +433,30 @@ impl FenceController {
     /// is seen here, and one that closes after it counts this lease and waits for it. `cancel`
     /// is how the read drain stops the work at its deadline: it must make the work end and
     /// drop the lease, never wait for it to end. The lease is released when dropped.
+    ///
+    /// Fast path (section 9.1): while no read fence can be closer than two transitions away, a
+    /// normal SQL read is only counted, without the lock or `cancel`. A read fence still waits
+    /// for it, but cannot cancel it at its deadline.
     pub fn acquire_read_lease(
         self: &Arc<Self>,
         class: OperationClass,
         kind: LeaseKind,
         cancel: impl Fn() + Send + Sync + 'static,
     ) -> Result<ReadLease, FenceError> {
+        if kind == LeaseKind::Sql && class == OperationClass::NormalRead {
+            // Counted before the flag is read: a gate that turns the fast path off after this
+            // check sees the count, and one that turned it off before is seen here.
+            self.fast_sql_reads.fetch_add(1, Ordering::SeqCst);
+            if self.fast_reads.load(Ordering::SeqCst) {
+                return Ok(ReadLease {
+                    controller: self.clone(),
+                    id: None,
+                    kind,
+                    cancelled: None,
+                });
+            }
+            self.release_fast_read();
+        }
         let cancelled = Arc::new(AtomicBool::new(false));
         let id = {
             let mut leases = self.read_leases.lock();
@@ -442,16 +475,53 @@ impl FenceController {
         };
         Ok(ReadLease {
             controller: self.clone(),
-            id,
+            id: Some(id),
             kind,
-            cancelled,
+            cancelled: Some(cancelled),
         })
+    }
+
+    fn release_fast_read(&self) {
+        // Only a read drain waits for releases, and none can run while the fast path is on.
+        if self.fast_sql_reads.fetch_sub(1, Ordering::SeqCst) == 1
+            && !self.fast_reads.load(Ordering::SeqCst)
+        {
+            self.read_released.notify_waiters();
+        }
+    }
+
+    /// Turn the SQL read fast path on or off after a change of the gate. On only for
+    /// `UNFENCED`, `RELEASED` and `TARGET_WRITABLE` with nothing installing, indeterminate or
+    /// closing reads: every other state is at most one transition away from a read fence. And
+    /// only while the gate admits normal reads at all, whatever else may deny them.
+    fn refresh_fast_reads(&self) {
+        let fast = {
+            let gate = self.gate.borrow();
+            gate.installing.is_none()
+                && gate.indeterminate.is_none()
+                && gate.closing_reads.is_none()
+                && gate.permits(OperationClass::NormalRead).is_ok()
+                && matches!(
+                    gate.state(),
+                    FenceState::Unfenced | FenceState::Released | FenceState::TargetWritable
+                )
+        };
+        self.fast_reads.store(fast, Ordering::SeqCst);
+    }
+
+    /// The read leases registered under the lease lock (every lease but those on the fast path).
+    #[cfg(test)]
+    pub(crate) fn registered_read_leases(&self) -> usize {
+        self.read_leases.lock().live.len()
     }
 
     /// The read leases currently held, by kind.
     pub fn read_lease_counts(&self) -> ReadLeaseCounts {
         let leases = self.read_leases.lock();
-        let mut counts = ReadLeaseCounts::default();
+        let mut counts = ReadLeaseCounts {
+            sql: self.fast_sql_reads.load(Ordering::SeqCst),
+            ..Default::default()
+        };
         for entry in leases.live.values() {
             match entry.kind {
                 LeaseKind::Sql => counts.sql += 1,
@@ -575,6 +645,7 @@ impl FenceController {
                 "published namespace fence gate"
             );
         }
+        self.refresh_fast_reads();
         // After the gate is published, so that every woken writer re-checks against it.
         if generation_changed {
             self.write_queues.lock().retain(WriteQueueWaker::wake);
@@ -628,6 +699,7 @@ impl Transition {
         self.controller
             .gate
             .send_modify(|gate| gate.closing_reads = Some(key));
+        self.controller.refresh_fast_reads();
         tracing::debug!(
             namespace = %self.controller.namespace,
             operation_id = %key.0,
@@ -643,6 +715,7 @@ impl Transition {
             gate.closing_reads = None;
             was_closing
         });
+        self.controller.refresh_fast_reads();
     }
 
     /// Commit `request` in the metastore and publish the result.
@@ -1192,6 +1265,44 @@ pub(crate) mod tests {
 
     /// Registered write queues are woken after every change of the write generation, and only
     /// then; a waker whose manager is gone is forgotten.
+    /// The cost of admitting one read, on the SQL fast path and on the registered path that every
+    /// read took before it (and dumps and streams still take). Not a pass/fail test:
+    /// `cargo test -p libsql-server --release --lib -- --ignored --nocapture read_lease_cost`.
+    #[test]
+    #[ignore]
+    fn read_lease_cost() {
+        const N: u32 = 1_000_000;
+        const THREADS: u32 = 8;
+        let controller = FenceController::unfenced("ns".into());
+        for (label, class, kind) in [
+            (
+                "fast path (SQL, unfenced)",
+                OperationClass::NormalRead,
+                LeaseKind::Sql,
+            ),
+            ("registered", OperationClass::Stream, LeaseKind::Dump),
+        ] {
+            let started = std::time::Instant::now();
+            for _ in 0..N {
+                drop(controller.acquire_read_lease(class, kind, || ()).unwrap());
+            }
+            let one = started.elapsed() / N;
+            let started = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        for _ in 0..N / THREADS {
+                            drop(controller.acquire_read_lease(class, kind, || ()).unwrap());
+                        }
+                    });
+                }
+            });
+            let contended = started.elapsed() / N;
+            println!("{label}: {one:?} per read on one thread, {contended:?} per read across {THREADS} threads");
+        }
+        assert_eq!(controller.read_lease_counts().total(), 0);
+    }
+
     #[tokio::test]
     async fn dead_write_queues_and_drains_are_dropped_on_registration() {
         let controller = FenceController::unfenced("ns".into());
