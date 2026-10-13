@@ -201,6 +201,32 @@ mod tests {
         assert_eq!(refusal_backoff(u32::MAX), REFUSAL_BACKOFF_MAX);
     }
 
+    /// A denial learned from the primary turns the SQL read fast path off: no normal read is
+    /// admitted past it, on the fast path or any other.
+    #[test]
+    fn primary_denial_turns_the_fast_path_off() {
+        use super::super::controller::{FenceController, LeaseKind};
+        use crate::namespace::NamespaceName;
+
+        let fence = FenceController::unfenced(NamespaceName::from_string("ns".into()).unwrap());
+        let fast = fence
+            .acquire_read_lease(OperationClass::NormalRead, LeaseKind::Sql, || ())
+            .unwrap();
+        assert_eq!(fence.registered_read_leases(), 0);
+        let refusal =
+            PrimaryFenceRefusal::from_status(&status(FenceOutcome::MigrationReadFenced)).unwrap();
+        assert!(fence.observe_primary(Some(refusal.local_denial())));
+        let err = fence
+            .acquire_read_lease(OperationClass::NormalRead, LeaseKind::Sql, || ())
+            .unwrap_err();
+        assert_eq!(err.outcome(), FenceOutcome::MigrationReadFenced);
+        drop(fast);
+        assert!(fence.observe_primary(None));
+        assert!(fence
+            .acquire_read_lease(OperationClass::NormalRead, LeaseKind::Sql, || ())
+            .is_ok());
+    }
+
     #[test]
     fn observed_denial_refuses_local_reads_and_cancels_leases() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -210,6 +236,7 @@ mod tests {
         use crate::namespace::NamespaceName;
 
         let fence = FenceController::unfenced(NamespaceName::from_string("ns".into()).unwrap());
+        fence.serve_as_replica();
         let cancels = Arc::new(AtomicUsize::new(0));
         let lease = fence
             .acquire_read_lease(OperationClass::NormalRead, LeaseKind::Sql, {

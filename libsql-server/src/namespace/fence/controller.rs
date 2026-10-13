@@ -378,6 +378,9 @@ pub struct FenceController {
     fast_reads: AtomicBool,
     /// SQL read leases taken on the fast path and not released yet.
     fast_sql_reads: AtomicUsize,
+    /// The namespace is a copy served by a replica server (section 6.2). Its reads always take
+    /// the registered lease, so that [`observe_primary`](Self::observe_primary) can cancel them.
+    replica: AtomicBool,
     /// Notified whenever a read lease is released.
     read_released: Notify,
     /// The migration capabilities issued and not revoked, and the import calls running under
@@ -412,6 +415,7 @@ impl FenceController {
             read_leases: Mutex::new(ReadLeaseSet::default()),
             fast_reads: AtomicBool::new(false),
             fast_sql_reads: AtomicUsize::new(0),
+            replica: AtomicBool::new(false),
             read_released: Notify::new(),
             capabilities: Mutex::new(CapabilitySet::default()),
             import_released: Notify::new(),
@@ -567,12 +571,21 @@ impl FenceController {
                 && gate.indeterminate.is_none()
                 && gate.closing_reads.is_none()
                 && gate.permits(OperationClass::NormalRead).is_ok()
+                && !self.replica.load(Ordering::SeqCst)
                 && matches!(
                     gate.state(),
                     FenceState::Unfenced | FenceState::Released | FenceState::TargetWritable
                 )
         };
         self.fast_reads.store(fast, Ordering::SeqCst);
+    }
+
+    /// Mark the namespace as a copy served by a replica server, before its first connection:
+    /// none of its reads take the fast path (section 9.1), so all of them can be cancelled when
+    /// the replica learns that the primary's fence denies reads.
+    pub fn serve_as_replica(&self) {
+        self.replica.store(true, Ordering::SeqCst);
+        self.refresh_fast_reads();
     }
 
     /// The read leases registered under the lease lock (every lease but those on the fast path).
@@ -636,6 +649,9 @@ impl FenceController {
             gate.primary_denial = denial;
             true
         });
+        if changed {
+            self.refresh_fast_reads();
+        }
         if changed && deny {
             for entry in leases.live.values() {
                 if !entry.cancelled.swap(true, Ordering::AcqRel) {

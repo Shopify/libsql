@@ -66,6 +66,7 @@ impl ConfigureNamespace for ReplicaConfigurator {
     ) -> Pin<Box<dyn Future<Output = crate::Result<Namespace>> + Send + 'a>> {
         Box::pin(async move {
             tracing::debug!("creating replica namespace");
+            fence.serve_as_replica();
             let db_path = self.base.base_path.join("dbs").join(name.as_str());
             // Whether this server already had a copy of the namespace: a directory this setup
             // creates is removed again if the primary's fence refuses the namespace.
