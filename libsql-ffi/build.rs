@@ -255,7 +255,13 @@ pub fn build_bundled(out_dir: &str, out_path: &Path) {
     if cfg!(feature = "sqlean-extension-regexp") {
         enabled_extensions.push("regexp");
         sqlean_patterns.push("regexp/*.c");
-        sqlean_patterns.push("regexp/pcre2/pcre2_internal.h");
+        // This header is passed to the compiler as a source file, which produces a
+        // precompiled header instead of an object file. On Apple targets `ar` then
+        // drops the archive members that follow it and linking fails with missing
+        // symbols, so pass it only on other targets.
+        if !env::var("TARGET").map_or(false, |v| v.contains("apple")) {
+            sqlean_patterns.push("regexp/pcre2/pcre2_internal.h");
+        }
         sqlean_patterns.push("regexp/pcre2/*.c");
     }
 
