@@ -870,6 +870,11 @@ pub(crate) mod test {
 
         assert_eq!(request.await.unwrap().unwrap(), namespace);
         eviction.await.unwrap();
+        // Reloaded into a fresh entry; the evicted one was not filled.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        assert!(cached.read().await.is_some());
+        assert!(entry.read().await.is_none());
     }
 
     #[tokio::test]
@@ -1112,7 +1117,7 @@ pub(crate) mod test {
         let to = NamespaceName::from_string("to".to_string()).unwrap();
 
         store
-            .fork(from, to.clone(), DatabaseConfig::default(), None)
+            .fork(from.clone(), to.clone(), DatabaseConfig::default(), None)
             .await
             .unwrap();
 
@@ -1123,6 +1128,12 @@ pub(crate) mod test {
                 .unwrap(),
             to
         );
+        // The source was reloaded into a fresh entry; the left-empty one was
+        // not filled.
+        let cached = store.inner.store.get(&from).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        assert!(cached.read().await.is_some());
+        assert!(entry.read().await.is_none());
     }
 
     #[tokio::test]
@@ -1198,6 +1209,12 @@ pub(crate) mod test {
                 .unwrap(),
             to
         );
+        // The source was reloaded into a fresh entry; the emptied one was not
+        // filled.
+        let cached = store.inner.store.get(&from).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        assert!(cached.read().await.is_some());
+        assert!(entry.read().await.is_none());
     }
 
     #[tokio::test]
