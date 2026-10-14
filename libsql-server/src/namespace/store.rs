@@ -5,7 +5,7 @@ use async_lock::RwLock;
 use chrono::NaiveDateTime;
 use futures::TryFutureExt;
 use moka::future::Cache;
-use moka::ops::compute::Op;
+use moka::ops::compute::{CompResult, Op};
 use once_cell::sync::OnceCell;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
@@ -16,7 +16,10 @@ use crate::broadcaster::BroadcastMsg;
 use crate::connection::config::DatabaseConfig;
 use crate::database::DatabaseKind;
 use crate::error::Error;
-use crate::metrics::{NAMESPACE_EMPTIED_ENTRY, NAMESPACE_LOAD_LATENCY};
+use crate::metrics::{
+    NAMESPACE_EMPTIED_ENTRY, NAMESPACE_EMPTIED_ENTRY_GAVE_UP, NAMESPACE_LEFT_EMPTY_ENTRY_DROPPED,
+    NAMESPACE_LOAD_LATENCY,
+};
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
 use crate::stats::Stats;
 
@@ -397,6 +400,7 @@ impl NamespaceStore {
         }
 
         let error = self.emptied_entry_error(&namespace).await;
+        NAMESPACE_EMPTIED_ENTRY_GAVE_UP.increment(1);
         tracing::warn!(%namespace, %error, "namespace cache entry kept being emptied, giving up");
         Err(error)
     }
@@ -408,7 +412,8 @@ impl NamespaceStore {
     /// It never fills an entry itself, so it cannot open a namespace that the
     /// cache no longer holds.
     async fn evict_if_still_empty(&self, namespace: &NamespaceName, entry: &NamespaceEntry) {
-        self.inner
+        let result = self
+            .inner
             .store
             .entry_by_ref(namespace)
             .and_compute_with(|cached| {
@@ -419,6 +424,9 @@ impl NamespaceStore {
                 std::future::ready(if still_empty { Op::Remove } else { Op::Nop })
             })
             .await;
+        if matches!(result, CompResult::Removed(_)) {
+            NAMESPACE_LEFT_EMPTY_ENTRY_DROPPED.increment(1);
+        }
     }
 
     /// The error for a namespace whose cache entry was emptied while it was
