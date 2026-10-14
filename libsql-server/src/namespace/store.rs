@@ -932,6 +932,46 @@ pub(crate) mod test {
         assert!(entry.read().await.is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_waiting_on_one_left_empty_entry_share_one_reloaded_namespace() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        settle(&store, &entry).await;
+        const REQUESTS: usize = 8;
+        let requests: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                tokio::spawn({
+                    let store = store.clone();
+                    let namespace = namespace.clone();
+                    async move { store.with(namespace, |ns| ns.stats.clone()).await }
+                })
+            })
+            .collect();
+        wait_until("every request holds the entry", || {
+            Arc::strong_count(&entry) >= 2 + REQUESTS
+        })
+        .await;
+
+        // The namespace is taken out and its emptied entry stays cached: every
+        // request finds it, and every one of them may try to drop it.
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        let mut stats = Vec::with_capacity(REQUESTS);
+        for request in requests {
+            stats.push(request.await.unwrap().unwrap());
+        }
+        // One namespace, loaded once, into one fresh entry.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        let loaded = cached.read().await.as_ref().unwrap().stats.clone();
+        assert!(stats.iter().all(|stats| Arc::ptr_eq(stats, &loaded)));
+        assert!(entry.read().await.is_none());
+    }
+
     /// `start_waiting_request` with `attempts` attempts. With one, the emptied
     /// entry the request finds is also the last one it looks at.
     async fn start_request_with_attempts(
