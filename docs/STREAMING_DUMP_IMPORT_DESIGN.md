@@ -1,6 +1,6 @@
 # Design: memory-bounded streaming SQL dump importer for libsql-server
 
-Status: implemented (see `libsql-server/src/namespace/dump_import/`) · Target: `Shopify/libsql`, branch `v0.9.30-shopify-patches` · Related: Retail #35846, LibSQL DB Mover P0
+Status: implemented (see `libsql-server/src/namespace/dump_import/`) · Target: `Shopify/libsql`, branch `v0.9.30-shopify-patches`
 
 Sections marked *as built* record where the implementation refined the original proposal, including the changes made after the adversarial review of PR #51 (§18).
 
@@ -21,7 +21,7 @@ This document is written so that an implementer can follow it step by step witho
 ## 2. Non-goals
 
 - Enormous single statements / large BLOBs. A per-statement size cap exists purely as a safety valve; dumps exceeding it are rejected, not supported.
-- Fixing pre-existing namespace lifecycle issues (metastore row kept after a failed create; directory not cleaned when the request is cancelled). Documented in §13; owned by the DB Mover fence/quarantine work.
+- Fixing pre-existing namespace lifecycle issues (metastore row kept after a failed create; directory not cleaned when the request is cancelled). Documented in §13.
 - Binary SQLite file ingestion, bottomless memory behavior, Admin request timeouts, export-side changes.
 - Changing what the buffered importer does. It is moved, not modified.
 
@@ -590,7 +590,7 @@ Metrics (`metrics` 0.21 macros with labels):
 3. No server-side timeout exists for dump imports; the Admin HTTP request stays open for the whole import. Clients must not time out, or must tolerate (2).
 4. Bottomless, if enabled, has its own frame buffering/backpressure outside this design.
 
-These are tracked by the DB Mover quarantine/fence work (Retail #35846/#35848).
+None of these is fixed here. #53 proposed all-or-nothing namespace creation, which addresses (1) and (2); it is closed for now, and an operator deletes a namespace left behind by a failed import.
 
 ---
 
