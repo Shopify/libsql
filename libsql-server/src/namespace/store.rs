@@ -771,8 +771,16 @@ pub(crate) mod test {
 
     /// Yields until `condition` holds; fails the test instead of hanging.
     async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        wait_until_async(what, || std::future::ready(condition())).await
+    }
+
+    /// `wait_until` for a condition that is checked asynchronously.
+    async fn wait_until_async<Fut: std::future::Future<Output = bool>>(
+        what: &str,
+        condition: impl Fn() -> Fut,
+    ) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !condition() {
+            while !condition().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -873,21 +881,27 @@ pub(crate) mod test {
         let mut lock = entry.write().await;
         let request = start_waiting_request(&store, &namespace, &entry).await;
 
-        // What `destroy` does: remove the metastore record, then take the
-        // namespace out of its entry.
-        tokio::task::spawn_blocking({
+        // `destroy` removes the metastore record first, then takes the
+        // namespace out of its entry, for which it waits on the lock this
+        // test holds. The request must answer "missing" because of the record.
+        let destroy = tokio::spawn({
             let store = store.clone();
             let namespace = namespace.clone();
-            move || store.inner.metadata.remove(namespace)
+            async move { store.destroy(namespace, false).await }
+        });
+        wait_until_async("the record is removed", || async {
+            !store.exists(&namespace).await
         })
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        // Take the namespace out as destroy would once it gets the lock, so
+        // the request finds the entry empty whichever of the two wakes first.
         lock.take().unwrap().shutdown(false).await.unwrap();
         drop(lock);
 
         let error = request.await.unwrap().unwrap_err();
         assert!(matches!(error, Error::NamespaceDoesntExist(_)), "{error:?}");
+        destroy.await.unwrap().unwrap();
+        assert!(!store.inner.store.contains_key(&namespace));
     }
 
     #[tokio::test]
