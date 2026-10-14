@@ -50,6 +50,17 @@ impl ReplicaProxyService {
             Ok(None) | Err(crate::error::Error::NamespaceDoesntExist(_)) => {
                 Ok(self.user_auth_strategy.clone())
             }
+            // The namespace exists but cannot be served right now: neither
+            // missing (so no fallback to the user strategy) nor internal.
+            Err(e)
+                if matches!(
+                    e.as_ref(),
+                    crate::error::Error::NamespaceStoreShutdown
+                        | crate::error::Error::NamespaceUnavailable(_)
+                ) =>
+            {
+                Err(super::namespace_error_status(&e))
+            }
             Err(e) => Err(Status::internal(format!(
                 "Can't fetch jwt key for a namespace: {}",
                 e
@@ -125,5 +136,41 @@ impl Proxy for ReplicaProxyService {
 
         let mut client = self.client.clone();
         client.describe(req).await
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::auth::Disabled;
+    use crate::connection::config::DatabaseConfig;
+    use crate::namespace::{make_test_store, NamespaceName, RestoreOption};
+
+    #[tokio::test]
+    async fn auth_while_the_store_is_shut_down_is_unavailable() {
+        let tmp = tempdir().unwrap();
+        let store = make_test_store(tmp.path()).await;
+        store
+            .create(
+                NamespaceName::default(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.clone().shutdown().await.unwrap();
+        let service = ReplicaProxyService::new(
+            Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            Uri::from_static("http://127.0.0.1:1"),
+            store,
+            Auth::new(Disabled::new()),
+            true,
+        );
+
+        let status = service.do_auth(&mut Request::new(())).await.unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     }
 }
