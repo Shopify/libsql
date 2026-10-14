@@ -331,8 +331,24 @@ impl NamespaceStore {
     where
         Fun: FnOnce(&Namespace) -> R,
     {
+        self.with_attempts(namespace, MAX_EMPTIED_ENTRY_ATTEMPTS, f)
+            .await
+    }
+
+    /// `with`, giving up after `max_attempts` lookups found the namespace's
+    /// entry emptied. Kept apart from `with` so that tests can reach the
+    /// give-up path with a single emptied entry.
+    async fn with_attempts<Fun, R>(
+        &self,
+        namespace: NamespaceName,
+        max_attempts: usize,
+        f: Fun,
+    ) -> crate::Result<R>
+    where
+        Fun: FnOnce(&Namespace) -> R,
+    {
         let mut emptied: Option<NamespaceEntry> = None;
-        for _ in 0..MAX_EMPTIED_ENTRY_ATTEMPTS {
+        for _ in 0..max_attempts {
             if self.inner.has_shutdown.load(Ordering::Relaxed) {
                 return Err(Error::NamespaceStoreShutdown);
             }
@@ -681,25 +697,38 @@ pub(crate) mod test {
         namespace
     }
 
-    /// Starts `with` on `namespace` while the test holds the entry's write
-    /// lock, and returns once the request holds the same entry and waits for
-    /// the lock: the cache, the test and the request then share it.
-    async fn start_waiting_request(
+    /// Starts `request` while the test holds `entry`'s write lock, and returns
+    /// once the request holds the same entry and waits for the lock: the
+    /// cache, the test and the request then share it.
+    async fn start_waiting<Fut>(
         store: &NamespaceStore,
-        namespace: &NamespaceName,
         entry: &NamespaceEntry,
-    ) -> tokio::task::JoinHandle<crate::Result<NamespaceName>> {
+        request: impl FnOnce(NamespaceStore) -> Fut,
+    ) -> tokio::task::JoinHandle<Fut::Output>
+    where
+        Fut: std::future::Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
         settle(store, entry).await;
-        let request = tokio::spawn({
-            let store = store.clone();
-            let namespace = namespace.clone();
-            async move { store.with(namespace, |ns| ns.name().clone()).await }
-        });
+        let request = tokio::spawn(request(store.clone()));
         wait_until("the request holds the entry", || {
             Arc::strong_count(entry) >= 3
         })
         .await;
         request
+    }
+
+    /// `start_waiting` for a `with` on `namespace`.
+    async fn start_waiting_request(
+        store: &NamespaceStore,
+        namespace: &NamespaceName,
+        entry: &NamespaceEntry,
+    ) -> tokio::task::JoinHandle<crate::Result<NamespaceName>> {
+        let namespace = namespace.clone();
+        start_waiting(store, entry, move |store| async move {
+            store.with(namespace, |ns| ns.name().clone()).await
+        })
+        .await
     }
 
     /// Lets the cache drop the extra reference it keeps to a fresh entry until
@@ -815,6 +844,63 @@ pub(crate) mod test {
         assert!(!Arc::ptr_eq(&cached, &entry));
         assert!(cached.read().await.is_some());
         assert!(entry.read().await.is_none());
+    }
+
+    /// `start_waiting_request` with a single attempt, so that the emptied
+    /// entry the request finds is also the last one it looks at.
+    async fn start_last_attempt(
+        store: &NamespaceStore,
+        namespace: &NamespaceName,
+        entry: &NamespaceEntry,
+    ) -> tokio::task::JoinHandle<crate::Result<NamespaceName>> {
+        let namespace = namespace.clone();
+        start_waiting(store, entry, move |store| async move {
+            store
+                .with_attempts(namespace, 1, |ns| ns.name().clone())
+                .await
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn with_gives_up_with_unavailable_while_the_namespace_still_exists() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        let request = start_last_attempt(&store, &namespace, &entry).await;
+
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        // The metastore still has the namespace: giving up is temporary.
+        let error = request.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::NamespaceUnavailable(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn with_gives_up_with_missing_only_when_the_metastore_agrees() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        let request = start_last_attempt(&store, &namespace, &entry).await;
+
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let namespace = namespace.clone();
+            move || store.inner.metadata.remove(namespace)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::NamespaceDoesntExist(_)), "{error:?}");
     }
 
     #[tokio::test]
@@ -1013,6 +1099,40 @@ pub(crate) mod test {
                 .unwrap(),
             to
         );
+    }
+
+    #[tokio::test]
+    async fn fork_reports_unavailable_when_its_source_is_emptied_between_its_loads() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let from = create(&store, "from").await;
+        let to = NamespaceName::from_string("to".to_string()).unwrap();
+        // Holding the destination entry's lock stops the fork after it loaded
+        // its source through `with` and before it reads the source from its
+        // own lookup.
+        let to_entry: NamespaceEntry = Default::default();
+        store.inner.store.insert(to.clone(), to_entry.clone()).await;
+        let to_lock = to_entry.write().await;
+        let fork = start_waiting(&store, &to_entry, {
+            let (from, to) = (from.clone(), to.clone());
+            move |store| async move { store.fork(from, to, DatabaseConfig::default(), None).await }
+        })
+        .await;
+
+        // The source is taken out, and its emptied entry stays cached.
+        let from_entry = store.inner.store.get(&from).await.unwrap();
+        from_entry
+            .write()
+            .await
+            .take()
+            .unwrap()
+            .shutdown(false)
+            .await
+            .unwrap();
+        drop(to_lock);
+
+        let error = fork.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::NamespaceUnavailable(_)), "{error:?}");
     }
 
     #[tokio::test]
