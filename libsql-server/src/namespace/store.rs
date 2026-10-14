@@ -29,7 +29,8 @@ use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 type NamespaceEntry = Arc<RwLock<Option<Namespace>>>;
 
 /// How many times `with` looks up a namespace whose cache entry was emptied
-/// under it (by shutdown, eviction or destroy) before giving up.
+/// under it (by shutdown, eviction or destroy) before giving up. Dropping an
+/// entry that was left empty is not a lookup and does not count.
 const MAX_EMPTIED_ENTRY_ATTEMPTS: usize = 3;
 
 /// Stores and manage a set of namespaces.
@@ -348,7 +349,8 @@ impl NamespaceStore {
         Fun: FnOnce(&Namespace) -> R,
     {
         let mut emptied: Option<NamespaceEntry> = None;
-        for _ in 0..max_attempts {
+        let mut attempts_left = max_attempts;
+        while attempts_left > 0 {
             if self.inner.has_shutdown.load(Ordering::Relaxed) {
                 return Err(Error::NamespaceStoreShutdown);
             }
@@ -366,6 +368,8 @@ impl NamespaceStore {
             if emptied.as_ref().is_some_and(|e| Arc::ptr_eq(e, &entry)) {
                 // The emptied entry is still the cached one, so nothing is going
                 // to refill it: drop it, and the next lookup loads the namespace.
+                // This is not an attempt: `emptied` is cleared, so this branch
+                // cannot run again before another emptied entry was found.
                 tracing::warn!(%namespace, "namespace cache entry was left empty, dropping it");
                 self.evict_if_still_empty(&namespace, &entry).await;
                 emptied = None;
@@ -384,6 +388,7 @@ impl NamespaceStore {
             // does not mean it is missing, so check again with a fresh entry.
             NAMESPACE_EMPTIED_ENTRY.increment(1);
             tracing::warn!(%namespace, "namespace cache entry was emptied while in use, looking it up again");
+            attempts_left -= 1;
             emptied = Some(entry);
         }
 
@@ -846,20 +851,38 @@ pub(crate) mod test {
         assert!(entry.read().await.is_none());
     }
 
-    /// `start_waiting_request` with a single attempt, so that the emptied
+    /// `start_waiting_request` with `attempts` attempts. With one, the emptied
     /// entry the request finds is also the last one it looks at.
-    async fn start_last_attempt(
+    async fn start_request_with_attempts(
         store: &NamespaceStore,
         namespace: &NamespaceName,
         entry: &NamespaceEntry,
+        attempts: usize,
     ) -> tokio::task::JoinHandle<crate::Result<NamespaceName>> {
         let namespace = namespace.clone();
         start_waiting(store, entry, move |store| async move {
             store
-                .with_attempts(namespace, 1, |ns| ns.name().clone())
+                .with_attempts(namespace, attempts, |ns| ns.name().clone())
                 .await
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn dropping_a_left_empty_entry_does_not_spend_an_attempt() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        // Two attempts: one for the emptied entry, one for the fresh one. If
+        // dropping the left-empty entry counted, there would be none left.
+        let request = start_request_with_attempts(&store, &namespace, &entry, 2).await;
+
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        assert_eq!(request.await.unwrap().unwrap(), namespace);
     }
 
     #[tokio::test]
@@ -869,7 +892,7 @@ pub(crate) mod test {
         let namespace = create(&store, "ns").await;
         let entry = store.inner.store.get(&namespace).await.unwrap();
         let mut lock = entry.write().await;
-        let request = start_last_attempt(&store, &namespace, &entry).await;
+        let request = start_request_with_attempts(&store, &namespace, &entry, 1).await;
 
         lock.take().unwrap().shutdown(false).await.unwrap();
         drop(lock);
@@ -886,7 +909,7 @@ pub(crate) mod test {
         let namespace = create(&store, "ns").await;
         let entry = store.inner.store.get(&namespace).await.unwrap();
         let mut lock = entry.write().await;
-        let request = start_last_attempt(&store, &namespace, &entry).await;
+        let request = start_request_with_attempts(&store, &namespace, &entry, 1).await;
 
         tokio::task::spawn_blocking({
             let store = store.clone();
