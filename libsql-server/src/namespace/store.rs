@@ -5,6 +5,7 @@ use async_lock::RwLock;
 use chrono::NaiveDateTime;
 use futures::TryFutureExt;
 use moka::future::Cache;
+use moka::ops::compute::Op;
 use once_cell::sync::OnceCell;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use crate::broadcaster::BroadcastMsg;
 use crate::connection::config::DatabaseConfig;
 use crate::database::DatabaseKind;
 use crate::error::Error;
-use crate::metrics::NAMESPACE_LOAD_LATENCY;
+use crate::metrics::{NAMESPACE_EMPTIED_ENTRY, NAMESPACE_LOAD_LATENCY};
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
 use crate::stats::Stats;
 
@@ -26,6 +27,10 @@ use super::schema_lock::SchemaLocksRegistry;
 use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
 type NamespaceEntry = Arc<RwLock<Option<Namespace>>>;
+
+/// How many times `with` looks up a namespace whose cache entry was emptied
+/// under it (by shutdown, eviction or destroy) before giving up.
+const MAX_EMPTIED_ENTRY_ATTEMPTS: usize = 3;
 
 /// Stores and manage a set of namespaces.
 pub struct NamespaceStore {
@@ -141,11 +146,11 @@ impl NamespaceStore {
     }
 
     pub async fn checkpoint(&self, namespace: NamespaceName) -> crate::Result<()> {
-        let entry = self
-            .inner
-            .store
-            .get_with(namespace.clone(), async { Default::default() })
-            .await;
+        // Only a loaded namespace has anything to checkpoint. Inserting an empty
+        // entry for one that is not loaded would leave it cached empty.
+        let Some(entry) = self.inner.store.get(&namespace).await else {
+            return Ok(());
+        };
         let lock = entry.read().await;
         if let Some(ns) = &*lock {
             ns.checkpoint().await?;
@@ -224,6 +229,10 @@ impl NamespaceStore {
         if !self.inner.metadata.exists(&from).await {
             return Err(crate::error::Error::NamespaceDoesntExist(from.to_string()));
         }
+        // Load the source as `with` does, so a source whose cache entry was
+        // emptied (by eviction, or left empty) is reloaded rather than failing
+        // the fork, and its errors are the same as `with`'s.
+        self.with(from.clone(), |_| ()).await?;
 
         let to_entry = self
             .inner
@@ -246,7 +255,7 @@ impl NamespaceStore {
             .await?;
         let from_lock = from_entry.read().await;
         let Some(from_ns) = &*from_lock else {
-            return Err(crate::error::Error::NamespaceDoesntExist(from.to_string()));
+            return Err(self.emptied_entry_error(&from).await);
         };
 
         struct Bomb {
@@ -322,30 +331,83 @@ impl NamespaceStore {
     where
         Fun: FnOnce(&Namespace) -> R,
     {
-        if namespace != NamespaceName::default()
-            && !self.inner.metadata.exists(&namespace).await
-            && !self.inner.allow_lazy_creation
-        {
-            return Err(Error::NamespaceDoesntExist(namespace.to_string()));
-        }
+        let mut emptied: Option<NamespaceEntry> = None;
+        for _ in 0..MAX_EMPTIED_ENTRY_ATTEMPTS {
+            if self.inner.has_shutdown.load(Ordering::Relaxed) {
+                return Err(Error::NamespaceStoreShutdown);
+            }
+            if namespace != NamespaceName::default()
+                && !self.inner.metadata.exists(&namespace).await
+                && !self.inner.allow_lazy_creation
+            {
+                return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+            }
 
-        let f = {
-            let name = namespace.clone();
-            move |ns: NamespaceEntry| async move {
-                let lock = ns.read().await;
-                match &*lock {
-                    Some(ns) => Ok(f(ns)),
-                    // the namespace was taken out of the entry
-                    None => Err(Error::NamespaceDoesntExist(name.to_string())),
+            let handle = self.inner.metadata.handle(namespace.to_owned()).await;
+            let entry = self
+                .load_namespace(&namespace, handle, RestoreOption::Latest)
+                .await?;
+            if emptied.as_ref().is_some_and(|e| Arc::ptr_eq(e, &entry)) {
+                // The emptied entry is still the cached one, so nothing is going
+                // to refill it: drop it, and the next lookup loads the namespace.
+                tracing::warn!(%namespace, "namespace cache entry was left empty, dropping it");
+                self.evict_if_still_empty(&namespace, &entry).await;
+                emptied = None;
+                continue;
+            }
+
+            {
+                let lock = entry.read().await;
+                if let Some(ns) = &*lock {
+                    return Ok(f(ns));
                 }
             }
-        };
 
-        let handle = self.inner.metadata.handle(namespace.to_owned()).await;
-        f(self
-            .load_namespace(&namespace, handle, RestoreOption::Latest)
-            .await?)
-        .await
+            // The namespace was taken out of the entry after we got it: by
+            // shutdown, by cache eviction, or by a concurrent destroy. That
+            // does not mean it is missing, so check again with a fresh entry.
+            NAMESPACE_EMPTIED_ENTRY.increment(1);
+            tracing::warn!(%namespace, "namespace cache entry was emptied while in use, looking it up again");
+            emptied = Some(entry);
+        }
+
+        let error = self.emptied_entry_error(&namespace).await;
+        tracing::warn!(%namespace, %error, "namespace cache entry kept being emptied, giving up");
+        Err(error)
+    }
+
+    /// Removes `entry` from the cache if it is still the cached entry for
+    /// `namespace` and still empty, so that the next lookup loads the namespace
+    /// afresh (with its own restore option). Leaves the cache alone if it holds
+    /// another entry, or if someone holds `entry`'s lock and may be filling it.
+    /// It never fills an entry itself, so it cannot open a namespace that the
+    /// cache no longer holds.
+    async fn evict_if_still_empty(&self, namespace: &NamespaceName, entry: &NamespaceEntry) {
+        self.inner
+            .store
+            .entry_by_ref(namespace)
+            .and_compute_with(|cached| {
+                let still_empty = cached.is_some_and(|cached| {
+                    Arc::ptr_eq(cached.value(), entry)
+                        && entry.try_read().is_some_and(|lock| lock.is_none())
+                });
+                std::future::ready(if still_empty { Op::Remove } else { Op::Nop })
+            })
+            .await;
+    }
+
+    /// The error for a namespace whose cache entry was emptied while it was
+    /// being used. `NamespaceDoesntExist` only when the metastore agrees: a
+    /// client must be able to trust it, and a namespace that still exists but
+    /// cannot be served right now is a temporary condition, not a missing one.
+    async fn emptied_entry_error(&self, namespace: &NamespaceName) -> Error {
+        if self.inner.has_shutdown.load(Ordering::Relaxed) {
+            Error::NamespaceStoreShutdown
+        } else if !self.inner.metadata.exists(namespace).await {
+            Error::NamespaceDoesntExist(namespace.to_string())
+        } else {
+            Error::NamespaceUnavailable(namespace.to_string())
+        }
     }
 
     fn resolve_attach_fn(&self) -> ResolveNamespacePathFn {
@@ -418,6 +480,10 @@ impl NamespaceStore {
         restore_option: RestoreOption,
         db_config: DatabaseConfig,
     ) -> crate::Result<()> {
+        if self.inner.has_shutdown.load(Ordering::Relaxed) {
+            return Err(Error::NamespaceStoreShutdown);
+        }
+
         if let Some(shared_schema_name) = &db_config.shared_schema_name {
             // we hold a lock for the duration of the namespace creation
             let _lock = self
@@ -444,6 +510,12 @@ impl NamespaceStore {
         tracing::debug!("storing db config");
         handle.store(db_config).await?;
         tracing::debug!("completed storing db config, loading namespace");
+        // An empty entry left cached (for example by a fork that failed before
+        // storing its record) would be returned as is, and the namespace would
+        // not be loaded with `restore_option` (a dump, say).
+        if let Some(entry) = self.inner.store.get(&namespace).await {
+            self.evict_if_still_empty(&namespace, &entry).await;
+        }
         self.load_namespace(&namespace, handle, restore_option)
             .await?;
 
@@ -530,5 +602,460 @@ impl NamespaceStore {
         self.get_configurator(db_config)
             .cleanup(namespace, db_config, prune_all, bottomless_db_id_init)
             .await
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    use std::path::Path;
+
+    use axum::response::IntoResponse;
+    use hyper::StatusCode;
+    use libsql_sys::wal::Sqlite3WalManager;
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+
+    use super::*;
+    use crate::namespace::configurator::{BaseNamespaceConfig, PrimaryConfig, PrimaryConfigurator};
+    use crate::namespace::meta_store::metastore_connection_maker;
+
+    pub(crate) async fn make_store(path: &Path) -> NamespaceStore {
+        let (maker, manager) = metastore_connection_maker(None, path).await.unwrap();
+        let meta_store = MetaStore::new(
+            Default::default(),
+            path,
+            maker().unwrap(),
+            manager,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+        let base_config = BaseNamespaceConfig {
+            base_path: path.to_path_buf().into(),
+            extensions: Arc::new([]),
+            stats_sender: tokio::sync::mpsc::channel(1).0,
+            max_response_size: 100_000_000,
+            max_total_response_size: 100_000_000,
+            max_concurrent_connections: Arc::new(Semaphore::new(10)),
+            max_concurrent_requests: 10_000,
+            encryption_config: None,
+            connection_creation_timeout: None,
+            disable_intelligent_throttling: false,
+        };
+        let primary_config = PrimaryConfig {
+            max_log_size: 1_000_000_000,
+            max_log_duration: None,
+            bottomless_replication: None,
+            scripted_backup: None,
+            checkpoint_interval: None,
+        };
+        let mut configurators = NamespaceConfigurators::empty();
+        configurators.with_primary(PrimaryConfigurator::new(
+            base_config,
+            primary_config,
+            Arc::new(Sqlite3WalManager::default),
+        ));
+
+        NamespaceStore::new(
+            false,
+            false,
+            10,
+            meta_store,
+            configurators,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn create(store: &NamespaceStore, name: &str) -> NamespaceName {
+        let namespace = NamespaceName::from_string(name.to_string()).unwrap();
+        store
+            .create(
+                namespace.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        namespace
+    }
+
+    /// Starts `with` on `namespace` while the test holds the entry's write
+    /// lock, and returns once the request holds the same entry and waits for
+    /// the lock: the cache, the test and the request then share it.
+    async fn start_waiting_request(
+        store: &NamespaceStore,
+        namespace: &NamespaceName,
+        entry: &NamespaceEntry,
+    ) -> tokio::task::JoinHandle<crate::Result<NamespaceName>> {
+        settle(store, entry).await;
+        let request = tokio::spawn({
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move { store.with(namespace, |ns| ns.name().clone()).await }
+        });
+        wait_until("the request holds the entry", || {
+            Arc::strong_count(entry) >= 3
+        })
+        .await;
+        request
+    }
+
+    /// Lets the cache drop the extra reference it keeps to a fresh entry until
+    /// its housekeeping runs, so that a third holder of `entry` can only be the
+    /// request or fork under test.
+    async fn settle(store: &NamespaceStore, entry: &NamespaceEntry) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(entry) > 2 {
+                store.inner.store.run_pending_tasks().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cache keeps an extra reference to the entry");
+        assert_eq!(Arc::strong_count(entry), 2);
+    }
+
+    /// Yields until `condition` holds; fails the test instead of hanging.
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    #[tokio::test]
+    async fn with_after_shutdown_is_unavailable_not_missing() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+
+        store.clone().shutdown().await.unwrap();
+
+        let error = store.with(namespace, |_| ()).await.unwrap_err();
+        assert!(matches!(error, Error::NamespaceStoreShutdown), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn with_reloads_a_namespace_evicted_while_waiting_for_it() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        let request = start_waiting_request(&store, &namespace, &entry).await;
+
+        // Evict the entry the request holds, as cache pressure or idleness
+        // does. The eviction listener waits for the write lock this test
+        // holds, so evict from another task and wait for the removal.
+        let eviction = tokio::spawn({
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move { store.inner.store.invalidate(&namespace).await }
+        });
+        wait_until("the entry is evicted", || {
+            !store.inner.store.contains_key(&namespace)
+        })
+        .await;
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        assert_eq!(request.await.unwrap().unwrap(), namespace);
+        eviction.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn with_reports_missing_for_a_namespace_destroyed_while_waiting_for_it() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        let request = start_waiting_request(&store, &namespace, &entry).await;
+
+        // What `destroy` does: remove the metastore record, then take the
+        // namespace out of its entry.
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let namespace = namespace.clone();
+            move || store.inner.metadata.remove(namespace)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::NamespaceDoesntExist(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn with_loads_a_namespace_whose_cached_entry_stays_empty() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        let request = start_waiting_request(&store, &namespace, &entry).await;
+
+        // The namespace is taken out but its emptied entry stays cached, as an
+        // entry left behind by a fork that failed before storing its record:
+        // nothing else is going to refill it.
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        assert_eq!(request.await.unwrap().unwrap(), namespace);
+        // The empty entry was dropped and a fresh one loaded; it was not filled.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        assert!(cached.read().await.is_some());
+        assert!(entry.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn evict_if_still_empty_drops_only_the_cached_unlocked_empty_entry() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let cached = |store: &NamespaceStore| {
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move { store.inner.store.get(&namespace).await }
+        };
+
+        // A loaded cached entry is not empty: it stays.
+        let loaded = cached(&store).await.unwrap();
+        store.evict_if_still_empty(&namespace, &loaded).await;
+        assert!(Arc::ptr_eq(&cached(&store).await.unwrap(), &loaded));
+
+        // An empty entry that is not the cached one leaves the cached empty
+        // entry alone.
+        let empty: NamespaceEntry = Default::default();
+        store
+            .inner
+            .store
+            .insert(namespace.clone(), empty.clone())
+            .await;
+        let other: NamespaceEntry = Default::default();
+        store.evict_if_still_empty(&namespace, &other).await;
+        assert!(Arc::ptr_eq(&cached(&store).await.unwrap(), &empty));
+
+        // An empty cached entry whose lock is held (it may be being filled)
+        // stays. Evicting it would wait for that lock, so bound the call.
+        let lock = empty.write().await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.evict_if_still_empty(&namespace, &empty),
+        )
+        .await
+        .expect("evicting a locked entry must not wait for its lock");
+        assert!(Arc::ptr_eq(&cached(&store).await.unwrap(), &empty));
+        drop(lock);
+
+        // Once nobody holds it, the empty cached entry is dropped.
+        store.evict_if_still_empty(&namespace, &empty).await;
+        assert!(!store.inner.store.contains_key(&namespace));
+    }
+
+    #[tokio::test]
+    async fn create_loads_a_namespace_over_an_empty_cached_entry() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = NamespaceName::from_string("ns".to_string()).unwrap();
+        // What a fork that failed before storing its record leaves behind.
+        let empty: NamespaceEntry = Default::default();
+        store
+            .inner
+            .store
+            .insert(namespace.clone(), empty.clone())
+            .await;
+
+        store
+            .create(
+                namespace.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        // Loaded by create itself, with its restore option.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &empty));
+        assert!(cached.read().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_after_shutdown_is_refused() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        store.clone().shutdown().await.unwrap();
+        let namespace = NamespaceName::from_string("ns".to_string()).unwrap();
+
+        let error = store
+            .create(
+                namespace.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::NamespaceStoreShutdown), "{error:?}");
+        assert!(!store.inner.metadata.exists(&namespace).await);
+    }
+
+    #[tokio::test]
+    async fn fork_loads_a_source_whose_cached_entry_was_left_empty() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let from = create(&store, "from").await;
+        let entry = store.inner.store.get(&from).await.unwrap();
+        entry
+            .write()
+            .await
+            .take()
+            .unwrap()
+            .shutdown(false)
+            .await
+            .unwrap();
+        let to = NamespaceName::from_string("to".to_string()).unwrap();
+
+        store
+            .fork(from, to.clone(), DatabaseConfig::default(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .with(to.clone(), |ns| ns.name().clone())
+                .await
+                .unwrap(),
+            to
+        );
+    }
+
+    #[tokio::test]
+    async fn with_reports_shutdown_when_the_store_shuts_down_while_waiting() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        let request = start_waiting_request(&store, &namespace, &entry).await;
+
+        // The rolling-restart case: shutdown starts while the request waits,
+        // then takes the namespace out of the entry the request holds.
+        let shutdown = tokio::spawn(store.clone().shutdown());
+        wait_until("shutdown has started", || {
+            store.inner.has_shutdown.load(Ordering::Relaxed)
+        })
+        .await;
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::NamespaceStoreShutdown), "{error:?}");
+        shutdown.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_does_not_cache_an_empty_entry_for_an_unloaded_namespace() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        store.inner.store.invalidate(&namespace).await;
+
+        store.checkpoint(namespace.clone()).await.unwrap();
+
+        assert!(!store.inner.store.contains_key(&namespace));
+        assert_eq!(
+            store
+                .with(namespace.clone(), |ns| ns.name().clone())
+                .await
+                .unwrap(),
+            namespace
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_reloads_a_source_emptied_while_waiting_for_it() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let from = create(&store, "from").await;
+        let to = NamespaceName::from_string("to".to_string()).unwrap();
+        let entry = store.inner.store.get(&from).await.unwrap();
+        let mut lock = entry.write().await;
+        settle(&store, &entry).await;
+        let fork = tokio::spawn({
+            let store = store.clone();
+            let (from, to) = (from.clone(), to.clone());
+            async move { store.fork(from, to, DatabaseConfig::default(), None).await }
+        });
+        wait_until("the fork holds the source entry", || {
+            Arc::strong_count(&entry) >= 3
+        })
+        .await;
+
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        fork.await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .with(to.clone(), |ns| ns.name().clone())
+                .await
+                .unwrap(),
+            to
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emptied_entry_is_missing_only_when_the_metastore_agrees() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+
+        let error = store.emptied_entry_error(&namespace).await;
+        assert!(matches!(error, Error::NamespaceUnavailable(_)), "{error:?}");
+
+        tokio::task::spawn_blocking({
+            let store = store.clone();
+            let namespace = namespace.clone();
+            move || store.inner.metadata.remove(namespace)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let error = store.emptied_entry_error(&namespace).await;
+        assert!(matches!(error, Error::NamespaceDoesntExist(_)), "{error:?}");
+
+        store.inner.has_shutdown.store(true, Ordering::Relaxed);
+        let error = store.emptied_entry_error(&namespace).await;
+        assert!(matches!(error, Error::NamespaceStoreShutdown), "{error:?}");
+    }
+
+    #[test]
+    fn temporarily_unavailable_namespaces_answer_503() {
+        for error in [
+            Error::NamespaceStoreShutdown,
+            Error::NamespaceUnavailable("ns".to_string()),
+        ] {
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            Error::NamespaceDoesntExist("ns".to_string())
+                .into_response()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

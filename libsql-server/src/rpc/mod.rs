@@ -23,6 +23,24 @@ pub mod replica_proxy;
 pub mod replication;
 pub mod streaming_exec;
 
+/// The gRPC status for an error from `NamespaceStore::with`. A namespace that
+/// exists but cannot be served right now (the store is shutting down, or its
+/// cache entry was emptied) is `UNAVAILABLE`, so clients retry it instead of
+/// treating it as missing or as an internal failure.
+pub(crate) fn namespace_error_status(error: &crate::Error) -> Status {
+    // `Error::as_ref` unwraps an `Error::Ref` from the namespace cache.
+    #[allow(clippy::useless_asref)]
+    match error.as_ref() {
+        crate::Error::NamespaceDoesntExist(_) => Status::failed_precondition(
+            libsql_replication::rpc::replication::NAMESPACE_DOESNT_EXIST,
+        ),
+        crate::Error::NamespaceStoreShutdown | crate::Error::NamespaceUnavailable(_) => {
+            Status::unavailable(error.to_string())
+        }
+        _ => Status::internal(error.to_string()),
+    }
+}
+
 pub async fn run_rpc_server<A: crate::net::Accept>(
     proxy_service: ProxyService,
     acceptor: A,
@@ -147,5 +165,40 @@ fn trace_request<B>(req: &hyper::Request<B>, span: &Span) {
         if let Ok(s) = v.to_str() {
             metrics::increment_counter!(CLIENT_VERSION, "version" => s.to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use tonic::Code;
+
+    use super::namespace_error_status;
+    use crate::Error;
+
+    #[test]
+    fn namespace_errors_map_to_grpc_status() {
+        let cases = [
+            (
+                Error::NamespaceDoesntExist("ns".into()),
+                Code::FailedPrecondition,
+            ),
+            (Error::NamespaceStoreShutdown, Code::Unavailable),
+            (Error::NamespaceUnavailable("ns".into()), Code::Unavailable),
+            (
+                Error::Ref(Arc::new(Error::NamespaceUnavailable("ns".into()))),
+                Code::Unavailable,
+            ),
+            (Error::InvalidNamespace, Code::Internal),
+        ];
+        for (error, code) in cases {
+            assert_eq!(namespace_error_status(&error).code(), code, "{error:?}");
+        }
+        // Replicas match on the message to decide that a namespace is gone.
+        assert_eq!(
+            namespace_error_status(&Error::NamespaceDoesntExist("ns".into())).message(),
+            libsql_replication::rpc::replication::NAMESPACE_DOESNT_EXIST
+        );
     }
 }

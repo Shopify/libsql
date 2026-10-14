@@ -25,6 +25,12 @@ pub async fn authenticate<T>(
             crate::error::Error::NamespaceDoesntExist(_) => {
                 return Err(tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST))
             }
+            // The namespace exists but cannot be served right now: neither
+            // missing (so no fallback to the user strategy) nor internal.
+            crate::error::Error::NamespaceStoreShutdown
+            | crate::error::Error::NamespaceUnavailable(_) => {
+                return Err(Status::unavailable(e.to_string()))
+            }
             _ => Err(Status::internal(format!(
                 "Error fetching jwt key for a namespace: {}",
                 e

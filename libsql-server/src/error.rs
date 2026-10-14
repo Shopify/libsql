@@ -102,6 +102,8 @@ pub enum Error {
     UrlParseError(#[from] url::ParseError),
     #[error("Namespace store has shutdown")]
     NamespaceStoreShutdown,
+    #[error("Namespace `{0}` is temporarily unavailable")]
+    NamespaceUnavailable(String),
     #[error("Unable to update metastore: {0}")]
     MetaStoreUpdateFailure(Box<dyn std::error::Error + Send + Sync>),
     // This is for errors returned by moka
@@ -212,6 +214,7 @@ impl IntoResponse for &Error {
             PrimaryStreamInterupted => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             UrlParseError(_) => self.format_err(StatusCode::BAD_REQUEST),
             NamespaceStoreShutdown => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
+            NamespaceUnavailable(_) => self.format_err(StatusCode::SERVICE_UNAVAILABLE),
             MetaStoreUpdateFailure(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
             Ref(this) => this.as_ref().into_response(),
             ProstDecode(_) => self.format_err(StatusCode::INTERNAL_SERVER_ERROR),
