@@ -164,6 +164,10 @@ impl NamespaceStore {
         namespace: NamespaceName,
         restore_option: RestoreOption,
     ) -> anyhow::Result<()> {
+        if self.inner.has_shutdown.load(Ordering::Relaxed) {
+            return Err(Error::NamespaceStoreShutdown.into());
+        }
+
         // The process for reseting is as follow:
         // - get a lock on the namespace entry, if the entry exists, then it's a lock on the entry,
         // if it doesn't exist, insert an empty entry and take a lock on it
@@ -474,6 +478,12 @@ impl NamespaceStore {
         restore_option: RestoreOption,
     ) -> crate::Result<NamespaceEntry> {
         let init = async {
+            // Shutdown may have started since the caller checked. A namespace
+            // opened now would not be in the entries shutdown takes out, so
+            // nobody would ever shut it down.
+            if self.inner.has_shutdown.load(Ordering::Relaxed) {
+                return Err(Error::NamespaceStoreShutdown);
+            }
             let ns = self
                 .make_namespace(namespace, db_config, restore_option)
                 .await?;
@@ -772,6 +782,50 @@ pub(crate) mod test {
 
         let error = store.with(namespace, |_| ()).await.unwrap_err();
         assert!(matches!(error, Error::NamespaceStoreShutdown), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn load_namespace_refuses_to_open_a_namespace_once_the_store_has_shut_down() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        // Not cached, so the load would open the namespace.
+        store.inner.store.invalidate(&namespace).await;
+        store.inner.has_shutdown.store(true, Ordering::Relaxed);
+
+        let handle = store.inner.metadata.handle(namespace.clone()).await;
+        let error = store
+            .load_namespace(&namespace, handle, RestoreOption::Latest)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error.as_ref(), Error::NamespaceStoreShutdown),
+            "{error:?}"
+        );
+        assert!(!store.inner.store.contains_key(&namespace));
+    }
+
+    #[tokio::test]
+    async fn reset_after_shutdown_is_refused() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        store.clone().shutdown().await.unwrap();
+
+        let error = store
+            .reset(namespace.clone(), RestoreOption::Latest)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error.downcast_ref::<Error>(),
+                Some(Error::NamespaceStoreShutdown)
+            ),
+            "{error:?}"
+        );
+        assert!(!store.inner.store.contains_key(&namespace));
     }
 
     #[tokio::test]
