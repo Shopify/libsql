@@ -518,12 +518,49 @@ impl NamespaceStore {
         tracing::debug!("storing db config");
         handle.store(db_config).await?;
         tracing::debug!("completed storing db config, loading namespace");
-        self.load_namespace(&namespace, handle, restore_option)
+        self.load_created(&namespace, handle, restore_option)
             .await?;
 
         tracing::debug!("completed loading namespace");
 
         Ok(())
+    }
+
+    /// Loads the namespace whose record `create` has just stored. If shutdown
+    /// started in between, `load_namespace` refuses before anything is opened
+    /// or written, and the record is removed again. Left in place, it would
+    /// make every retry answer "already exists" for a namespace that was never
+    /// loaded, so its restore option would never be applied.
+    async fn load_created(
+        &self,
+        namespace: &NamespaceName,
+        handle: MetaStoreHandle,
+        restore_option: RestoreOption,
+    ) -> crate::Result<()> {
+        let error = match self.load_namespace(namespace, handle, restore_option).await {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        if matches!(error.as_ref(), Error::NamespaceStoreShutdown) {
+            let removed = tokio::task::spawn_blocking({
+                let metadata = self.inner.metadata.clone();
+                let namespace = namespace.clone();
+                move || metadata.remove(namespace)
+            })
+            .await;
+            match removed {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::error!(
+                    %namespace,
+                    "failed to remove the record of a namespace whose creation shutdown interrupted: {e}"
+                ),
+                Err(e) => tracing::error!(
+                    %namespace,
+                    "failed to remove the record of a namespace whose creation shutdown interrupted: {e}"
+                ),
+            }
+        }
+        Err(error)
     }
 
     pub async fn shutdown(self) -> crate::Result<()> {
@@ -900,6 +937,47 @@ pub(crate) mod test {
             &store.inner.store.get(&namespace).await.unwrap(),
             &entry
         ));
+    }
+
+    #[tokio::test]
+    async fn create_removes_its_record_when_shutdown_starts_before_its_load() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = NamespaceName::from_string("ns".to_string()).unwrap();
+
+        // `create`'s steps up to its load, then shutdown starts: the only
+        // place where a stored record has no loaded namespace behind it.
+        assert!(!store.inner.metadata.exists(&namespace).await);
+        let handle = store.inner.metadata.handle(namespace.clone()).await;
+        handle
+            .store(Arc::new(DatabaseConfig::default()))
+            .await
+            .unwrap();
+        store.inner.has_shutdown.store(true, Ordering::Relaxed);
+
+        let error = store
+            .load_created(&namespace, handle, RestoreOption::Latest)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.as_ref(), Error::NamespaceStoreShutdown),
+            "{error:?}"
+        );
+        assert!(!store.inner.metadata.exists(&namespace).await);
+
+        // A retry against a fresh store on the same files creates the
+        // namespace instead of answering "already exists".
+        drop(store);
+        let store = make_store(tmp.path()).await;
+        store
+            .create(
+                namespace.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(store.inner.store.get(&namespace).await.is_some());
     }
 
     #[tokio::test]
