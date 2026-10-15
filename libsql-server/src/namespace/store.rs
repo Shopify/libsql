@@ -80,9 +80,9 @@ impl NamespaceStore {
                 // On the other, if there's lots of cache pressure, snapshotting
                 // very often will kill the machine's I/O.
                 Box::pin(async move {
-                    tracing::info!("namespace `{name}` deallocated");
                     // shutdown namespace
                     if let Some(ns) = ns.write().await.take() {
+                        tracing::info!("namespace `{name}` deallocated");
                         if let Err(e) = ns.shutdown(snapshot_at_shutdown).await {
                             tracing::error!("error deallocating `{name}`: {e}")
                         }
@@ -181,6 +181,10 @@ impl NamespaceStore {
             .store
             .get_with(namespace.clone(), async { Default::default() })
             .await;
+        // This write lock is held across `make_namespace` below, which is not a
+        // cache call. Do not add one while it is held: moka runs its
+        // maintenance inline in cache calls and awaits the eviction listener,
+        // which waits for this lock. The same holds for `fork`'s `to_lock`.
         let mut lock = entry.write().await;
         if let Some(ns) = lock.take() {
             ns.destroy().await?;
@@ -258,6 +262,14 @@ impl NamespaceStore {
         }
 
         let from_config = self.inner.metadata.handle(from.clone()).await;
+        // Known hazard: `to_lock` is held across this cache call. moka runs its
+        // maintenance inline in cache calls and awaits the eviction listener,
+        // which waits for the evicted entry's write lock. If the cache is at
+        // capacity and picks the fresh, empty `to_entry` as its victim, the
+        // listener waits for the lock this task holds. The `with` above makes
+        // this a cache hit in the normal case, which lowers the exposure
+        // without removing it. Fixing it means reserving `to` outside the
+        // cache; see the follow-ups in PR #56.
         let from_entry = self
             .load_namespace(&from, from_config.clone(), RestoreOption::Latest)
             .await?;
@@ -393,8 +405,10 @@ impl NamespaceStore {
             // The namespace was taken out of the entry after we got it: by
             // shutdown, by cache eviction, or by a concurrent destroy. That
             // does not mean it is missing, so check again with a fresh entry.
+            // Expected during a rolling restart and under cache pressure, once
+            // per waiting request: the counter is the signal, not the log.
             NAMESPACE_EMPTIED_ENTRY.increment(1);
-            tracing::warn!(%namespace, "namespace cache entry was emptied while in use, looking it up again");
+            tracing::debug!(%namespace, "namespace cache entry was emptied while in use, looking it up again");
             attempts_left -= 1;
             emptied = Some(entry);
         }
@@ -407,10 +421,17 @@ impl NamespaceStore {
 
     /// Removes `entry` from the cache if it is still the cached entry for
     /// `namespace` and still empty, so that the next lookup loads the namespace
-    /// afresh (with its own restore option). Leaves the cache alone if it holds
-    /// another entry, or if someone holds `entry`'s lock and may be filling it.
-    /// It never fills an entry itself, so it cannot open a namespace that the
-    /// cache no longer holds.
+    /// afresh (with its own restore option). It never fills an entry itself.
+    ///
+    /// What the checks guarantee, under moka's per-key compute lock: a loaded
+    /// entry is never removed, and neither is an entry whose lock is held at
+    /// that moment. What they do not: `try_read` cannot see a `fork` or `reset`
+    /// that holds the entry but has not locked it yet, and `Op::Remove` removes
+    /// whatever the cache holds when it runs, which moka does not tie to the
+    /// entry the closure saw (its compute lock does not exclude `try_get_with`
+    /// or `invalidate`). Both windows are a few instructions wide; the second
+    /// is detected below. Closing them needs the entry state to live in the
+    /// cache value rather than behind the lock; see the follow-ups in PR #56.
     async fn evict_if_still_empty(&self, namespace: &NamespaceName, entry: &NamespaceEntry) {
         let result = self
             .inner
@@ -424,7 +445,10 @@ impl NamespaceStore {
                 std::future::ready(if still_empty { Op::Remove } else { Op::Nop })
             })
             .await;
-        if matches!(result, CompResult::Removed(_)) {
+        if let CompResult::Removed(removed) = result {
+            if !Arc::ptr_eq(removed.value(), entry) {
+                tracing::error!(%namespace, "dropped a different cache entry than the empty one");
+            }
             NAMESPACE_LEFT_EMPTY_ENTRY_DROPPED.increment(1);
         }
     }
