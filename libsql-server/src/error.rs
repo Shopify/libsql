@@ -133,9 +133,10 @@ pub enum Error {
 }
 
 impl AsRef<Self> for Error {
+    /// The error behind any number of `Ref` wrappers, like `into_response`.
     fn as_ref(&self) -> &Self {
         match self {
-            Self::Ref(this) => this.as_ref(),
+            Self::Ref(this) => <Error as AsRef<Error>>::as_ref(this),
             _ => self,
         }
     }

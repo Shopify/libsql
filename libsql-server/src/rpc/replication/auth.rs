@@ -1,5 +1,4 @@
-use libsql_replication::rpc::replication::NAMESPACE_DOESNT_EXIST;
-use tonic::Status;
+use tonic::{Code, Status};
 
 use crate::auth::parsers::parse_grpc_auth_header;
 use crate::auth::{Auth, Jwt};
@@ -18,24 +17,21 @@ pub async fn authenticate<T>(
     let auth = match namespace_jwt_keys {
         Ok(Ok(Some(key))) => Some(Auth::new(Jwt::new(key))),
         Ok(Ok(None)) => user_auth_strategy.clone(),
-        Err(e) => match e.as_ref() {
-            crate::error::Error::NamespaceDoesntExist(_) if allow_user_auth_fallback => {
-                user_auth_strategy.clone()
+        Err(e) => {
+            // `namespace_error_status` is the one place that classifies the
+            // store's errors: `FAILED_PRECONDITION` is a missing namespace,
+            // `UNAVAILABLE` one that exists but cannot be served right now.
+            // Only a missing namespace may fall back to the user strategy.
+            let status = crate::rpc::namespace_error_status(&e);
+            match status.code() {
+                Code::FailedPrecondition if allow_user_auth_fallback => user_auth_strategy.clone(),
+                Code::FailedPrecondition | Code::Unavailable => return Err(status),
+                _ => Err(Status::internal(format!(
+                    "Error fetching jwt key for a namespace: {}",
+                    e
+                )))?,
             }
-            crate::error::Error::NamespaceDoesntExist(_) => {
-                return Err(tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST))
-            }
-            // The namespace exists but cannot be served right now: neither
-            // missing (so no fallback to the user strategy) nor internal.
-            crate::error::Error::NamespaceStoreShutdown
-            | crate::error::Error::NamespaceUnavailable(_) => {
-                return Err(Status::unavailable(e.to_string()))
-            }
-            _ => Err(Status::internal(format!(
-                "Error fetching jwt key for a namespace: {}",
-                e
-            )))?,
-        },
+        }
         Ok(Err(e)) => Err(Status::internal(format!(
             "Error fetching jwt key for a namespace: {}",
             e

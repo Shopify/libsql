@@ -500,8 +500,14 @@ mod test {
             )
             .await
             .unwrap();
-        // An external service authenticates through the namespace first.
-        let service = ReplicationLogService::new(store.clone(), None, None, true, false, false);
+        // An external service authenticates through the namespace first. A
+        // user strategy that would reject this request (Basic auth, and the
+        // request carries no credentials) shows that the shut-down store does
+        // not fall back to it: falling back would answer UNAUTHENTICATED or
+        // INTERNAL, as a missing namespace does.
+        let user_auth = Auth::new(crate::auth::HttpBasic::new("dXNlcjpwYXNz".to_string()));
+        let service =
+            ReplicationLogService::new(store.clone(), None, Some(user_auth), true, false, false);
         store.clone().shutdown().await.unwrap();
 
         let status = service

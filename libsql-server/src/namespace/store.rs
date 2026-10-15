@@ -1162,6 +1162,11 @@ pub(crate) mod test {
         for error in [
             Error::NamespaceStoreShutdown,
             Error::NamespaceUnavailable("ns".to_string()),
+            // Wrapped by the cache, once or more.
+            Error::Ref(Arc::new(Error::NamespaceStoreShutdown)),
+            Error::Ref(Arc::new(Error::Ref(Arc::new(Error::NamespaceUnavailable(
+                "ns".to_string(),
+            ))))),
         ] {
             assert_eq!(
                 error.into_response().status(),

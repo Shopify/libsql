@@ -47,24 +47,22 @@ impl ReplicaProxyService {
 
         let auth = match namespace_jwt_keys {
             Ok(Some(key)) => Ok(Auth::new(Jwt::new(key))),
-            Ok(None) | Err(crate::error::Error::NamespaceDoesntExist(_)) => {
-                Ok(self.user_auth_strategy.clone())
+            Ok(None) => Ok(self.user_auth_strategy.clone()),
+            Err(e) => {
+                // `namespace_error_status` classifies the store's errors:
+                // `FAILED_PRECONDITION` is a missing namespace, `UNAVAILABLE`
+                // one that exists but cannot be served right now. Only a
+                // missing namespace falls back to the user strategy.
+                let status = super::namespace_error_status(&e);
+                match status.code() {
+                    tonic::Code::FailedPrecondition => Ok(self.user_auth_strategy.clone()),
+                    tonic::Code::Unavailable => Err(status),
+                    _ => Err(Status::internal(format!(
+                        "Can't fetch jwt key for a namespace: {}",
+                        e
+                    ))),
+                }
             }
-            // The namespace exists but cannot be served right now: neither
-            // missing (so no fallback to the user strategy) nor internal.
-            Err(e)
-                if matches!(
-                    e.as_ref(),
-                    crate::error::Error::NamespaceStoreShutdown
-                        | crate::error::Error::NamespaceUnavailable(_)
-                ) =>
-            {
-                Err(super::namespace_error_status(&e))
-            }
-            Err(e) => Err(Status::internal(format!(
-                "Can't fetch jwt key for a namespace: {}",
-                e
-            ))),
         }?;
 
         let auth_context =

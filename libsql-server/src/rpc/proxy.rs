@@ -312,17 +312,21 @@ impl ProxyService {
         let auth = match namespace_jwt_keys {
             Ok(Ok(Some(key))) => Some(Auth::new(Jwt::new(key))),
             Ok(Ok(None)) => self.user_auth_strategy.clone(),
-            Err(e) => match e.as_ref() {
-                crate::error::Error::NamespaceDoesntExist(_) => None,
-                crate::error::Error::NamespaceStoreShutdown
-                | crate::error::Error::NamespaceUnavailable(_) => {
-                    Err(tonic::Status::unavailable(e.to_string()))?
+            Err(e) => {
+                // `namespace_error_status` classifies the store's errors:
+                // `FAILED_PRECONDITION` is a missing namespace, `UNAVAILABLE`
+                // one that exists but cannot be served right now. Only a
+                // missing namespace skips authentication here.
+                let status = crate::rpc::namespace_error_status(&e);
+                match status.code() {
+                    tonic::Code::FailedPrecondition => None,
+                    tonic::Code::Unavailable => Err(status)?,
+                    _ => Err(tonic::Status::internal(format!(
+                        "Error fetching jwt key for a namespace: {}",
+                        e
+                    )))?,
                 }
-                _ => Err(tonic::Status::internal(format!(
-                    "Error fetching jwt key for a namespace: {}",
-                    e
-                )))?,
-            },
+            }
             Ok(Err(e)) => Err(tonic::Status::internal(format!(
                 "Error fetching jwt key for a namespace: {}",
                 e

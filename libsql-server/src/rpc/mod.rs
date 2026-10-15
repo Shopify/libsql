@@ -23,12 +23,14 @@ pub mod replica_proxy;
 pub mod replication;
 pub mod streaming_exec;
 
-/// The gRPC status for an error from `NamespaceStore::with`. A namespace that
-/// exists but cannot be served right now (the store is shutting down, or its
-/// cache entry was emptied) is `UNAVAILABLE`, so clients retry it instead of
-/// treating it as missing or as an internal failure.
+/// The gRPC status for an error from `NamespaceStore::with`. `FAILED_PRECONDITION`
+/// is only ever a missing namespace. A namespace that exists but cannot be
+/// served right now (the store is shutting down, or its cache entry was
+/// emptied) is `UNAVAILABLE`, so clients retry it instead of treating it as
+/// missing or as an internal failure. The authentication paths decide on the
+/// code this returns, so that they classify the error in exactly one place.
 pub(crate) fn namespace_error_status(error: &crate::Error) -> Status {
-    // `Error::as_ref` unwraps an `Error::Ref` from the namespace cache.
+    // `Error::as_ref` unwraps the `Error::Ref`s from the namespace cache.
     #[allow(clippy::useless_asref)]
     match error.as_ref() {
         crate::Error::NamespaceDoesntExist(_) => Status::failed_precondition(
@@ -188,6 +190,17 @@ mod test {
             (Error::NamespaceUnavailable("ns".into()), Code::Unavailable),
             (
                 Error::Ref(Arc::new(Error::NamespaceUnavailable("ns".into()))),
+                Code::Unavailable,
+            ),
+            (
+                Error::Ref(Arc::new(Error::NamespaceDoesntExist("ns".into()))),
+                Code::FailedPrecondition,
+            ),
+            // Nested `Ref`s are unwrapped too.
+            (
+                Error::Ref(Arc::new(Error::Ref(Arc::new(
+                    Error::NamespaceStoreShutdown,
+                )))),
                 Code::Unavailable,
             ),
             (Error::InvalidNamespace, Code::Internal),
