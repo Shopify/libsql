@@ -781,11 +781,16 @@ pub(crate) mod test {
     /// Lets the cache drop the extra reference it keeps to a fresh entry until
     /// its housekeeping runs, so that a third holder of `entry` can only be the
     /// request or fork under test.
+    ///
+    /// This and `start_waiting` count references: the cache holds one, the
+    /// test one, and each waiting request one. That is how moka 0.12.8 (the
+    /// version in Cargo.lock) behaves; a moka upgrade that keeps more
+    /// references fails these tests with a timeout rather than hanging them.
     async fn settle(store: &NamespaceStore, entry: &NamespaceEntry) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while Arc::strong_count(entry) > 2 {
                 store.inner.store.run_pending_tasks().await;
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -805,7 +810,7 @@ pub(crate) mod test {
     ) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while !condition().await {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -1164,7 +1169,9 @@ pub(crate) mod test {
         assert!(!store.inner.metadata.exists(&namespace).await);
     }
 
-    #[tokio::test]
+    // `fork`'s cleanup on failure calls `block_in_place`, which panics on
+    // the current-thread runtime and would hide the real error.
+    #[tokio::test(flavor = "multi_thread")]
     async fn fork_loads_a_source_whose_cached_entry_was_left_empty() {
         let tmp = tempdir().unwrap();
         let store = make_store(tmp.path()).await;
@@ -1243,7 +1250,9 @@ pub(crate) mod test {
         );
     }
 
-    #[tokio::test]
+    // `fork`'s cleanup on failure calls `block_in_place`, which panics on
+    // the current-thread runtime and would hide the real error.
+    #[tokio::test(flavor = "multi_thread")]
     async fn fork_reloads_a_source_emptied_while_waiting_for_it() {
         let tmp = tempdir().unwrap();
         let store = make_store(tmp.path()).await;
@@ -1281,7 +1290,9 @@ pub(crate) mod test {
         assert!(entry.read().await.is_none());
     }
 
-    #[tokio::test]
+    // `fork`'s cleanup on failure calls `block_in_place`, which panics on
+    // the current-thread runtime and would hide the real error.
+    #[tokio::test(flavor = "multi_thread")]
     async fn fork_reports_unavailable_when_its_source_is_emptied_between_its_loads() {
         let tmp = tempdir().unwrap();
         let store = make_store(tmp.path()).await;
