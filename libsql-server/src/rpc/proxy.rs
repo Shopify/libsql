@@ -763,12 +763,13 @@ mod test {
             .unwrap();
         store.clone().shutdown().await.unwrap();
         let service = ProxyService::new(store, None, true);
+        // A namespace reported as missing is authenticated from this header,
+        // which the client writes. A false "missing" used to make a forged
+        // one pass; the request must fail before it is read.
+        let mut request = tonic::Request::new(());
+        Authenticated::FullAccess.upgrade_grpc_request(&mut request);
 
-        let status = service
-            .extract_context(&mut tonic::Request::new(()))
-            .await
-            .err()
-            .unwrap();
+        let status = service.extract_context(&mut request).await.err().unwrap();
 
         assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     }
