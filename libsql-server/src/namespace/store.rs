@@ -5,6 +5,7 @@ use async_lock::RwLock;
 use chrono::NaiveDateTime;
 use futures::TryFutureExt;
 use moka::future::Cache;
+use moka::ops::compute::{CompResult, Op};
 use once_cell::sync::OnceCell;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
@@ -16,7 +17,8 @@ use crate::connection::config::DatabaseConfig;
 use crate::database::DatabaseKind;
 use crate::error::Error;
 use crate::metrics::{
-    NAMESPACE_EMPTIED_ENTRY, NAMESPACE_EMPTIED_ENTRY_GAVE_UP, NAMESPACE_LOAD_LATENCY,
+    NAMESPACE_EMPTIED_ENTRY, NAMESPACE_EMPTIED_ENTRY_GAVE_UP, NAMESPACE_LEFT_EMPTY_ENTRY_DROPPED,
+    NAMESPACE_LOAD_LATENCY,
 };
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
 use crate::stats::Stats;
@@ -380,14 +382,17 @@ impl NamespaceStore {
             // waiting request: the counter is the signal, not the log.
             NAMESPACE_EMPTIED_ENTRY.increment(1);
             tracing::debug!(%namespace, "namespace cache entry was emptied while in use, looking it up again");
+            if self.inner.has_shutdown.load(Ordering::Relaxed) {
+                return Err(Error::NamespaceStoreShutdown);
+            }
+            // If the emptied entry is still the cached one, nothing is going
+            // to refill it (a fork that failed before storing its record
+            // leaves one behind): drop it, so that the next lookup loads the
+            // namespace. An evicted or destroyed entry is no longer cached,
+            // and this does nothing.
+            self.evict_if_still_empty(&namespace, &entry).await;
         }
 
-        // Every lookup found an emptied entry. That is also where an entry
-        // that stays cached but empty ends up (a fork that failed before
-        // storing its record leaves one behind): the namespace answers
-        // `NamespaceUnavailable` until the entry is evicted or the server
-        // restarts. Dropping such an entry so that the next lookup reloads the
-        // namespace is left to a follow-up.
         let error = self.emptied_entry_error(&namespace).await;
         if matches!(error, Error::NamespaceUnavailable(_)) {
             // Shutdown and a namespace that is really gone are not failures
@@ -396,6 +401,45 @@ impl NamespaceStore {
         }
         tracing::warn!(%namespace, %error, "namespace cache entry kept being emptied, giving up");
         Err(error)
+    }
+
+    /// Removes `entry` from the cache if it is still the cached entry for
+    /// `namespace` and still empty, so that the next lookup loads the namespace
+    /// afresh (with its own restore option). It never fills an entry itself.
+    ///
+    /// What the checks guarantee, under moka's per-key compute lock: a loaded
+    /// entry is never removed, and neither is an entry whose lock is held at
+    /// that moment. What they do not: `try_read` cannot see a `fork` or `reset`
+    /// that holds the entry but has not locked it yet. That window is not a
+    /// few instructions: `get_with` makes the entry visible and may then run
+    /// the cache's housekeeping, awaiting eviction listeners, before it
+    /// returns. A `fork` or `reset` whose fresh entry is dropped in that window
+    /// fills an entry the cache no longer holds, which nothing shuts down.
+    /// `Op::Remove` also removes whatever the cache holds when it runs, which
+    /// moka does not tie to the entry the closure saw; that case is detected
+    /// below. Closing both needs the entry state to live in the cache value
+    /// rather than behind the lock.
+    async fn evict_if_still_empty(&self, namespace: &NamespaceName, entry: &NamespaceEntry) {
+        let result = self
+            .inner
+            .store
+            .entry_by_ref(namespace)
+            .and_compute_with(|cached| {
+                let still_empty = cached.is_some_and(|cached| {
+                    Arc::ptr_eq(cached.value(), entry)
+                        && entry.try_read().is_some_and(|lock| lock.is_none())
+                });
+                std::future::ready(if still_empty { Op::Remove } else { Op::Nop })
+            })
+            .await;
+        if let CompResult::Removed(removed) = result {
+            if Arc::ptr_eq(removed.value(), entry) {
+                tracing::warn!(%namespace, "namespace cache entry was left empty, dropped it");
+                NAMESPACE_LEFT_EMPTY_ENTRY_DROPPED.increment(1);
+            } else {
+                tracing::error!(%namespace, "dropped a different cache entry than the empty one");
+            }
+        }
     }
 
     /// The error for a namespace whose cache entry was emptied while it was
@@ -518,6 +562,12 @@ impl NamespaceStore {
         tracing::debug!("storing db config");
         handle.store(db_config).await?;
         tracing::debug!("completed storing db config, loading namespace");
+        // An empty entry left cached (for example by a fork that failed before
+        // storing its record) would be returned as is, and the namespace would
+        // not be loaded with `restore_option` (a dump, say).
+        if let Some(entry) = self.inner.store.get(&namespace).await {
+            self.evict_if_still_empty(&namespace, &entry).await;
+        }
         self.load_created(&namespace, handle, restore_option)
             .await?;
 
@@ -915,7 +965,7 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn with_gives_up_with_unavailable_when_the_entry_stays_empty() {
+    async fn with_loads_a_namespace_whose_cached_entry_stays_empty() {
         let tmp = tempdir().unwrap();
         let store = make_store(tmp.path()).await;
         let namespace = create(&store, "ns").await;
@@ -925,18 +975,129 @@ pub(crate) mod test {
 
         // The namespace is taken out but its emptied entry stays cached, as an
         // entry left behind by a fork that failed before storing its record:
-        // every lookup finds it again.
+        // nothing else is going to refill it.
         lock.take().unwrap().shutdown(false).await.unwrap();
         drop(lock);
 
-        // The metastore still has the namespace: giving up is temporary, not
-        // "missing".
-        let error = request.await.unwrap().unwrap_err();
-        assert!(matches!(error, Error::NamespaceUnavailable(_)), "{error:?}");
-        assert!(Arc::ptr_eq(
-            &store.inner.store.get(&namespace).await.unwrap(),
-            &entry
-        ));
+        assert_eq!(request.await.unwrap().unwrap(), namespace);
+        // The empty entry was dropped and a fresh one loaded; it was not filled.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        assert!(cached.read().await.is_some());
+        assert!(entry.read().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_waiting_on_one_left_empty_entry_share_one_reloaded_namespace() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        settle(&store, &entry).await;
+        const REQUESTS: usize = 8;
+        let requests: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                tokio::spawn({
+                    let store = store.clone();
+                    let namespace = namespace.clone();
+                    async move { store.with(namespace, |ns| ns.stats.clone()).await }
+                })
+            })
+            .collect();
+        wait_until("every request holds the entry", || {
+            Arc::strong_count(&entry) >= 2 + REQUESTS
+        })
+        .await;
+
+        // The namespace is taken out and its emptied entry stays cached: every
+        // request finds it, and every one of them may try to drop it.
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        let mut stats = Vec::with_capacity(REQUESTS);
+        for request in requests {
+            stats.push(request.await.unwrap().unwrap());
+        }
+        // One namespace, loaded once, into one fresh entry.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        let loaded = cached.read().await.as_ref().unwrap().stats.clone();
+        assert!(stats.iter().all(|stats| Arc::ptr_eq(stats, &loaded)));
+        assert!(entry.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn evict_if_still_empty_drops_only_the_cached_unlocked_empty_entry() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let cached = |store: &NamespaceStore| {
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move { store.inner.store.get(&namespace).await }
+        };
+
+        // A loaded cached entry is not empty: it stays.
+        let loaded = cached(&store).await.unwrap();
+        store.evict_if_still_empty(&namespace, &loaded).await;
+        assert!(Arc::ptr_eq(&cached(&store).await.unwrap(), &loaded));
+
+        // An empty entry that is not the cached one leaves the cached empty
+        // entry alone.
+        let empty: NamespaceEntry = Default::default();
+        store
+            .inner
+            .store
+            .insert(namespace.clone(), empty.clone())
+            .await;
+        let other: NamespaceEntry = Default::default();
+        store.evict_if_still_empty(&namespace, &other).await;
+        assert!(Arc::ptr_eq(&cached(&store).await.unwrap(), &empty));
+
+        // An empty cached entry whose lock is held (it may be being filled)
+        // stays. Evicting it would wait for that lock, so bound the call.
+        let lock = empty.write().await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.evict_if_still_empty(&namespace, &empty),
+        )
+        .await
+        .expect("evicting a locked entry must not wait for its lock");
+        assert!(Arc::ptr_eq(&cached(&store).await.unwrap(), &empty));
+        drop(lock);
+
+        // Once nobody holds it, the empty cached entry is dropped.
+        store.evict_if_still_empty(&namespace, &empty).await;
+        assert!(!store.inner.store.contains_key(&namespace));
+    }
+
+    #[tokio::test]
+    async fn create_loads_a_namespace_over_an_empty_cached_entry() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = NamespaceName::from_string("ns".to_string()).unwrap();
+        // What a fork that failed before storing its record leaves behind.
+        let empty: NamespaceEntry = Default::default();
+        store
+            .inner
+            .store
+            .insert(namespace.clone(), empty.clone())
+            .await;
+
+        store
+            .create(
+                namespace.clone(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+
+        // Loaded by create itself, with its restore option.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &empty));
+        assert!(cached.read().await.is_some());
     }
 
     #[tokio::test]
@@ -998,6 +1159,44 @@ pub(crate) mod test {
 
         assert!(matches!(error, Error::NamespaceStoreShutdown), "{error:?}");
         assert!(!store.inner.metadata.exists(&namespace).await);
+    }
+
+    // `fork`'s cleanup on failure calls `block_in_place`, which panics on
+    // the current-thread runtime and would hide the real error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_loads_a_source_whose_cached_entry_was_left_empty() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let from = create(&store, "from").await;
+        let entry = store.inner.store.get(&from).await.unwrap();
+        entry
+            .write()
+            .await
+            .take()
+            .unwrap()
+            .shutdown(false)
+            .await
+            .unwrap();
+        let to = NamespaceName::from_string("to".to_string()).unwrap();
+
+        store
+            .fork(from.clone(), to.clone(), DatabaseConfig::default(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .with(to.clone(), |ns| ns.name().clone())
+                .await
+                .unwrap(),
+            to
+        );
+        // The source was reloaded into a fresh entry; the left-empty one was
+        // not filled.
+        let cached = store.inner.store.get(&from).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        assert!(cached.read().await.is_some());
+        assert!(entry.read().await.is_none());
     }
 
     #[tokio::test]

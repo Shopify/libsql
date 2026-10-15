@@ -53,6 +53,14 @@ pub static NAMESPACE_EMPTIED_ENTRY_GAVE_UP: Lazy<Counter> = Lazy::new(|| {
     );
     register_counter!(NAME)
 });
+pub static NAMESPACE_LEFT_EMPTY_ENTRY_DROPPED: Lazy<Counter> = Lazy::new(|| {
+    const NAME: &str = "libsql_server_namespace_left_empty_entry_dropped";
+    describe_counter!(
+        NAME,
+        "number of namespace cache entries dropped because they were left empty (for example by a failed fork); the next lookup reloads the namespace"
+    );
+    register_counter!(NAME)
+});
 pub static NAMESPACE_LOAD_LATENCY: Lazy<Histogram> = Lazy::new(|| {
     const NAME: &str = "libsql_server_namespace_load_latency";
     describe_histogram!(NAME, "latency is us when loading a namespace");
