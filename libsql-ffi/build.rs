@@ -267,7 +267,16 @@ pub fn build_bundled(out_dir: &str, out_path: &Path) {
         let mut sqlean_sources = Vec::new();
         for pattern in sqlean_patterns {
             let full_pattern = format!("{BUNDLED_DIR}/sqlean/{}", pattern);
-            sqlean_sources.extend(glob(&full_pattern).unwrap().filter_map(Result::ok));
+            sqlean_sources.extend(
+                glob(&full_pattern)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    // Headers are glob'd in as a side effect but must not
+                    // be passed to `cc::Build::files()`: on clang/macOS
+                    // that turns them into precompiled-header .o files
+                    // which fail to link.
+                    .filter(|p| p.extension().map_or(false, |ext| ext == "c")),
+            );
         }
 
         if cfg!(feature = "sqlean-extension-regexp") {
