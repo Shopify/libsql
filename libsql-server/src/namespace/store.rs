@@ -915,7 +915,7 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn with_gives_up_with_unavailable_when_the_entry_stays_empty() {
+    async fn with_reports_unavailable_not_missing_for_an_entry_left_empty() {
         let tmp = tempdir().unwrap();
         let store = make_store(tmp.path()).await;
         let namespace = create(&store, "ns").await;
