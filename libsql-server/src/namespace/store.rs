@@ -15,7 +15,7 @@ use crate::broadcaster::BroadcastMsg;
 use crate::connection::config::DatabaseConfig;
 use crate::database::DatabaseKind;
 use crate::error::Error;
-use crate::metrics::NAMESPACE_LOAD_LATENCY;
+use crate::metrics::record_namespace_load_latency;
 use crate::namespace::{NamespaceBottomlessDbId, NamespaceBottomlessDbIdInit, NamespaceName};
 use crate::stats::Stats;
 
@@ -406,7 +406,7 @@ impl NamespaceStore {
                 init.map_ok(|ns| Arc::new(RwLock::new(ns))),
             )
             .await?;
-        NAMESPACE_LOAD_LATENCY.record(before_load.elapsed());
+        record_namespace_load_latency(before_load.elapsed());
 
         Ok(ns)
     }

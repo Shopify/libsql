@@ -21,7 +21,7 @@ use tonic::{Code, Request, Status};
 
 use crate::connection::config::DatabaseConfig;
 use crate::metrics::{
-    REPLICATION_LATENCY, REPLICATION_LATENCY_CACHE_MISS, REPLICATION_LATENCY_OUT_OF_SYNC,
+    record_replication_latency, REPLICATION_LATENCY_CACHE_MISS, REPLICATION_LATENCY_OUT_OF_SYNC,
 };
 use crate::namespace::meta_store::MetaStoreHandle;
 use crate::namespace::{NamespaceName, NamespaceStore};
@@ -224,7 +224,7 @@ impl ReplicatorClient for Client {
                                 Ok(lat) => {
                                     // we can record negative values if the clocks are out-of-sync. There is not
                                     // point in recording those values.
-                                    REPLICATION_LATENCY.record(lat);
+                                    record_replication_latency(lat);
                                 }
                                 Err(_) => {
                                     REPLICATION_LATENCY_OUT_OF_SYNC.increment(1);
