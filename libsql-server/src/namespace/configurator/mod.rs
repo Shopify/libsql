@@ -13,6 +13,7 @@ use crate::replication::script_backup_manager::ScriptBackupManager;
 use crate::StatsSender;
 
 use super::broadcasters::BroadcasterHandle;
+use super::dump_import::DumpImportConfig;
 use super::meta_store::MetaStoreHandle;
 use super::{
     Namespace, NamespaceBottomlessDbIdInit, NamespaceName, NamespaceStore, ResetCb,
@@ -41,6 +42,7 @@ pub struct BaseNamespaceConfig {
     pub(crate) encryption_config: Option<EncryptionConfig>,
     pub(crate) disable_intelligent_throttling: bool,
     pub(crate) connection_creation_timeout: Option<Duration>,
+    pub(crate) dump_import: DumpImportConfig,
 }
 
 #[derive(Clone)]

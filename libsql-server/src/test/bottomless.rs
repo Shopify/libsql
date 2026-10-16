@@ -98,6 +98,7 @@ async fn configure_server(
             max_concurrent_requests: 128,
             connection_creation_timeout: None,
             disable_intelligent_throttling: false,
+            dump_import: Default::default(),
         },
         admin_api_config: None,
         disable_namespaces: true,

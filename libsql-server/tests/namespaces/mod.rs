@@ -10,18 +10,24 @@ use std::time::Duration;
 use crate::common::http::Client;
 use crate::common::net::{init_tracing, SimServer, TestServer, TurmoilAcceptor, TurmoilConnector};
 use libsql::{Database, Value};
-use libsql_server::config::{AdminApiConfig, RpcServerConfig, UserApiConfig};
+use libsql_server::config::{AdminApiConfig, DbConfig, RpcServerConfig, UserApiConfig};
 use serde_json::json;
 use tempfile::tempdir;
 use turmoil::{Builder, Sim};
 
 fn make_primary(sim: &mut Sim, path: PathBuf) {
+    make_primary_with_db_config(sim, path, DbConfig::default());
+}
+
+fn make_primary_with_db_config(sim: &mut Sim, path: PathBuf, db_config: DbConfig) {
     init_tracing();
     sim.host("primary", move || {
         let path = path.clone();
+        let db_config = db_config.clone();
         async move {
             let server = TestServer {
                 path: path.into(),
+                db_config,
                 user_api_config: UserApiConfig {
                     ..Default::default()
                 },

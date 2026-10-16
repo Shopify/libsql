@@ -16,8 +16,8 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 use libsql_server::config::{
-    AdminApiConfig, BottomlessConfig, DbConfig, HeartbeatConfig, MetaStoreConfig, RpcClientConfig,
-    RpcServerConfig, TlsConfig, UserApiConfig,
+    AdminApiConfig, BottomlessConfig, DbConfig, DumpImportConfig, DumpImporterKind,
+    HeartbeatConfig, MetaStoreConfig, RpcClientConfig, RpcServerConfig, TlsConfig, UserApiConfig,
 };
 use libsql_server::net::AddrIncoming;
 use libsql_server::version::Version;
@@ -253,6 +253,28 @@ struct Cli {
     #[clap(long, env = "SQLD_CONNECTION_CREATION_TIMEOUT_SEC")]
     connection_creation_timeout_sec: Option<u64>,
 
+    /// Importer used by `POST /v1/namespaces/:ns/create` with `dump_url` when the request
+    /// doesn't specify `dump_importer`. `buffered` reads the whole dump into memory;
+    /// `streaming` executes statements as they arrive with bounded memory.
+    #[clap(long, env = "SQLD_DUMP_IMPORTER", default_value = "buffered")]
+    dump_importer: DumpImporterKind,
+
+    /// Streaming dump importer: reject any single SQL statement larger than this.
+    #[clap(
+        long,
+        env = "SQLD_DUMP_IMPORT_MAX_STATEMENT_SIZE",
+        default_value = "64MiB"
+    )]
+    dump_import_max_statement_size: ByteSize,
+
+    /// Streaming dump importer: maximum bytes of statements framed but not yet executed.
+    #[clap(long, env = "SQLD_DUMP_IMPORT_QUEUE_BYTES", default_value = "16MiB")]
+    dump_import_queue_bytes: ByteSize,
+
+    /// Streaming dump importer: maximum number of statements framed but not yet executed.
+    #[clap(long, env = "SQLD_DUMP_IMPORT_QUEUE_DEPTH", default_value = "256")]
+    dump_import_queue_depth: usize,
+
     /// Allow meta store to recover config from filesystem from older version, if meta store is
     /// empty on startup
     #[clap(long, env = "SQLD_ALLOW_METASTORE_RECOVERY")]
@@ -401,6 +423,15 @@ fn make_db_config(config: &Cli) -> anyhow::Result<DbConfig> {
             bottomless_replication.encryption_config = encryption_config.clone();
         }
     }
+    let dump_import = DumpImportConfig {
+        default_importer: config.dump_importer,
+        max_statement_bytes: usize::try_from(config.dump_import_max_statement_size.as_u64())
+            .context("dump import max statement size doesn't fit in usize")?,
+        queue_bytes: usize::try_from(config.dump_import_queue_bytes.as_u64())
+            .context("dump import queue bytes doesn't fit in usize")?,
+        queue_depth: config.dump_import_queue_depth,
+    };
+    dump_import.validate()?;
     Ok(DbConfig {
         extensions_path: config.extensions_path.clone().map(Into::into),
         bottomless_replication,
@@ -419,6 +450,7 @@ fn make_db_config(config: &Cli) -> anyhow::Result<DbConfig> {
         connection_creation_timeout: config
             .connection_creation_timeout_sec
             .map(|x| Duration::from_secs(x)),
+        dump_import,
     })
 }
 

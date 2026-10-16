@@ -601,6 +601,7 @@ where
             encryption_config: self.db_config.encryption_config.clone(),
             disable_intelligent_throttling: self.db_config.disable_intelligent_throttling,
             connection_creation_timeout: self.db_config.connection_creation_timeout,
+            dump_import: self.db_config.dump_import.clone(),
         };
 
         let (metastore_conn_maker, meta_store_wal_manager) =
