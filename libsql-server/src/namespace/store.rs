@@ -882,6 +882,57 @@ pub(crate) mod test {
         assert!(entry.read().await.is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_waiting_on_one_evicted_entry_share_one_reloaded_namespace() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let namespace = create(&store, "ns").await;
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        settle(&store, &entry).await;
+        const REQUESTS: usize = 8;
+        let requests: Vec<_> = (0..REQUESTS)
+            .map(|_| {
+                tokio::spawn({
+                    let store = store.clone();
+                    let namespace = namespace.clone();
+                    async move { store.with(namespace, |ns| ns.stats.clone()).await }
+                })
+            })
+            .collect();
+        wait_until("every request holds the entry", || {
+            Arc::strong_count(&entry) >= 2 + REQUESTS
+        })
+        .await;
+
+        // The entry every request holds is evicted: all of them look the
+        // namespace up again at once.
+        let eviction = tokio::spawn({
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move { store.inner.store.invalidate(&namespace).await }
+        });
+        wait_until("the entry is evicted", || {
+            !store.inner.store.contains_key(&namespace)
+        })
+        .await;
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        let mut stats = Vec::with_capacity(REQUESTS);
+        for request in requests {
+            stats.push(request.await.unwrap().unwrap());
+        }
+        eviction.await.unwrap();
+        // The lookups coalesced: one namespace, loaded once, into one fresh
+        // entry, not one load per waiting request.
+        let cached = store.inner.store.get(&namespace).await.unwrap();
+        assert!(!Arc::ptr_eq(&cached, &entry));
+        let loaded = cached.read().await.as_ref().unwrap().stats.clone();
+        assert!(stats.iter().all(|stats| Arc::ptr_eq(stats, &loaded)));
+        assert!(entry.read().await.is_none());
+    }
+
     #[tokio::test]
     async fn with_reports_missing_for_a_namespace_destroyed_while_waiting_for_it() {
         let tmp = tempdir().unwrap();
@@ -1155,6 +1206,24 @@ pub(crate) mod test {
         store.inner.has_shutdown.store(true, Ordering::Relaxed);
         let error = store.emptied_entry_error(&namespace).await;
         assert!(matches!(error, Error::NamespaceStoreShutdown), "{error:?}");
+    }
+
+    /// Clients tell a missing namespace from a temporarily unavailable one by
+    /// the status, and some also by the message: a 503 must never read like
+    /// a 404.
+    #[test]
+    fn temporarily_unavailable_messages_do_not_claim_the_namespace_is_missing() {
+        for error in [
+            Error::NamespaceStoreShutdown,
+            Error::NamespaceUnavailable("ns".to_string()),
+        ] {
+            let message = error.to_string();
+            assert!(!message.contains("doesn't exist"), "{message}");
+            assert!(!message.contains("not found"), "{message}");
+        }
+        assert!(Error::NamespaceDoesntExist("ns".to_string())
+            .to_string()
+            .contains("doesn't exist"));
     }
 
     #[test]
