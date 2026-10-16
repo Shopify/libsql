@@ -1,0 +1,97 @@
+# Namespace live checks
+
+Scripts that run a built `sqld` locally and check how the namespace store
+behaves under load, during shutdown, and across the admin API. They exist
+because the interesting failures here are races: an entry emptied under a
+request, a shutdown while requests are in flight, a destroy racing a lookup.
+Unit tests pin each race deterministically; these scripts show the same
+races against a real server, and let two binaries be compared.
+
+Nothing here touches a remote system. Everything listens on `127.0.0.1`.
+
+## Requirements
+
+`bash` 3.2 or newer, `curl`, `python3`, `lsof`. A debug build is fine and
+widens the race windows, which is what you want.
+
+```
+cargo build -p libsql-server --bin sqld
+cargo build -p libsql --example replica_sync_loop   # for replica-sigterm.sh
+```
+
+## Scripts
+
+| Script | What it does |
+|---|---|
+| `load.py` | Keep-alive clients driving `POST /v2/pipeline`; tallies status codes per phase, with an optional SIGTERM or shell action at a given time. |
+| `scenario.sh` | One focused scenario: `evict` (cache capacity far below the hot set) or `sigterm` (signal under load). Prints the tally, the namespace-store counters and the grouped store log lines. |
+| `regress.sh` | A 65-check matrix across the admin and user APIs, one primary and one primary plus replica, optionally mixed versions. Writes `results.tsv`. |
+| `compare.py` | Side-by-side diff of two `results.tsv` files. |
+| `replica-sigterm.sh` | What embedded replicas (the `libsql` crate, `libsql/examples/replica_sync_loop.rs`) see when their primary is stopped and started again: every distinct `sync()` error with the time it was first seen, and the replicator's own retry log lines. |
+| `window.sh` | How long the shutdown window (503s until the port closes) is for N loaded namespaces, each with a WAL. Compare with your clients' retry budgets. |
+
+## Comparing two binaries
+
+```
+S=libsql-server/scripts/namespace-live-checks
+$S/scenario.sh target/debug/sqld evict            # expect 0 non-200 answers
+$S/scenario.sh target/debug/sqld sigterm          # expect 503s after the signal, no 404s
+
+$S/regress.sh /path/to/old/sqld old /path/to/new/sqld
+$S/regress.sh /path/to/new/sqld new /path/to/old/sqld
+$S/compare.py namespace-live-checks-out/old/results.tsv namespace-live-checks-out/new/results.tsv old new
+
+$S/replica-sigterm.sh target/debug/sqld           # expect no "doesn't exist"; see below
+$S/window.sh target/debug/sqld 2000               # setup takes about 45 s per 1,000 namespaces
+```
+
+`regress.sh` writes server logs next to the results (`<label>/p.log`,
+`r.log`, `d.log`). When a line differs, those logs say why.
+
+## What a healthy run looks like
+
+- `scenario.sh ... evict`: every answer is 200. `libsql_server_namespace_emptied_entry`
+  is well above zero (the race happened and was retried) and
+  `libsql_server_namespace_emptied_entry_gave_up` is absent (never incremented).
+- `scenario.sh ... sigterm`: after the signal only 503 `Namespace store has shutdown`,
+  then connection errors once the port closes. No 404.
+- `regress.sh`: unknown namespaces answer 404 everywhere; deleted namespaces
+  answer 404 and their directory is gone; data survives a restart; the
+  replica catches up, proxies writes, and resumes after a primary restart.
+- `replica-sigterm.sh`: no `sync()` error says `Requested namespace doesn't
+  exist` (a server that reports an existing namespace as missing produces
+  exactly that, at the moment of the signal, and the client does not retry
+  it). What a healthy server produces instead is the replicator's own retry
+  line, `error connecting to primary. retrying. error: status: Unavailable,
+  message: "Namespace store has shutdown"`, and, if the server stays down
+  longer than the client's handshake retries, `Timeout performing handshake
+  with primary`. All replicas sync again once the server is back.
+- `window.sh`: 503 `Namespace store has shutdown` from the first millisecond
+  after the signal until the port closes, no 404. The window grows with the
+  number of loaded namespaces (a debug build on a laptop: about 0.2 to
+  0.3 ms per namespace). It is the time your clients must retry through.
+
+## Reading the output
+
+- A counter that was never incremented is not listed by `/metrics`; absent
+  means zero.
+- `conn_error` in a tally covers refused, reset and timed-out connections.
+  After a SIGTERM it is the expected tail. Elsewhere it usually means the
+  server closed the connection after an error answer.
+- The admin port is gone after a SIGTERM; `scenario.sh` reads `/metrics`
+  only when the server is still up.
+- `window.sh` creates namespaces with a few threads only. More trips sqld's
+  connection-creation throttle (`429 DbCreateTimeout`) during setup; the
+  namespace is still loaded, so the measurement is unaffected.
+- Under eviction churn the server logs `unable to remove .sentinel file`
+  for namespaces reopened while the evicted instance is still shutting
+  down. That is independent of the namespace store and shows on every
+  version.
+
+## Ports
+
+Defaults: user HTTP 18080, admin 19090, gRPC 15001; replica 18081 and
+19091. Override with `PORT`/`ADMIN` (`scenario.sh`) or `P_HTTP`, `P_ADMIN`,
+`P_GRPC`, `R_HTTP`, `R_ADMIN` (`regress.sh`). Both scripts refuse to start
+when a port is already in use, because a stale server answering the health
+check would silently invalidate the run.
