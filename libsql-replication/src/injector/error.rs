@@ -9,4 +9,6 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
     #[error("A fatal error occured injecting frames: {0}")]
     FatalInjectError(BoxError),
+    #[error("sync cancelled for terminal shutdown")]
+    SyncCancelledForShutdown,
 }

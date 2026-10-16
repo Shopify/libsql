@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::{collections::VecDeque, path::PathBuf};
 
 use parking_lot::Mutex;
-use rusqlite::OpenFlags;
+use rusqlite::{ErrorCode, OpenFlags};
 use tokio::task::spawn_blocking;
+use tokio_util::sync::CancellationToken;
 
 use crate::frame::{Frame, FrameNo};
 use crate::rpc::replication::Frame as RpcFrame;
@@ -23,6 +24,32 @@ pub type FrameBuffer = Arc<Mutex<VecDeque<Frame>>>;
 
 pub struct SqliteInjector {
     pub(in super::super) inner: Arc<Mutex<SqliteInjectorInner>>,
+    interrupt_handle: InjectorInterruptHandle,
+}
+
+#[derive(Clone, Default)]
+struct InjectorInterruptHandle {
+    current: Arc<Mutex<Option<rusqlite::InterruptHandle>>>,
+}
+
+impl InjectorInterruptHandle {
+    fn set(&self, handle: rusqlite::InterruptHandle) {
+        *self.current.lock() = Some(handle);
+    }
+
+    fn interrupt(&self) {
+        if let Some(handle) = self.current.lock().as_ref() {
+            handle.interrupt();
+        }
+    }
+}
+
+fn is_cancellation_interrupt(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Sqlite(e)
+            if e.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
+    )
 }
 
 impl Injector for SqliteInjector {
@@ -33,6 +60,41 @@ impl Injector for SqliteInjector {
         spawn_blocking(move || inner.lock().inject_frame(frame))
             .await
             .unwrap()
+    }
+
+    async fn inject_frame_with_cancellation(
+        &mut self,
+        frame: RpcFrame,
+        token: &CancellationToken,
+    ) -> Result<Option<FrameNo>> {
+        let inner = self.inner.clone();
+        let interrupt_handle = self.interrupt_handle.clone();
+        let frame =
+            Frame::try_from(&frame.data[..]).map_err(|e| Error::FatalInjectError(e.into()))?;
+        let mut join = spawn_blocking(move || inner.lock().inject_frame(frame));
+
+        tokio::select! {
+            biased;
+
+            result = &mut join => result.map_err(|e| Error::FatalInjectError(e.into()))?,
+            _ = token.cancelled() => {
+                interrupt_handle.interrupt();
+                match join.await {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(Error::SyncCancelledForShutdown)) => {
+                        Err(Error::SyncCancelledForShutdown)
+                    }
+                    Ok(Err(e)) if is_cancellation_interrupt(&e) => {
+                        Err(Error::SyncCancelledForShutdown)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "injector_error_after_sync_cancellation");
+                        Err(e)
+                    }
+                    Err(e) => Err(Error::FatalInjectError(e.into())),
+                }
+            }
+        }
     }
 
     async fn rollback(&mut self) {
@@ -58,14 +120,23 @@ impl SqliteInjector {
         auto_checkpoint: u32,
         encryption_config: Option<libsql_sys::EncryptionConfig>,
     ) -> super::Result<Self> {
+        let interrupt_handle = InjectorInterruptHandle::default();
+        let inner_interrupt_handle = interrupt_handle.clone();
         let inner = spawn_blocking(move || {
-            SqliteInjectorInner::new(path, capacity, auto_checkpoint, encryption_config)
+            SqliteInjectorInner::new(
+                path,
+                capacity,
+                auto_checkpoint,
+                encryption_config,
+                inner_interrupt_handle,
+            )
         })
         .await
         .unwrap()?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+            interrupt_handle,
         })
     }
 }
@@ -86,6 +157,7 @@ pub(in super::super) struct SqliteInjectorInner {
     path: PathBuf,
     encryption_config: Option<libsql_sys::EncryptionConfig>,
     auto_checkpoint: u32,
+    interrupt_handle: InjectorInterruptHandle,
 }
 
 /// Methods from this trait are called before and after performing a frame injection.
@@ -98,6 +170,7 @@ impl SqliteInjectorInner {
         capacity: usize,
         auto_checkpoint: u32,
         encryption_config: Option<libsql_sys::EncryptionConfig>,
+        interrupt_handle: InjectorInterruptHandle,
     ) -> Result<Self, Error> {
         let path = path.as_ref().to_path_buf();
 
@@ -113,6 +186,7 @@ impl SqliteInjectorInner {
             auto_checkpoint,
             encryption_config.clone(),
         )?;
+        interrupt_handle.set(connection.get_interrupt_handle());
 
         Ok(Self {
             is_txn: false,
@@ -124,6 +198,7 @@ impl SqliteInjectorInner {
             path,
             encryption_config,
             auto_checkpoint,
+            interrupt_handle,
         })
     }
 
@@ -235,6 +310,7 @@ impl SqliteInjectorInner {
                 self.auto_checkpoint,
                 self.encryption_config.clone(),
             )?;
+            self.interrupt_handle.set(new_conn.get_interrupt_handle());
 
             let _ = std::mem::replace(&mut *conn, new_conn);
         }
@@ -266,6 +342,9 @@ impl SqliteInjectorInner {
 mod test {
     use crate::frame::FrameBorrowed;
     use std::mem::size_of;
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
 
     use super::*;
     /// this this is generated by creating a table test, inserting 5 rows into it, and then
@@ -278,11 +357,86 @@ mod test {
     }
 
     #[test]
+    fn cancellation_interrupt_errors_are_classified_narrowly() {
+        let interrupted = Error::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::OperationInterrupted,
+                extended_code: rusqlite::ffi::SQLITE_INTERRUPT,
+            },
+            None,
+        ));
+        assert!(is_cancellation_interrupt(&interrupted));
+
+        let corrupt = Error::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseCorrupt,
+                extended_code: rusqlite::ffi::SQLITE_CORRUPT,
+            },
+            None,
+        ));
+        assert!(!is_cancellation_interrupt(&corrupt));
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_real_blocking_injection_task_to_settle() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut injector = SqliteInjector::new(temp.path().join("data"), 10, 10000, None)
+            .await
+            .unwrap();
+        let frame = RpcFrame {
+            data: wal_log().next().unwrap().bytes(),
+            timestamp: None,
+            durable_frame_no: None,
+        };
+
+        let inner = injector.inner.clone();
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _guard = inner.lock();
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv();
+        });
+        locked_rx.await.unwrap();
+
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let injection = tokio::spawn(async move {
+            let result = injector.inject_frame_with_cancellation(frame, &token).await;
+            (injector, result)
+        });
+
+        cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !injection.is_finished(),
+            "cancelled injection returned before the blocking task settled"
+        );
+
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        let (_injector, result) = tokio::time::timeout(Duration::from_secs(5), injection)
+            .await
+            .expect("cancelled injection did not settle after releasing the blocking task")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Ok(_) | Err(Error::SyncCancelledForShutdown)
+        ));
+    }
+
+    #[test]
     fn test_simple_inject_frames() {
         let temp = tempfile::tempdir().unwrap();
 
-        let mut injector =
-            SqliteInjectorInner::new(temp.path().join("data"), 10, 10000, None).unwrap();
+        let mut injector = SqliteInjectorInner::new(
+            temp.path().join("data"),
+            10,
+            10000,
+            None,
+            InjectorInterruptHandle::default(),
+        )
+        .unwrap();
         let log = wal_log();
         for frame in log {
             injector.inject_frame(frame).unwrap();
@@ -302,8 +456,14 @@ mod test {
         let temp = tempfile::tempdir().unwrap();
 
         // inject one frame at a time
-        let mut injector =
-            SqliteInjectorInner::new(temp.path().join("data"), 1, 10000, None).unwrap();
+        let mut injector = SqliteInjectorInner::new(
+            temp.path().join("data"),
+            1,
+            10000,
+            None,
+            InjectorInterruptHandle::default(),
+        )
+        .unwrap();
         let log = wal_log();
         for frame in log {
             injector.inject_frame(frame).unwrap();
@@ -323,8 +483,14 @@ mod test {
         let temp = tempfile::tempdir().unwrap();
 
         // inject one frame at a time
-        let mut injector =
-            SqliteInjectorInner::new(temp.path().join("data"), 10, 1000, None).unwrap();
+        let mut injector = SqliteInjectorInner::new(
+            temp.path().join("data"),
+            10,
+            1000,
+            None,
+            InjectorInterruptHandle::default(),
+        )
+        .unwrap();
         let mut frames = wal_log();
 
         assert!(injector

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use tokio::time::Duration;
 use tokio_stream::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
 
 use crate::frame::{Frame, FrameNo};
@@ -38,6 +39,8 @@ pub enum Error {
     NoHandshake,
     #[error("Requested namespace doesn't exist")]
     NamespaceDoesntExist,
+    #[error("sync cancelled for terminal shutdown")]
+    SyncCancelledForShutdown,
 }
 
 impl From<Status> for Error {
@@ -67,11 +70,41 @@ pub trait ReplicatorClient {
 
     /// Perform handshake with remote
     async fn handshake(&mut self) -> Result<(), Error>;
+    /// Perform handshake with remote, cooperatively observing terminal sync cancellation.
+    async fn handshake_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        tokio::select! {
+            result = self.handshake() => result,
+            _ = token.cancelled() => Err(Error::SyncCancelledForShutdown),
+        }
+    }
     /// Return a stream of frames to apply to the database
     async fn next_frames(&mut self) -> Result<Self::FrameStream, Error>;
+    /// Return a stream of frames to apply to the database, cooperatively observing terminal sync cancellation.
+    async fn next_frames_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<Self::FrameStream, Error> {
+        tokio::select! {
+            result = self.next_frames() => result,
+            _ = token.cancelled() => Err(Error::SyncCancelledForShutdown),
+        }
+    }
     /// Return a snapshot for the current replication index. Called after next_frame has returned a
     /// NeedSnapshot error
     async fn snapshot(&mut self) -> Result<Self::FrameStream, Error>;
+    /// Return a snapshot for the current replication index, cooperatively observing terminal sync cancellation.
+    async fn snapshot_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<Self::FrameStream, Error> {
+        tokio::select! {
+            result = self.snapshot() => result,
+            _ = token.cancelled() => Err(Error::SyncCancelledForShutdown),
+        }
+    }
     /// set the new commit frame_no
     async fn commit_frame_no(&mut self, frame_no: FrameNo) -> Result<(), Error>;
     /// Returns the currently committed replication index
@@ -94,6 +127,17 @@ where
             Either::Right(b) => b.handshake().await,
         }
     }
+
+    async fn handshake_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        match self {
+            Either::Left(a) => a.handshake_with_cancellation(token).await,
+            Either::Right(b) => b.handshake_with_cancellation(token).await,
+        }
+    }
+
     /// Return a stream of frames to apply to the database
     async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
         match self {
@@ -101,12 +145,39 @@ where
             Either::Right(b) => b.next_frames().await.map(Either::Right),
         }
     }
+
+    async fn next_frames_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<Self::FrameStream, Error> {
+        match self {
+            Either::Left(a) => a
+                .next_frames_with_cancellation(token)
+                .await
+                .map(Either::Left),
+            Either::Right(b) => b
+                .next_frames_with_cancellation(token)
+                .await
+                .map(Either::Right),
+        }
+    }
+
     /// Return a snapshot for the current replication index. Called after next_frame has returned a
     /// NeedSnapshot error
     async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
         match self {
             Either::Left(a) => a.snapshot().await.map(Either::Left),
             Either::Right(b) => b.snapshot().await.map(Either::Right),
+        }
+    }
+
+    async fn snapshot_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<Self::FrameStream, Error> {
+        match self {
+            Either::Left(a) => a.snapshot_with_cancellation(token).await.map(Either::Left),
+            Either::Right(b) => b.snapshot_with_cancellation(token).await.map(Either::Right),
         }
     }
     /// set the new commit frame_no
@@ -154,7 +225,7 @@ enum ReplicatorState {
 
 impl<C> Replicator<C, SqliteInjector>
 where
-    C: ReplicatorClient,
+    C: ReplicatorClient + Send,
 {
     /// Creates a replicator for the db file pointed at by `db_path`
     pub async fn new_sqlite(
@@ -177,7 +248,7 @@ where
 
 impl<C, I> Replicator<C, I>
 where
-    C: ReplicatorClient,
+    C: ReplicatorClient + Send,
     I: Injector,
 {
     pub fn new(client: C, injector: I) -> Self {
@@ -250,19 +321,61 @@ where
         }
     }
 
+    pub async fn replicate_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        loop {
+            self.try_replicate_step_with_cancellation(token).await?;
+            if self.state == ReplicatorState::Exit {
+                self.state = ReplicatorState::NeedFrames;
+                return Ok(());
+            }
+        }
+    }
+
     async fn try_replicate_step(&mut self) -> Result<(), Error> {
+        self.try_replicate_step_inner(None).await
+    }
+
+    async fn try_replicate_step_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        self.try_replicate_step_inner(Some(token)).await
+    }
+
+    async fn try_replicate_step_inner(
+        &mut self,
+        token: Option<&CancellationToken>,
+    ) -> Result<(), Error> {
         let state = self.state;
-        let ret = match state {
-            ReplicatorState::NeedHandshake => self.try_perform_handshake().await,
-            ReplicatorState::NeedFrames => self.try_replicate().await,
-            ReplicatorState::NeedSnapshot => self.load_snapshot().await,
-            ReplicatorState::Exit => unreachable!("trying to step replicator on exit"),
+        let ret = match (state, token) {
+            (ReplicatorState::NeedHandshake, Some(token)) => {
+                self.try_perform_handshake_with_cancellation(token).await
+            }
+            (ReplicatorState::NeedHandshake, None) => self.try_perform_handshake().await,
+            (ReplicatorState::NeedFrames, Some(token)) => {
+                self.try_replicate_with_cancellation(token).await
+            }
+            (ReplicatorState::NeedFrames, None) => self.try_replicate().await,
+            (ReplicatorState::NeedSnapshot, Some(token)) => {
+                self.load_snapshot_with_cancellation(token).await
+            }
+            (ReplicatorState::NeedSnapshot, None) => self.load_snapshot().await,
+            (ReplicatorState::Exit, _) => unreachable!("trying to step replicator on exit"),
         };
 
         // in case of error we rollback the current injector transaction, and start over.
         if ret.is_err() {
+            if matches!(ret, Err(Error::SyncCancelledForShutdown)) {
+                tracing::info!("sync_cancellation_rollback_started");
+            }
             self.client.rollback();
             self.injector.rollback().await;
+            if matches!(ret, Err(Error::SyncCancelledForShutdown)) {
+                tracing::info!("sync_cancellation_rollback_finished");
+            }
         }
 
         self.state = match ret {
@@ -294,11 +407,93 @@ where
         Ok(())
     }
 
+    async fn try_perform_handshake_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        let mut error_printed = false;
+        for _ in 0..self.max_handshake_retries {
+            if token.is_cancelled() {
+                tracing::info!("sync_cancelled_during_handshake");
+                return Err(Error::SyncCancelledForShutdown);
+            }
+
+            tracing::debug!("Attempting to perform handshake with primary.");
+            match self.client.handshake_with_cancellation(token).await {
+                Ok(_) => {
+                    self.state = ReplicatorState::NeedFrames;
+                    return Ok(());
+                }
+                Err(Error::Client(e)) if !error_printed => {
+                    if e.downcast_ref::<uuid::Error>().is_some() {
+                        tracing::warn!("error connecting to primary. retrying. Verify that the libsql server version is `>=0.22` error: {e}");
+                    } else {
+                        tracing::warn!("error connecting to primary. retrying. error: {e}");
+                    }
+
+                    error_printed = true;
+                }
+                Err(Error::Client(_)) if error_printed => (),
+                Err(Error::SyncCancelledForShutdown) => {
+                    tracing::info!("sync_cancelled_during_handshake");
+                    return Err(Error::SyncCancelledForShutdown);
+                }
+                Err(e) => return Err(e),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                _ = token.cancelled() => {
+                    tracing::info!("sync_cancelled_during_handshake");
+                    return Err(Error::SyncCancelledForShutdown);
+                }
+            }
+        }
+
+        Err(Error::PrimaryHandshakeTimeout)
+    }
+
     async fn try_replicate(&mut self) -> Result<(), Error> {
         let mut stream = self.client.next_frames().await?;
 
         while let Some(frame) = stream.next().await.transpose()? {
             self.inject_frame(frame).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn try_replicate_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        if token.is_cancelled() {
+            tracing::info!("sync_cancelled_during_frame_fetch");
+            return Err(Error::SyncCancelledForShutdown);
+        }
+        let mut stream = self.client.next_frames_with_cancellation(token).await?;
+
+        loop {
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = token.cancelled() => {
+                    tracing::info!("sync_cancelled_during_frame_fetch");
+                    return Err(Error::SyncCancelledForShutdown);
+                }
+            };
+
+            let Some(frame) = next.transpose()? else {
+                if token.is_cancelled() {
+                    tracing::info!("sync_cancelled_during_frame_fetch");
+                    return Err(Error::SyncCancelledForShutdown);
+                }
+                break;
+            };
+            self.inject_frame_with_cancellation(frame, token).await?;
+        }
+
+        if token.is_cancelled() {
+            tracing::info!("sync_cancelled_during_frame_fetch");
+            return Err(Error::SyncCancelledForShutdown);
         }
 
         Ok(())
@@ -325,6 +520,52 @@ where
         }
     }
 
+    async fn load_snapshot_with_cancellation(
+        &mut self,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        self.client.rollback();
+        self.injector.rollback().await;
+        loop {
+            if token.is_cancelled() {
+                tracing::info!("sync_cancelled_during_snapshot_fetch");
+                return Err(Error::SyncCancelledForShutdown);
+            }
+
+            match self.client.snapshot_with_cancellation(token).await {
+                Ok(mut stream) => loop {
+                    let next = tokio::select! {
+                        next = stream.next() => next,
+                        _ = token.cancelled() => {
+                            tracing::info!("sync_cancelled_during_snapshot_stream");
+                            return Err(Error::SyncCancelledForShutdown);
+                        }
+                    };
+
+                    let Some(frame) = next else {
+                        if token.is_cancelled() {
+                            tracing::info!("sync_cancelled_during_snapshot_stream");
+                            return Err(Error::SyncCancelledForShutdown);
+                        }
+                        return Ok(());
+                    };
+                    self.inject_frame_with_cancellation(frame?, token).await?;
+                },
+                Err(Error::SnapshotPending) => {
+                    tracing::info!("snapshot not ready yet, waiting 1s...");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                        _ = token.cancelled() => {
+                            tracing::info!("sync_cancelled_during_snapshot_fetch");
+                            return Err(Error::SyncCancelledForShutdown);
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     async fn inject_frame(&mut self, frame: RpcFrame) -> Result<(), Error> {
         self.frames_synced += 1;
 
@@ -332,22 +573,56 @@ where
             self.injector.durable_frame_no(frame_no);
         }
 
-        match self.injector.inject_frame(frame).await? {
-            Some(commit_fno) => {
+        if let Some(commit_fno) = self.injector.inject_frame(frame).await? {
+            self.client.commit_frame_no(commit_fno).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn inject_frame_with_cancellation(
+        &mut self,
+        frame: RpcFrame,
+        token: &CancellationToken,
+    ) -> Result<(), Error> {
+        if token.is_cancelled() {
+            tracing::info!("sync_cancelled_during_injection");
+            return Err(Error::SyncCancelledForShutdown);
+        }
+
+        self.frames_synced += 1;
+
+        if let Some(frame_no) = frame.durable_frame_no {
+            self.injector.durable_frame_no(frame_no);
+        }
+
+        match self
+            .injector
+            .inject_frame_with_cancellation(frame, token)
+            .await
+        {
+            Ok(Some(commit_fno)) => {
                 self.client.commit_frame_no(commit_fno).await?;
             }
-            None => (),
+            Ok(None) => (),
+            Err(crate::injector::Error::SyncCancelledForShutdown) => {
+                tracing::info!("sync_cancelled_during_injection");
+                return Err(Error::SyncCancelledForShutdown);
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        if token.is_cancelled() {
+            tracing::info!("sync_cancelled_during_injection");
+            return Err(Error::SyncCancelledForShutdown);
         }
 
         Ok(())
     }
 
     pub async fn flush(&mut self) -> Result<(), Error> {
-        match self.injector.flush().await? {
-            Some(commit_fno) => {
-                self.client.commit_frame_no(commit_fno).await?;
-            }
-            None => (),
+        if let Some(commit_fno) = self.injector.flush().await? {
+            self.client.commit_frame_no(commit_fno).await?;
         }
 
         Ok(())
@@ -366,7 +641,14 @@ pub fn map_frame_err(f: Result<RpcFrame, Status>) -> Result<Frame, Error> {
 
 #[cfg(test)]
 mod test {
-    use std::{mem::size_of, pin::Pin};
+    use std::{
+        mem::size_of,
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use async_stream::stream;
 
@@ -374,6 +656,607 @@ mod test {
     use crate::rpc::replication::Frame as RpcFrame;
 
     use super::*;
+
+    struct BlockingInjector {
+        inject_called: Arc<AtomicBool>,
+        rolled_back: Arc<AtomicBool>,
+    }
+
+    impl BlockingInjector {
+        fn new() -> Self {
+            Self {
+                inject_called: Arc::new(AtomicBool::new(false)),
+                rolled_back: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl Injector for BlockingInjector {
+        async fn inject_frame(
+            &mut self,
+            _frame: RpcFrame,
+        ) -> std::result::Result<Option<FrameNo>, crate::injector::Error> {
+            Ok(None)
+        }
+
+        async fn inject_frame_with_cancellation(
+            &mut self,
+            _frame: RpcFrame,
+            token: &CancellationToken,
+        ) -> std::result::Result<Option<FrameNo>, crate::injector::Error> {
+            self.inject_called.store(true, Ordering::SeqCst);
+            token.cancelled().await;
+            Err(crate::injector::Error::SyncCancelledForShutdown)
+        }
+
+        async fn rollback(&mut self) {
+            self.rolled_back.store(true, Ordering::SeqCst);
+        }
+
+        async fn flush(&mut self) -> std::result::Result<Option<FrameNo>, crate::injector::Error> {
+            Ok(None)
+        }
+
+        fn durable_frame_no(&mut self, _frame_no: u64) {}
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_handshake_rolls_back() {
+        struct Client {
+            rolled_back: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReplicatorClient for Client {
+            type FrameStream =
+                Pin<Box<dyn Stream<Item = Result<RpcFrame, Error>> + Send + 'static>>;
+
+            async fn handshake(&mut self) -> Result<(), Error> {
+                std::future::pending().await
+            }
+
+            async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn commit_frame_no(&mut self, _frame_no: FrameNo) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            fn committed_frame_no(&self) -> Option<FrameNo> {
+                None
+            }
+
+            fn rollback(&mut self) {
+                self.rolled_back.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let client_rolled_back = Arc::new(AtomicBool::new(false));
+        let injector = BlockingInjector::new();
+        let injector_rolled_back = injector.rolled_back.clone();
+        let mut replicator = Replicator::new(
+            Client {
+                rolled_back: client_rolled_back.clone(),
+            },
+            injector,
+        );
+        replicator.state = ReplicatorState::NeedHandshake;
+
+        let cancel = token.clone();
+        let (result, _) = tokio::join!(
+            async {
+                replicator
+                    .try_replicate_step_with_cancellation(&token)
+                    .await
+            },
+            async {
+                tokio::task::yield_now().await;
+                cancel.cancel();
+            }
+        );
+
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::SyncCancelledForShutdown
+        ));
+        assert!(client_rolled_back.load(Ordering::SeqCst));
+        assert!(injector_rolled_back.load(Ordering::SeqCst));
+        assert_eq!(replicator.state, ReplicatorState::NeedHandshake);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_injection_waits_and_rolls_back() {
+        struct Client {
+            rolled_back: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReplicatorClient for Client {
+            type FrameStream =
+                Pin<Box<dyn Stream<Item = Result<RpcFrame, Error>> + Send + 'static>>;
+
+            async fn handshake(&mut self) -> Result<(), Error> {
+                Ok(())
+            }
+
+            async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
+                Ok(Box::pin(tokio_stream::iter([Ok(RpcFrame {
+                    data: Vec::new().into(),
+                    timestamp: None,
+                    durable_frame_no: None,
+                })])))
+            }
+
+            async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn commit_frame_no(&mut self, _frame_no: FrameNo) -> Result<(), Error> {
+                Ok(())
+            }
+
+            fn committed_frame_no(&self) -> Option<FrameNo> {
+                None
+            }
+
+            fn rollback(&mut self) {
+                self.rolled_back.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let client_rolled_back = Arc::new(AtomicBool::new(false));
+        let injector = BlockingInjector::new();
+        let inject_called = injector.inject_called.clone();
+        let injector_rolled_back = injector.rolled_back.clone();
+        let mut replicator = Replicator::new(
+            Client {
+                rolled_back: client_rolled_back.clone(),
+            },
+            injector,
+        );
+        replicator.state = ReplicatorState::NeedFrames;
+
+        let cancel = token.clone();
+        let (result, _) = tokio::join!(
+            async {
+                replicator
+                    .try_replicate_step_with_cancellation(&token)
+                    .await
+            },
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !inject_called.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("inject_frame_with_cancellation was not called");
+                cancel.cancel();
+            }
+        );
+
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::SyncCancelledForShutdown
+        ));
+        assert!(client_rolled_back.load(Ordering::SeqCst));
+        assert!(injector_rolled_back.load(Ordering::SeqCst));
+        assert_eq!(replicator.state, ReplicatorState::NeedHandshake);
+    }
+
+    struct SuccessfulAfterCancelInjector {
+        inject_called: Arc<AtomicBool>,
+        rolled_back: Arc<AtomicBool>,
+    }
+
+    impl SuccessfulAfterCancelInjector {
+        fn new() -> Self {
+            Self {
+                inject_called: Arc::new(AtomicBool::new(false)),
+                rolled_back: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl Injector for SuccessfulAfterCancelInjector {
+        async fn inject_frame(
+            &mut self,
+            _frame: RpcFrame,
+        ) -> std::result::Result<Option<FrameNo>, crate::injector::Error> {
+            Ok(None)
+        }
+
+        async fn inject_frame_with_cancellation(
+            &mut self,
+            _frame: RpcFrame,
+            token: &CancellationToken,
+        ) -> std::result::Result<Option<FrameNo>, crate::injector::Error> {
+            self.inject_called.store(true, Ordering::SeqCst);
+            token.cancel();
+            Ok(None)
+        }
+
+        async fn rollback(&mut self) {
+            self.rolled_back.store(true, Ordering::SeqCst);
+        }
+
+        async fn flush(&mut self) -> std::result::Result<Option<FrameNo>, crate::injector::Error> {
+            Ok(None)
+        }
+
+        fn durable_frame_no(&mut self, _frame_no: u64) {}
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_successful_injection_is_not_swallowed() {
+        struct Client {
+            rolled_back: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReplicatorClient for Client {
+            type FrameStream =
+                Pin<Box<dyn Stream<Item = Result<RpcFrame, Error>> + Send + 'static>>;
+
+            async fn handshake(&mut self) -> Result<(), Error> {
+                Ok(())
+            }
+
+            async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
+                Ok(Box::pin(tokio_stream::iter([Ok(RpcFrame {
+                    data: Vec::new().into(),
+                    timestamp: None,
+                    durable_frame_no: None,
+                })])))
+            }
+
+            async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn commit_frame_no(&mut self, _frame_no: FrameNo) -> Result<(), Error> {
+                Ok(())
+            }
+
+            fn committed_frame_no(&self) -> Option<FrameNo> {
+                None
+            }
+
+            fn rollback(&mut self) {
+                self.rolled_back.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let client_rolled_back = Arc::new(AtomicBool::new(false));
+        let injector = SuccessfulAfterCancelInjector::new();
+        let inject_called = injector.inject_called.clone();
+        let injector_rolled_back = injector.rolled_back.clone();
+        let mut replicator = Replicator::new(
+            Client {
+                rolled_back: client_rolled_back.clone(),
+            },
+            injector,
+        );
+        replicator.state = ReplicatorState::NeedFrames;
+
+        let result = replicator
+            .try_replicate_step_with_cancellation(&token)
+            .await;
+
+        assert!(inject_called.load(Ordering::SeqCst));
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::SyncCancelledForShutdown
+        ));
+        assert!(client_rolled_back.load(Ordering::SeqCst));
+        assert!(injector_rolled_back.load(Ordering::SeqCst));
+        assert_eq!(replicator.state, ReplicatorState::NeedHandshake);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_frame_fetch_rolls_back() {
+        struct Client {
+            rolled_back: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReplicatorClient for Client {
+            type FrameStream =
+                Pin<Box<dyn Stream<Item = Result<RpcFrame, Error>> + Send + 'static>>;
+
+            async fn handshake(&mut self) -> Result<(), Error> {
+                Ok(())
+            }
+
+            async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
+                std::future::pending().await
+            }
+
+            async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn commit_frame_no(&mut self, _frame_no: FrameNo) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            fn committed_frame_no(&self) -> Option<FrameNo> {
+                None
+            }
+
+            fn rollback(&mut self) {
+                self.rolled_back.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let client_rolled_back = Arc::new(AtomicBool::new(false));
+        let injector = BlockingInjector::new();
+        let injector_rolled_back = injector.rolled_back.clone();
+        let mut replicator = Replicator::new(
+            Client {
+                rolled_back: client_rolled_back.clone(),
+            },
+            injector,
+        );
+        replicator.state = ReplicatorState::NeedFrames;
+
+        let cancel = token.clone();
+        let (result, _) = tokio::join!(
+            async {
+                replicator
+                    .try_replicate_step_with_cancellation(&token)
+                    .await
+            },
+            async {
+                tokio::task::yield_now().await;
+                cancel.cancel();
+            }
+        );
+
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::SyncCancelledForShutdown
+        ));
+        assert!(client_rolled_back.load(Ordering::SeqCst));
+        assert!(injector_rolled_back.load(Ordering::SeqCst));
+        assert_eq!(replicator.state, ReplicatorState::NeedHandshake);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_snapshot_request_pending_rolls_back() {
+        struct Client {
+            rolled_back: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReplicatorClient for Client {
+            type FrameStream =
+                Pin<Box<dyn Stream<Item = Result<RpcFrame, Error>> + Send + 'static>>;
+
+            async fn handshake(&mut self) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
+                std::future::pending().await
+            }
+
+            async fn commit_frame_no(&mut self, _frame_no: FrameNo) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            fn committed_frame_no(&self) -> Option<FrameNo> {
+                None
+            }
+
+            fn rollback(&mut self) {
+                self.rolled_back.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let client_rolled_back = Arc::new(AtomicBool::new(false));
+        let injector = BlockingInjector::new();
+        let injector_rolled_back = injector.rolled_back.clone();
+        let mut replicator = Replicator::new(
+            Client {
+                rolled_back: client_rolled_back.clone(),
+            },
+            injector,
+        );
+        replicator.state = ReplicatorState::NeedSnapshot;
+
+        let cancel = token.clone();
+        let (result, _) = tokio::join!(
+            async {
+                replicator
+                    .try_replicate_step_with_cancellation(&token)
+                    .await
+            },
+            async {
+                tokio::task::yield_now().await;
+                cancel.cancel();
+            }
+        );
+
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::SyncCancelledForShutdown
+        ));
+        assert!(client_rolled_back.load(Ordering::SeqCst));
+        assert!(injector_rolled_back.load(Ordering::SeqCst));
+        assert_eq!(replicator.state, ReplicatorState::NeedHandshake);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_snapshot_pending_sleep_rolls_back() {
+        struct Client {
+            rolled_back: Arc<AtomicBool>,
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReplicatorClient for Client {
+            type FrameStream =
+                Pin<Box<dyn Stream<Item = Result<RpcFrame, Error>> + Send + 'static>>;
+
+            async fn handshake(&mut self) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::SnapshotPending)
+            }
+
+            async fn commit_frame_no(&mut self, _frame_no: FrameNo) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            fn committed_frame_no(&self) -> Option<FrameNo> {
+                None
+            }
+
+            fn rollback(&mut self) {
+                self.rolled_back.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let client_rolled_back = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let injector = BlockingInjector::new();
+        let injector_rolled_back = injector.rolled_back.clone();
+        let mut replicator = Replicator::new(
+            Client {
+                rolled_back: client_rolled_back.clone(),
+                calls: calls.clone(),
+            },
+            injector,
+        );
+        replicator.state = ReplicatorState::NeedSnapshot;
+
+        let cancel = token.clone();
+        let (result, _) = tokio::join!(
+            async {
+                replicator
+                    .try_replicate_step_with_cancellation(&token)
+                    .await
+            },
+            async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while calls.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("snapshot was not requested");
+                cancel.cancel();
+            }
+        );
+
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::SyncCancelledForShutdown
+        ));
+        assert!(client_rolled_back.load(Ordering::SeqCst));
+        assert!(injector_rolled_back.load(Ordering::SeqCst));
+        assert_eq!(replicator.state, ReplicatorState::NeedHandshake);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_snapshot_stream_pending_rolls_back() {
+        struct Client {
+            rolled_back: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ReplicatorClient for Client {
+            type FrameStream =
+                Pin<Box<dyn Stream<Item = Result<RpcFrame, Error>> + Send + 'static>>;
+
+            async fn handshake(&mut self) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            async fn next_frames(&mut self) -> Result<Self::FrameStream, Error> {
+                unreachable!()
+            }
+
+            async fn snapshot(&mut self) -> Result<Self::FrameStream, Error> {
+                Ok(Box::pin(stream! {
+                    std::future::pending::<()>().await;
+                    yield Ok(RpcFrame {
+                        data: Vec::new().into(),
+                        timestamp: None,
+                        durable_frame_no: None,
+                    });
+                }))
+            }
+
+            async fn commit_frame_no(&mut self, _frame_no: FrameNo) -> Result<(), Error> {
+                unreachable!()
+            }
+
+            fn committed_frame_no(&self) -> Option<FrameNo> {
+                None
+            }
+
+            fn rollback(&mut self) {
+                self.rolled_back.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token = CancellationToken::new();
+        let client_rolled_back = Arc::new(AtomicBool::new(false));
+        let injector = BlockingInjector::new();
+        let injector_rolled_back = injector.rolled_back.clone();
+        let mut replicator = Replicator::new(
+            Client {
+                rolled_back: client_rolled_back.clone(),
+            },
+            injector,
+        );
+        replicator.state = ReplicatorState::NeedSnapshot;
+
+        let cancel = token.clone();
+        let (result, _) = tokio::join!(
+            async {
+                replicator
+                    .try_replicate_step_with_cancellation(&token)
+                    .await
+            },
+            async {
+                tokio::task::yield_now().await;
+                cancel.cancel();
+            }
+        );
+
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::SyncCancelledForShutdown
+        ));
+        assert!(client_rolled_back.load(Ordering::SeqCst));
+        assert!(injector_rolled_back.load(Ordering::SeqCst));
+        assert_eq!(replicator.state, ReplicatorState::NeedHandshake);
+    }
 
     #[tokio::test]
     async fn handshake_error_namespace_doesnt_exist() {

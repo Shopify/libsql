@@ -2,6 +2,7 @@
 name = "libsql_rust_suite"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.85"
 
 [workspace]
 
@@ -17,6 +18,17 @@ hex = "0.4.3"
 rustc-hash = "1"
 home = { version = "=0.5.9" }
 which = "=4.4.0"
+
+# Keep transitive URL/idna dependencies compatible with the Rust toolchain used by
+# extension-test CI. Newer releases require rustc 1.86+.
+idna_adapter = "=1.2.1"
+icu_collections = "=2.1.1"
+icu_locale_core = "=2.1.1"
+icu_normalizer = "=2.1.1"
+icu_normalizer_data = "=2.1.1"
+icu_properties = "=2.1.1"
+icu_properties_data = "=2.1.1"
+icu_provider = "=2.1.1"
 
 [dev-dependencies.psm]
 version = "=0.1.21"

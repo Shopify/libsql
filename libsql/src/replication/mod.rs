@@ -1,7 +1,7 @@
 //! Utilities used when using a replicated version of libsql.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +14,10 @@ use libsql_replication::rpc::proxy::{
     query::Params, DescribeRequest, DescribeResult, ExecuteResults, Positional, Program,
     ProgramReq, Query, Step,
 };
+use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::database::EncryptionConfig;
@@ -167,11 +169,82 @@ pub(crate) struct EmbeddedReplicator {
     replicator: Arc<Mutex<Replicator<Either<RemoteClient, LocalClient>, SqliteInjector>>>,
     bg_abort: Option<Arc<DropAbort>>,
     last_frames_synced: Arc<AtomicUsize>,
+    current_sync_cancellation: CurrentSyncCancellation,
+}
+
+#[derive(Clone, Default)]
+struct CurrentSyncCancellation {
+    current: Arc<ParkingMutex<Option<ActiveSyncToken>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct ActiveSyncToken {
+    id: u64,
+    token: CancellationToken,
+}
+
+struct ActiveSyncCancellationGuard {
+    state: CurrentSyncCancellation,
+    active: ActiveSyncToken,
+}
+
+impl CurrentSyncCancellation {
+    fn begin_sync(&self) -> ActiveSyncCancellationGuard {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let active = ActiveSyncToken {
+            id,
+            token: CancellationToken::new(),
+        };
+        *self.current.lock() = Some(active.clone());
+        tracing::debug!("sync_cancellation_registered");
+        ActiveSyncCancellationGuard {
+            state: self.clone(),
+            active,
+        }
+    }
+
+    fn cancel_current_sync_for_shutdown(&self) -> bool {
+        let token = self.current.lock().as_ref().map(|active| active.token.clone());
+        if let Some(token) = token {
+            tracing::info!("sync_cancellation_requested");
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl ActiveSyncCancellationGuard {
+    fn token(&self) -> &CancellationToken {
+        &self.active.token
+    }
+}
+
+impl Drop for ActiveSyncCancellationGuard {
+    fn drop(&mut self) {
+        let mut current = self.state.current.lock();
+        if current
+            .as_ref()
+            .is_some_and(|active| active.id == self.active.id)
+        {
+            *current = None;
+            tracing::debug!("sync_cancellation_settled");
+        }
+    }
 }
 
 impl From<libsql_replication::replicator::Error> for errors::Error {
     fn from(err: libsql_replication::replicator::Error) -> Self {
-        errors::Error::Replication(err.into())
+        match err {
+            libsql_replication::replicator::Error::SyncCancelledForShutdown => {
+                errors::Error::SyncCancelledForShutdown
+            }
+            err => errors::Error::Replication(err.into()),
+        }
     }
 }
 
@@ -197,6 +270,7 @@ impl EmbeddedReplicator {
             replicator,
             bg_abort: None,
             last_frames_synced: Arc::new(AtomicUsize::new(0)),
+            current_sync_cancellation: CurrentSyncCancellation::default(),
         };
 
         if let Some(sync_duration) = perodic_sync {
@@ -241,7 +315,13 @@ impl EmbeddedReplicator {
             replicator,
             bg_abort: None,
             last_frames_synced: Arc::new(AtomicUsize::new(0)),
+            current_sync_cancellation: CurrentSyncCancellation::default(),
         })
+    }
+
+    pub fn cancel_current_sync_for_shutdown(&self) -> bool {
+        self.current_sync_cancellation
+            .cancel_current_sync_for_shutdown()
     }
 
     pub async fn get_sync_usage_stats(&self) -> Result<SyncUsageStats> {
@@ -283,11 +363,14 @@ impl EmbeddedReplicator {
             ));
         }
 
+        let active_sync = self.current_sync_cancellation.begin_sync();
+        let token = active_sync.token().clone();
+
         // we force a handshake to get the most up to date replication index from the primary.
         replicator.force_handshake();
 
         loop {
-            match replicator.replicate().await {
+            match replicator.replicate_with_cancellation(&token).await {
                 Err(libsql_replication::replicator::Error::Meta(
                     libsql_replication::meta::Error::LogIncompatible,
                 )) => {
@@ -295,11 +378,11 @@ impl EmbeddedReplicator {
                     // this time.
                     tracing::debug!("re-replicating database after LogIncompatible error");
                     replicator
-                        .replicate()
+                        .replicate_with_cancellation(&token)
                         .await
-                        .map_err(|e| crate::Error::Replication(e.into()))?;
+                        .map_err(crate::Error::from)?;
                 }
-                Err(e) => return Err(crate::Error::Replication(e.into())),
+                Err(e) => return Err(crate::Error::from(e)),
                 Ok(_) => {
                     let Either::Left(client) = replicator.client_mut() else {
                         unreachable!()
