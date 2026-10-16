@@ -71,6 +71,13 @@ Three components, each independently testable:
 
 Why a dedicated blocking thread instead of `spawn_blocking` per statement: it removes a thread-pool handoff per row, keeps the connection on one thread, and lets network I/O overlap with execution.
 
+Why the hand-off between the reader and the executor is a bounded queue with two limits:
+
+- **The queue must be bounded.** Reading is usually faster than execution: the import rate follows SQLite's per-row work, not the reader. An unbounded queue would fill with the rest of the dump, which is the memory problem this design removes. When the queue is full, the reader waits in `send` and stops polling the stream. For an HTTP body, hyper then stops reading the socket and TCP flow control slows the sender. For a file, reads pause.
+- **It needs a count limit and a byte limit**, because statement size varies widely. A dump row is typically hundreds of bytes to a few KB, but one statement can be as large as the 64 MiB statement cap. `queue_depth` (256 messages) is the limit that applies to small rows: 256 rows of 4 KB hold about 1 MiB. `queue_bytes` (16 MiB) applies only when statements average more than 64 KiB. Without it, 256 statements at the cap could hold 16 GiB.
+- **The byte limit is a semaphore whose permit travels with the statement.** Before sending, the reader acquires one permit per byte, clamped to `1..=queue_bytes` (§9.2). The permit is a field of `Msg::Stmt` (§8.1), so it is released when the executor drops the message after running it, on every exit path. A statement larger than the whole budget takes every permit and is the only one in flight. Without the clamp, the reader would wait for more permits than exist.
+- **The channel also signals completion and failure.** `Msg::End` marks a clean end of input. Either side dropping its end of the channel tells the other side to stop (§9.3).
+
 ---
 
 ## 5. Interface changes
@@ -556,7 +563,7 @@ In `dump_stream_from_url` change `ReaderStream::new(f)` to `ReaderStream::with_c
 | SQLite page cache | `cache_size` pragma, independent of importer | unchanged |
 | Replication log / WAL | on disk, flushed per spill (`replication_logger_wal.rs`) | disk ≈ 2× DB size during import |
 
-Expected steady-state importer RSS: < 32 MiB regardless of dump size, versus ≈ 2× dump size for buffered (`String` + lowercase copy during the ATTACH check).
+Expected steady-state importer RSS: tens of MiB regardless of dump size, versus ≈ 2× dump size for buffered (`String` + lowercase copy during the ATTACH check). §15 has the local measurements.
 
 Disk: the single dump transaction means the SQLite WAL and the replication log each grow to roughly the database size before `COMMIT`; the auto-checkpoint runs after commit. Identical for both importers; worth stating in the runbook.
 
@@ -590,7 +597,7 @@ Metrics (`metrics` 0.21 macros with labels):
 3. No server-side timeout exists for dump imports; the Admin HTTP request stays open for the whole import. Clients must not time out, or must tolerate (2).
 4. Bottomless, if enabled, has its own frame buffering/backpressure outside this design.
 
-None of these is fixed here. #53 proposed all-or-nothing namespace creation, which addresses (1) and (2); it is closed for now, and an operator deletes a namespace left behind by a failed import.
+None of these is fixed here. #53, stacked on this change, makes namespace creation all-or-nothing and addresses (1) and (2); until it lands, an operator deletes a namespace left behind by a failed import.
 
 ---
 
