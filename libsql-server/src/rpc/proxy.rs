@@ -13,7 +13,6 @@ use libsql_replication::rpc::proxy::{
     describe_result, Ack, DescribeRequest, DescribeResult, Description, DisconnectMessage, ExecReq,
     ExecResp, ExecuteResults, QueryResult, ResultRows, Row,
 };
-use libsql_replication::rpc::replication::NAMESPACE_DOESNT_EXIST;
 use rusqlite::types::ValueRef;
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -313,13 +312,21 @@ impl ProxyService {
         let auth = match namespace_jwt_keys {
             Ok(Ok(Some(key))) => Some(Auth::new(Jwt::new(key))),
             Ok(Ok(None)) => self.user_auth_strategy.clone(),
-            Err(e) => match e.as_ref() {
-                crate::error::Error::NamespaceDoesntExist(_) => None,
-                _ => Err(tonic::Status::internal(format!(
-                    "Error fetching jwt key for a namespace: {}",
-                    e
-                )))?,
-            },
+            Err(e) => {
+                // `namespace_error_status` classifies the store's errors:
+                // `FAILED_PRECONDITION` is a missing namespace, `UNAVAILABLE`
+                // one that exists but cannot be served right now. Only a
+                // missing namespace skips authentication here.
+                let status = crate::rpc::namespace_error_status(&e);
+                match status.code() {
+                    tonic::Code::FailedPrecondition => None,
+                    tonic::Code::Unavailable => Err(status)?,
+                    _ => Err(tonic::Status::internal(format!(
+                        "Error fetching jwt key for a namespace: {}",
+                        e
+                    )))?,
+                }
+            }
             Ok(Err(e)) => Err(tonic::Status::internal(format!(
                 "Error fetching jwt key for a namespace: {}",
                 e
@@ -585,13 +592,7 @@ impl Proxy for ProxyService {
                 (connection_maker, notifier)
             })
             .await
-            .map_err(|e| {
-                if let crate::error::Error::NamespaceDoesntExist(_) = e {
-                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
-                } else {
-                    tonic::Status::internal(e.to_string())
-                }
-            })?;
+            .map_err(|e| crate::rpc::namespace_error_status(&e))?;
 
         let conn = connection_maker
             .create()
@@ -617,13 +618,7 @@ impl Proxy for ProxyService {
             .namespaces
             .with(ctx.namespace().clone(), |ns| ns.db.connection_maker())
             .await
-            .map_err(|e| {
-                if let crate::error::Error::NamespaceDoesntExist(_) = e {
-                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
-                } else {
-                    tonic::Status::internal(e.to_string())
-                }
-            })?;
+            .map_err(|e| crate::rpc::namespace_error_status(&e))?;
 
         let conn = {
             let lock = self.clients.upgradable_read().await;
@@ -691,13 +686,7 @@ impl Proxy for ProxyService {
             .namespaces
             .with(ctx.namespace().clone(), |ns| ns.db.connection_maker())
             .await
-            .map_err(|e| {
-                if let crate::error::Error::NamespaceDoesntExist(_) = e {
-                    tonic::Status::failed_precondition(NAMESPACE_DOESNT_EXIST)
-                } else {
-                    tonic::Status::internal(e.to_string())
-                }
-            })?;
+            .map_err(|e| crate::rpc::namespace_error_status(&e))?;
 
         let DescribeRequest { client_id, stmt } = req.into_inner();
         let client_id = Uuid::from_str(&client_id).unwrap();
@@ -753,5 +742,39 @@ impl Proxy for ProxyService {
                 param_count,
             })),
         }))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::connection::config::DatabaseConfig;
+    use crate::namespace::{make_test_store, NamespaceName, RestoreOption};
+
+    #[tokio::test]
+    async fn context_while_the_store_is_shut_down_is_unavailable() {
+        let tmp = tempdir().unwrap();
+        let store = make_test_store(tmp.path()).await;
+        store
+            .create(
+                NamespaceName::default(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.clone().shutdown().await.unwrap();
+        let service = ProxyService::new(store, None, true);
+        // A namespace reported as missing is authenticated from this header,
+        // which the client writes. A false "missing" used to make a forged
+        // one pass; the request must fail before it is read.
+        let mut request = tonic::Request::new(());
+        Authenticated::FullAccess.upgrade_grpc_request(&mut request);
+
+        let status = service.extract_context(&mut request).await.err().unwrap();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     }
 }
