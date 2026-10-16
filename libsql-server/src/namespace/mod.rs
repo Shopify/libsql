@@ -23,6 +23,7 @@ pub use self::store::NamespaceStore;
 pub mod broadcasters;
 pub(crate) mod configurator;
 pub mod dump_import;
+pub(crate) mod incomplete;
 pub mod meta_store;
 mod name;
 pub mod replication_wal;
@@ -58,6 +59,20 @@ pub enum NamespaceBottomlessDbIdInit {
     FetchFromConfig,
 }
 
+/// Remove the incomplete marker of the namespace directory `path`, if present.
+pub(crate) async fn remove_incomplete_marker(path: &Path) -> std::io::Result<()> {
+    let marker = path.join(incomplete::INCOMPLETE_MARKER);
+    // Almost always absent (every cold load passes through here): a stat is cheaper than a
+    // trip to the blocking pool.
+    if !marker.exists() {
+        return Ok(());
+    }
+    match tokio::fs::remove_file(marker).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// A namespace isolates the resources pertaining to a database of type T
 #[derive(Debug)]
 pub struct Namespace {
@@ -73,6 +88,12 @@ pub struct Namespace {
 impl Namespace {
     pub(crate) fn name(&self) -> &NamespaceName {
         &self.name
+    }
+
+    /// Remove the [`incomplete::INCOMPLETE_MARKER`]: the namespace is now persisted in the
+    /// metastore (or was opened from it, which implies the same).
+    pub(crate) async fn mark_complete(&self) -> std::io::Result<()> {
+        remove_incomplete_marker(&self.path).await
     }
 
     async fn destroy(mut self) -> anyhow::Result<()> {
