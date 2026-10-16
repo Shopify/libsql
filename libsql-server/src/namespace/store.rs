@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use async_lock::{RwLock, RwLockWriteGuardArc};
+use async_lock::{RwLock, RwLockReadGuardArc, RwLockWriteGuardArc};
 use chrono::NaiveDateTime;
 use futures::TryFutureExt;
 use moka::future::Cache;
@@ -35,9 +35,31 @@ use super::{Namespace, ResetCb, ResetOp, ResolveNamespacePathFn, RestoreOption};
 
 type NamespaceEntry = Arc<RwLock<Option<Namespace>>>;
 
-/// How many times `with` looks a namespace up again after finding its entry emptied (by
-/// shutdown, eviction or destroy) before it gives up.
-const MAX_EMPTIED_ENTRY_ATTEMPTS: usize = 3;
+/// A namespace held read-locked in its cache entry, so that nothing can take it out of the
+/// entry (eviction, shutdown, destroy) while it is in use. Only `load_namespace` makes one,
+/// after it saw the entry filled.
+pub(crate) struct LoadedNamespace(RwLockReadGuardArc<Option<Namespace>>);
+
+impl std::ops::Deref for LoadedNamespace {
+    type Target = Namespace;
+
+    fn deref(&self) -> &Namespace {
+        self.0
+            .as_ref()
+            .expect("a LoadedNamespace is only made from a filled entry")
+    }
+}
+
+/// How many times a lookup finds its entry emptied (by shutdown, eviction or destroy) before
+/// it gives up with `NamespaceUnavailable`.
+///
+/// Where the cache holds the working set, eviction happens at shutdown only and the second
+/// lookup succeeds. The budget matters only for a cache far too small for its working set,
+/// where entries live for milliseconds: at a third of the working set, three lookups gave up
+/// on about one request in 20,000 and five on none in 340,000. The lookups are cheap; only the
+/// one that loads the namespace is not, and a load is as likely to be evicted at once as any
+/// other entry, so nothing is gained by spending more.
+const MAX_EMPTIED_ENTRY_ATTEMPTS: usize = 5;
 
 /// Entries of namespaces with a creation, fork or reset in progress, pinned so that lookups keep
 /// finding (and waiting on) the locked entry even if the cache evicts it meanwhile. Otherwise a
@@ -336,10 +358,18 @@ impl NamespaceStore {
         self.inner.metadata.exists(namespace).await
     }
 
-    pub async fn destroy(&self, namespace: NamespaceName, prune_all: bool) -> crate::Result<()> {
+    /// Nothing starts, and no operation in progress commits or installs anything, once shutdown
+    /// has begun: a namespace opened or installed after `shutdown` collected the entries would
+    /// never be shut down.
+    fn refuse_if_shut_down(&self) -> crate::Result<()> {
         if self.inner.has_shutdown.load(Ordering::Relaxed) {
             return Err(Error::NamespaceStoreShutdown);
         }
+        Ok(())
+    }
+
+    pub async fn destroy(&self, namespace: NamespaceName, prune_all: bool) -> crate::Result<()> {
+        self.refuse_if_shut_down()?;
 
         // destroy on-disk database and backups
         let db_config = tokio::task::spawn_blocking({
@@ -396,9 +426,7 @@ impl NamespaceStore {
         namespace: NamespaceName,
         restore_option: RestoreOption,
     ) -> anyhow::Result<()> {
-        if self.inner.has_shutdown.load(Ordering::Relaxed) {
-            return Err(Error::NamespaceStoreShutdown.into());
-        }
+        self.refuse_if_shut_down()?;
 
         // The process for reseting is as follow:
         // - get a lock on the namespace entry, if the entry exists, then it's a lock on the entry,
@@ -429,6 +457,9 @@ impl NamespaceStore {
         let ns = self
             .make_namespace(&namespace, db_config, restore_option)
             .await?;
+        // `shutdown` does not wait for a reset in progress (its entry is pinned), so a namespace
+        // installed now would never be shut down.
+        self.refuse_if_shut_down()?;
 
         self.install(&namespace, &entry, &mut lock, ns).await;
 
@@ -460,9 +491,7 @@ impl NamespaceStore {
         to_config: DatabaseConfig,
         timestamp: Option<NaiveDateTime>,
     ) -> crate::Result<()> {
-        if self.inner.has_shutdown.load(Ordering::Relaxed) {
-            return Err(Error::NamespaceStoreShutdown);
-        }
+        self.refuse_if_shut_down()?;
 
         // check that the source namespace exists
         if !self.inner.metadata.exists(&from).await {
@@ -493,14 +522,8 @@ impl NamespaceStore {
         timestamp: Option<NaiveDateTime>,
     ) -> crate::Result<Namespace> {
         // FIXME: we could potentially delete the namespace while trying to fork it
-        let Some(from_config) = self.inner.metadata.existing_handle(from.clone()).await else {
-            return Err(crate::Error::NamespaceDoesntExist(from.to_string()));
-        };
-        let from_entry = self.load_namespace(from, from_config.clone()).await?;
-        let from_lock = from_entry.read().await;
-        let Some(from_ns) = &*from_lock else {
-            return Err(self.emptied_entry_error(from).await);
-        };
+        let from_ns = self.load_namespace(from).await?;
+        let from_config = from_ns.db_config_store.clone();
 
         let handle = self.inner.metadata.handle(to.clone()).await;
         // In memory only: the fork reads it; nothing is persisted until it succeeded.
@@ -508,7 +531,7 @@ impl NamespaceStore {
         let to_ns = self
             .get_configurator(&from_config.get())
             .fork(
-                from_ns,
+                &from_ns,
                 from_config,
                 to.clone(),
                 handle.clone(),
@@ -517,9 +540,7 @@ impl NamespaceStore {
             )
             .await?;
 
-        if self.inner.has_shutdown.load(Ordering::Relaxed) {
-            return Err(Error::NamespaceStoreShutdown);
-        }
+        self.refuse_if_shut_down()?;
         handle.flush().await?; // commit point
         Ok(to_ns)
     }
@@ -549,9 +570,7 @@ impl NamespaceStore {
     where
         Fun: FnOnce(&Namespace) -> R + 'static,
     {
-        if self.inner.has_shutdown.load(Ordering::Relaxed) {
-            return Err(Error::NamespaceStoreShutdown);
-        }
+        self.refuse_if_shut_down()?;
         if !auth.is_namespace_authorized(&namespace) {
             return Err(Error::NamespaceDoesntExist(namespace.to_string()));
         }
@@ -563,49 +582,14 @@ impl NamespaceStore {
     where
         Fun: FnOnce(&Namespace) -> R,
     {
-        let lazily_created =
-            namespace == NamespaceName::default() || self.inner.allow_lazy_creation;
-        for _ in 0..MAX_EMPTIED_ENTRY_ATTEMPTS {
-            if self.inner.has_shutdown.load(Ordering::Relaxed) {
-                return Err(Error::NamespaceStoreShutdown);
-            }
-            // `handle` registers the name in the metastore's in-memory map as a side effect,
-            // which is what `exists` reads: a namespace that must already exist is looked up
-            // with the side-effect-free `existing_handle`, so that a lookup racing with the end
-            // of a failed creation, or with `destroy`, cannot bring the name back to life.
-            let handle = if lazily_created {
-                self.inner.metadata.handle(namespace.clone()).await
-            } else {
-                match self.inner.metadata.existing_handle(namespace.clone()).await {
-                    Some(handle) => handle,
-                    None => return Err(Error::NamespaceDoesntExist(namespace.to_string())),
-                }
-            };
+        let ns = self.load_namespace(&namespace).await?;
+        Ok(f(&ns))
+    }
 
-            let entry = self.load_namespace(&namespace, handle).await?;
-            {
-                let lock = entry.read().await;
-                if let Some(ns) = &*lock {
-                    return Ok(f(ns));
-                }
-            }
-
-            // The namespace was taken out of the entry after we got it: by shutdown, by cache
-            // eviction, or by a concurrent destroy. That does not mean it is missing, so look it
-            // up again. Expected during a rolling restart and under cache pressure, once per
-            // waiting request: the counter is the signal, not the log.
-            NAMESPACE_EMPTIED_ENTRY.increment(1);
-            tracing::debug!(%namespace, "namespace cache entry was emptied while in use, looking it up again");
-        }
-
-        let error = self.emptied_entry_error(&namespace).await;
-        if matches!(error, Error::NamespaceUnavailable(_)) {
-            // Shutdown and a namespace that is really gone are not failures of the store, so
-            // the counter only records this outcome.
-            NAMESPACE_EMPTIED_ENTRY_GAVE_UP.increment(1);
-        }
-        tracing::warn!(%namespace, %error, "namespace cache entry kept being emptied, giving up");
-        Err(error)
+    /// Whether a lookup of `namespace` creates it when it does not exist (the default namespace
+    /// when namespaces are disabled, and every namespace on a replica).
+    fn lazily_created(&self, namespace: &NamespaceName) -> bool {
+        *namespace == NamespaceName::default() || self.inner.allow_lazy_creation
     }
 
     /// Removes `entry` from the cache if it is still the cached entry for `namespace` and still
@@ -735,12 +719,57 @@ impl NamespaceStore {
         }
     }
 
-    /// The entry of an existing namespace, loading it (`RestoreOption::Latest`) if needed.
-    async fn load_namespace(
+    /// An existing namespace, read-locked in its entry; loaded (`RestoreOption::Latest`) if it
+    /// is not in the cache.
+    ///
+    /// The entry it finds may be emptied before it gets to read it (by eviction, shutdown or a
+    /// concurrent destroy), or may have been left empty (by a reservation that was rejected or
+    /// a reset that failed). Neither means the namespace is missing, so the lookup is repeated,
+    /// up to `MAX_EMPTIED_ENTRY_ATTEMPTS` times, after dropping the empty entry from the cache
+    /// so that the next lookup loads for real. Only the metastore decides that a namespace does
+    /// not exist. Expected during a rolling restart and under cache pressure, once per waiting
+    /// request: the counter is the signal, not the log.
+    async fn load_namespace(&self, namespace: &NamespaceName) -> crate::Result<LoadedNamespace> {
+        for _ in 0..MAX_EMPTIED_ENTRY_ATTEMPTS {
+            self.refuse_if_shut_down()?;
+            // `handle` registers the name in the metastore's in-memory map as a side effect,
+            // which is what `exists` reads: a namespace that must already exist is looked up
+            // with the side-effect-free `existing_handle`, so that a lookup racing with the end
+            // of a failed creation, or with `destroy`, cannot bring the name back to life.
+            let db_config = if self.lazily_created(namespace) {
+                self.inner.metadata.handle(namespace.clone()).await
+            } else {
+                match self.inner.metadata.existing_handle(namespace.clone()).await {
+                    Some(handle) => handle,
+                    None => return Err(Error::NamespaceDoesntExist(namespace.to_string())),
+                }
+            };
+            match self.lookup(namespace, &db_config).await? {
+                Some(ns) => return Ok(ns),
+                None => {
+                    NAMESPACE_EMPTIED_ENTRY.increment(1);
+                    tracing::debug!(%namespace, "namespace cache entry was emptied, looking it up again");
+                }
+            }
+        }
+
+        let error = self.emptied_entry_error(namespace).await;
+        if matches!(error, Error::NamespaceUnavailable(_)) {
+            // Shutdown and a namespace that is really gone are not failures of the store, so
+            // the counter only records this outcome.
+            NAMESPACE_EMPTIED_ENTRY_GAVE_UP.increment(1);
+        }
+        tracing::warn!(%namespace, %error, "namespace cache entry kept being emptied, giving up");
+        Err(error)
+    }
+
+    /// One attempt of `load_namespace`. `Ok(None)` means the entry it found was empty, and has
+    /// been dropped from the cache if it was still there.
+    async fn lookup(
         &self,
         namespace: &NamespaceName,
-        db_config: MetaStoreHandle,
-    ) -> crate::Result<NamespaceEntry> {
+        db_config: &MetaStoreHandle,
+    ) -> crate::Result<Option<LoadedNamespace>> {
         // An operation in progress on this namespace (create, fork, reset) holds its entry
         // locked and pinned: wait on that entry rather than loading the directory it is working
         // on (the cache may have evicted the entry meanwhile). If the operation leaves the entry
@@ -753,75 +782,67 @@ impl NamespaceStore {
                 namespace = %namespace,
                 "waiting for an operation in progress on the namespace"
             );
-            if entry.read().await.is_some() {
-                return Ok(entry);
+            let lock = entry.read_arc().await;
+            if lock.is_some() {
+                return Ok(Some(LoadedNamespace(lock)));
             }
+            drop(lock);
             if !self.inner.metadata.exists(namespace).await {
                 return Err(Error::NamespaceDoesntExist(namespace.to_string()));
             }
         }
 
-        let lazily_created =
-            *namespace == NamespaceName::default() || self.inner.allow_lazy_creation;
-        // Two rounds at most: an entry that is empty once nobody holds it locked is a leftover
-        // (of a reservation that was rejected, a reset that failed, a checkpoint of a namespace
-        // that was not loaded) and would make the namespace unreachable until the cache evicts
-        // it; drop it and load for real.
-        for round in 0..2 {
-            let loaded = AtomicBool::new(false);
-            let init = async {
-                loaded.store(true, Ordering::Relaxed);
-                // Shutdown may have started since the caller checked. A namespace opened now
-                // would not be in the entries shutdown takes out, so nobody would ever shut it
-                // down.
-                if self.inner.has_shutdown.load(Ordering::Relaxed) {
-                    return Err(Error::NamespaceStoreShutdown);
-                }
-                // The caller checked that the namespace exists; re-check now that we are the
-                // one loading it, in case it was discarded or destroyed in between (otherwise
-                // we would bring an empty namespace into existence for a name the metastore
-                // doesn't know).
-                if !lazily_created && !self.inner.metadata.exists(namespace).await {
-                    return Err(Error::NamespaceDoesntExist(namespace.to_string()));
-                }
-                let ns = self
-                    .make_namespace(namespace, db_config.clone(), RestoreOption::Latest)
-                    .await?;
-                // A namespace opened from the metastore is complete by definition; this only
-                // removes a marker left by a crash between persisting the config and removing
-                // it.
-                if let Err(e) = ns.mark_complete().await {
-                    tracing::warn!(namespace = %namespace, "could not remove creation marker: {e}");
-                }
-                Ok(Some(ns))
-            };
-
-            let before_load = Instant::now();
-            let entry = self
-                .inner
-                .store
-                .try_get_with(
-                    namespace.clone(),
-                    init.map_ok(|ns| Arc::new(RwLock::new(ns))),
-                )
+        let loaded = AtomicBool::new(false);
+        let init = async {
+            loaded.store(true, Ordering::Relaxed);
+            // Shutdown may have started since the caller checked. A namespace opened now
+            // would not be in the entries shutdown takes out, so nobody would ever shut it
+            // down.
+            self.refuse_if_shut_down()?;
+            // The caller checked that the namespace exists; re-check now that we are the
+            // one loading it, in case it was discarded or destroyed in between (otherwise
+            // we would bring an empty namespace into existence for a name the metastore
+            // doesn't know).
+            if !self.lazily_created(namespace) && !self.inner.metadata.exists(namespace).await {
+                return Err(Error::NamespaceDoesntExist(namespace.to_string()));
+            }
+            let ns = self
+                .make_namespace(namespace, db_config.clone(), RestoreOption::Latest)
                 .await?;
-            if loaded.load(Ordering::Relaxed) {
-                NAMESPACE_LOAD_LATENCY.record(before_load.elapsed());
-                return Ok(entry);
+            // A namespace opened from the metastore is complete by definition; this only
+            // removes a marker left by a crash between persisting the config and removing
+            // it.
+            if let Err(e) = ns.mark_complete().await {
+                tracing::warn!(namespace = %namespace, "could not remove creation marker: {e}");
             }
+            Ok(Some(ns))
+        };
 
-            if round == 0 && entry.read().await.is_none() {
-                // The entry was emptied (by eviction, shutdown or destroy) while we waited on
-                // it, or something left it empty. Either way the namespace is not missing
-                // because of it: drop the entry if it is still cached, and load for real.
-                NAMESPACE_EMPTIED_ENTRY.increment(1);
-                tracing::debug!(%namespace, "namespace cache entry was emptied, looking it up again");
-                self.evict_if_still_empty(namespace, &entry).await;
-                continue;
-            }
-            return Ok(entry);
+        let before_load = Instant::now();
+        let entry = self
+            .inner
+            .store
+            .try_get_with(
+                namespace.clone(),
+                init.map_ok(|ns| Arc::new(RwLock::new(ns))),
+            )
+            .await?;
+        if loaded.load(Ordering::Relaxed) {
+            NAMESPACE_LOAD_LATENCY.record(before_load.elapsed());
         }
-        unreachable!("the second round always returns")
+
+        let lock = entry.read_arc().await;
+        if lock.is_some() {
+            return Ok(Some(LoadedNamespace(lock)));
+        }
+        drop(lock);
+        // Emptied by an eviction, the entry is already out of the cache; only an entry that
+        // was left empty is still there. `contains_key` records no access and runs no
+        // maintenance, unlike the compute call behind `evict_if_still_empty`.
+        if self.inner.store.contains_key(namespace) {
+            self.evict_if_still_empty(namespace, &entry).await;
+        }
+        Ok(None)
     }
 
     #[tracing::instrument(skip_all, fields(namespace))]
@@ -831,9 +852,7 @@ impl NamespaceStore {
         restore_option: RestoreOption,
         db_config: DatabaseConfig,
     ) -> crate::Result<()> {
-        if self.inner.has_shutdown.load(Ordering::Relaxed) {
-            return Err(Error::NamespaceStoreShutdown);
-        }
+        self.refuse_if_shut_down()?;
 
         if let Some(shared_schema_name) = &db_config.shared_schema_name {
             // we hold a lock for the duration of the namespace creation
@@ -858,7 +877,7 @@ impl NamespaceStore {
             tracing::trace!("auto-creating the namespace");
             let handle = self.inner.metadata.handle(namespace.clone()).await;
             handle.store(Arc::new(db_config)).await?;
-            self.load_namespace(&namespace, handle).await?;
+            self.load_namespace(&namespace).await?;
             return Ok(());
         }
 
@@ -908,9 +927,7 @@ impl NamespaceStore {
         let ns = self
             .make_namespace(namespace, handle.clone(), restore_option)
             .await?;
-        if self.inner.has_shutdown.load(Ordering::Relaxed) {
-            return Err(Error::NamespaceStoreShutdown);
-        }
+        self.refuse_if_shut_down()?;
         tracing::debug!("storing db config");
         handle.flush().await?; // commit point
         Ok(ns)
@@ -1526,7 +1543,11 @@ pub(crate) mod test {
         store.inner.has_shutdown.store(true, Ordering::Relaxed);
 
         let handle = store.inner.metadata.handle(namespace.clone()).await;
-        let error = store.load_namespace(&namespace, handle).await.unwrap_err();
+        // `lookup` rather than `load_namespace`: this targets the check inside the load itself,
+        // which `load_namespace`'s own check before each attempt would mask.
+        let Err(error) = store.lookup(&namespace, &handle).await else {
+            panic!("the load was not refused");
+        };
 
         assert!(
             matches!(error.as_ref(), Error::NamespaceStoreShutdown),
@@ -1835,6 +1856,90 @@ pub(crate) mod test {
             .await
             .unwrap();
         assert_eq!(count_test_rows(&store, "foo").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn reset_interrupted_by_shutdown_installs_nothing() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = create(&store, "foo").await;
+
+        let (tx, dump) = slow_dump();
+        let reset = tokio::spawn({
+            let (store, foo) = (store.clone(), foo.clone());
+            async move { store.reset(foo, RestoreOption::Dump(dump)).await }
+        });
+        tx.send(Ok(Bytes::from_static(
+            b"BEGIN TRANSACTION; CREATE TABLE test (x); INSERT INTO test VALUES (1);",
+        )))
+        .await
+        .unwrap();
+        wait_until_in_flight(&store, &foo).await;
+        // Shutdown does not wait for the reset in progress; it must not install its result.
+        store.inner.has_shutdown.store(true, Ordering::Relaxed);
+        tx.send(Ok(Bytes::from_static(b"COMMIT;"))).await.unwrap();
+        drop(tx);
+
+        let error = reset.await.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<Error>(),
+                Some(Error::NamespaceStoreShutdown)
+            ),
+            "{error:?}"
+        );
+        let entry = store
+            .inner
+            .store
+            .get(&foo)
+            .await
+            .expect("the entry stays cached");
+        assert!(entry.read().await.is_none(), "a namespace was installed");
+        assert!(store.inner.in_flight.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_creation_in_progress() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = NamespaceName::from_string("foo".into()).unwrap();
+        let bar = create(&store, "bar").await;
+
+        let (tx, dump) = slow_dump();
+        let create = tokio::spawn({
+            let (store, foo) = (store.clone(), foo.clone());
+            async move {
+                store
+                    .create(foo, RestoreOption::Dump(dump), Default::default())
+                    .await
+            }
+        });
+        tx.send(Ok(Bytes::from_static(
+            b"BEGIN TRANSACTION; CREATE TABLE test (x); INSERT INTO test VALUES (1);",
+        )))
+        .await
+        .unwrap();
+        wait_until_in_flight(&store, &foo).await;
+
+        // The creation is blocked on its dump and holds its entry locked. Shutdown must finish
+        // without it, and still shut the other namespaces down.
+        tokio::time::timeout(Duration::from_secs(5), store.clone().shutdown())
+            .await
+            .expect("shutdown waited for the creation in progress")
+            .unwrap();
+        assert!(
+            store.inner.store.get(&bar).await.is_none(),
+            "the other namespace was not shut down"
+        );
+
+        tx.send(Ok(Bytes::from_static(b"COMMIT;"))).await.unwrap();
+        drop(tx);
+        let error = create.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error.as_ref(), Error::NamespaceStoreShutdown),
+            "{error:?}"
+        );
+        assert!(!store.exists(&foo).await);
     }
 
     #[tokio::test]
