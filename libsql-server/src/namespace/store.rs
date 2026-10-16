@@ -1043,6 +1043,16 @@ pub(crate) mod test {
     use super::*;
 
     pub(crate) async fn make_store(path: &Path) -> NamespaceStore {
+        make_store_with(path, false, 10).await
+    }
+
+    /// `allow_lazy_creation` is what a replica runs with: a lookup of an unknown namespace
+    /// creates it. `max_active_namespaces` is the cache's capacity.
+    async fn make_store_with(
+        path: &Path,
+        allow_lazy_creation: bool,
+        max_active_namespaces: usize,
+    ) -> NamespaceStore {
         let (maker, manager) = metastore_connection_maker(None, path).await.unwrap();
         let meta_store = MetaStore::new(
             Default::default(),
@@ -1080,9 +1090,9 @@ pub(crate) mod test {
             Arc::new(libsql_sys::wal::Sqlite3WalManager::default),
         ));
         NamespaceStore::new(
+            allow_lazy_creation,
             false,
-            false,
-            10,
+            max_active_namespaces,
             meta_store,
             configurators,
             DatabaseKind::Primary,
@@ -1944,6 +1954,350 @@ pub(crate) mod test {
             "{error:?}"
         );
         assert!(!store.exists(&foo).await);
+    }
+
+    /// Lookups racing a destroy must not bring the namespace back: no record, no directory,
+    /// no filled cache entry once both are done. The window is between a lookup's metastore
+    /// check and its load; it cannot be hit deterministically, so this hammers it.
+    #[tokio::test]
+    async fn lookups_racing_a_destroy_do_not_resurrect_the_namespace() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = NamespaceName::from_string("foo".into()).unwrap();
+
+        for _ in 0..20 {
+            create(&store, "foo").await;
+            let destroyed = Arc::new(AtomicBool::new(false));
+            let lookups: Vec<_> = (0..8)
+                .map(|_| {
+                    tokio::spawn({
+                        let (store, foo, destroyed) =
+                            (store.clone(), foo.clone(), destroyed.clone());
+                        async move {
+                            let mut after_destroy_ok = 0;
+                            while !destroyed.load(Ordering::Relaxed) {
+                                let was_destroyed = destroyed.load(Ordering::Relaxed);
+                                let result = store.with(foo.clone(), |_| ()).await;
+                                match result {
+                                    Ok(()) if was_destroyed => after_destroy_ok += 1,
+                                    Ok(()) => {}
+                                    Err(e) => assert!(
+                                        matches!(e.as_ref(), Error::NamespaceDoesntExist(_)),
+                                        "{e:?}"
+                                    ),
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                            after_destroy_ok
+                        }
+                    })
+                })
+                .collect();
+            tokio::task::yield_now().await;
+            store.destroy(foo.clone(), true).await.unwrap();
+            destroyed.store(true, Ordering::Relaxed);
+            for lookup in lookups {
+                assert_eq!(lookup.await.unwrap(), 0, "a lookup served after destroy");
+            }
+
+            assert!(!store.exists(&foo).await);
+            assert!(!tmp.path().join("dbs").join("foo").exists());
+            if let Some(entry) = store.inner.store.get(&foo).await {
+                assert!(entry.read().await.is_none(), "a namespace was resurrected");
+            }
+            store.inner.store.invalidate(&foo).await;
+            assert!(store.inner.in_flight.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_of_a_namespace_whose_entry_was_left_empty() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = create(&store, "foo").await;
+        let entry = store.inner.store.get(&foo).await.unwrap();
+        entry
+            .write()
+            .await
+            .take()
+            .unwrap()
+            .shutdown(false)
+            .await
+            .unwrap();
+
+        store
+            .reset(foo.clone(), RestoreOption::Latest)
+            .await
+            .unwrap();
+
+        let cached = store.inner.store.get(&foo).await.unwrap();
+        assert!(cached.read().await.is_some(), "reset installed nothing");
+        assert!(store.inner.in_flight.lock().is_empty());
+        store.with(foo, |_| ()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_and_fork_racing_for_one_destination() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let src = create(&store, "src").await;
+        let dst = NamespaceName::from_string("dst".into()).unwrap();
+
+        let (tx, dump) = slow_dump();
+        let create = tokio::spawn({
+            let (store, dst) = (store.clone(), dst.clone());
+            async move {
+                store
+                    .create(dst, RestoreOption::Dump(dump), Default::default())
+                    .await
+            }
+        });
+        tx.send(Ok(Bytes::from_static(
+            b"BEGIN TRANSACTION; CREATE TABLE test (x); INSERT INTO test VALUES (1);",
+        )))
+        .await
+        .unwrap();
+        wait_until_in_flight(&store, &dst).await;
+        let fork = tokio::spawn({
+            let (store, src, dst) = (store.clone(), src.clone(), dst.clone());
+            async move { store.fork(src, dst, Default::default(), None).await }
+        });
+        // The fork waits for the reservation the create holds.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!fork.is_finished());
+        tx.send(Ok(Bytes::from_static(b"COMMIT;"))).await.unwrap();
+        drop(tx);
+
+        create.await.unwrap().unwrap();
+        let error = fork.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error.as_ref(), Error::NamespaceAlreadyExist(_)),
+            "{error:?}"
+        );
+        // The create's result is what is served, and the rejected fork left nothing behind.
+        assert_eq!(count_test_rows(&store, "dst").await.unwrap(), 1);
+        assert!(store.inner.in_flight.lock().is_empty());
+        assert!(!tmp
+            .path()
+            .join("dbs")
+            .join("dst")
+            .join(".incomplete")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn destroy_of_a_namespace_whose_entry_was_left_empty() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = create(&store, "foo").await;
+        let entry = store.inner.store.get(&foo).await.unwrap();
+        entry
+            .write()
+            .await
+            .take()
+            .unwrap()
+            .shutdown(false)
+            .await
+            .unwrap();
+
+        store.destroy(foo.clone(), true).await.unwrap();
+
+        assert!(!store.exists(&foo).await);
+        assert!(!tmp.path().join("dbs").join("foo").exists());
+        assert!(store.inner.store.get(&foo).await.is_none());
+        let error = store.with(foo, |_| ()).await.unwrap_err();
+        assert!(
+            matches!(error.as_ref(), Error::NamespaceDoesntExist(_)),
+            "{error:?}"
+        );
+    }
+
+    /// On a replica every lookup may create the namespace, so no lookup ever answers "doesn't
+    /// exist", and an entry emptied while a request waits is reloaded like on a primary.
+    #[tokio::test]
+    async fn lazy_creation_reloads_an_evicted_namespace_and_never_reports_it_missing() {
+        let tmp = tempdir().unwrap();
+        let store = make_store_with(tmp.path(), true, 10).await;
+        let namespace = NamespaceName::from_string("ns".into()).unwrap();
+        // Created by the lookup itself.
+        store.with(namespace.clone(), |_| ()).await.unwrap();
+        assert!(store.exists(&namespace).await);
+
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        let mut lock = entry.write().await;
+        let request = start_waiting_request(&store, &namespace, &entry).await;
+        let eviction = tokio::spawn({
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move { store.inner.store.invalidate(&namespace).await }
+        });
+        wait_until("the entry is evicted", || {
+            !store.inner.store.contains_key(&namespace)
+        })
+        .await;
+        lock.take().unwrap().shutdown(false).await.unwrap();
+        drop(lock);
+
+        assert_eq!(request.await.unwrap().unwrap(), namespace);
+        eviction.await.unwrap();
+        assert!(store
+            .inner
+            .store
+            .get(&namespace)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .is_some());
+
+        // With the entry left empty for good, giving up is "unavailable", not "missing".
+        let entry = store.inner.store.get(&namespace).await.unwrap();
+        entry
+            .write()
+            .await
+            .take()
+            .unwrap()
+            .shutdown(false)
+            .await
+            .unwrap();
+        let error = store.emptied_entry_error(&namespace).await;
+        assert!(matches!(error, Error::NamespaceUnavailable(_)), "{error:?}");
+    }
+
+    /// Random `with`, `create`, `fork`, `checkpoint` and eviction for a while, on up to 60
+    /// namespaces, with one operation in fifty evicting an entry, so that entries are emptied
+    /// while in use all the time. Nothing is destroyed, so every "doesn't exist" is a false one.
+    ///
+    /// Checked throughout: a lookup of a created namespace never fails, and a create or fork is
+    /// either accepted or rejected with "already exists". Checked at the end: every created
+    /// namespace is servable, no unlocked empty entry is left, nothing is pinned, and no
+    /// `.incomplete` marker remains.
+    ///
+    /// `destroy` is left out on purpose: a lookup whose entry was evicted may be loading
+    /// (creating files) while `destroy` removes the directory, which fails the destroy with
+    /// `Directory not empty` and can leave a loaded namespace cached for a name the metastore
+    /// no longer knows. That predates this change and is not fixed by it.
+    ///
+    /// The cache is larger than the number of namespaces, and evictions are rare, on purpose.
+    /// A lookup gives up with `NamespaceUnavailable` when its entry is emptied again after each
+    /// of `MAX_EMPTIED_ENTRY_ATTEMPTS` loads. A full cache does that (moka's admission policy
+    /// can evict a freshly loaded entry at once), and so does evicting one name from twelve
+    /// tasks faster than a load takes. Both are the designed outcome of eviction outrunning
+    /// loads (the base answered "doesn't exist" after the first load), not what this test is
+    /// about.
+    ///
+    /// Slow, so not part of the default run:
+    /// `cargo nextest run -p libsql-server --run-ignored only -E 'test(random_operations)'`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn random_operations_keep_the_store_consistent() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = tempdir().unwrap();
+        const NAMES: usize = 60;
+        let store = make_store_with(tmp.path(), false, 1000).await;
+        let names: Vec<NamespaceName> = (0..NAMES)
+            .map(|i| NamespaceName::from_string(format!("ns{i}")).unwrap())
+            .collect();
+        // Number of namespaces known to exist; `names[..created]` are safe to look up.
+        for name in &names[..10] {
+            create(&store, name.as_str()).await;
+        }
+        let created = Arc::new(AtomicUsize::new(10));
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        let workers: Vec<_> = (0..12)
+            .map(|worker| {
+                tokio::spawn({
+                    let (store, names, created) = (store.clone(), names.clone(), created.clone());
+                    async move {
+                        let mut seed = 0x9E3779B97F4A7C15u64 ^ (worker as u64 + 1);
+                        let mut next = || {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            seed
+                        };
+                        let mut ops = 0u64;
+                        while Instant::now() < deadline {
+                            let known = created.load(Ordering::SeqCst);
+                            let pick = |next: &mut dyn FnMut() -> u64| {
+                                names[(next() % known.max(1) as u64) as usize].clone()
+                            };
+                            match next() % 50 {
+                                0..=9 if known < NAMES => {
+                                    // Create or fork the next name; whoever is second gets
+                                    // "already exists". Only a success makes it known.
+                                    let name = names[known].clone();
+                                    let r = if known > 0 && next() % 2 == 0 {
+                                        store
+                                            .fork(pick(&mut next), name, Default::default(), None)
+                                            .await
+                                    } else {
+                                        store
+                                            .create(name, RestoreOption::Latest, Default::default())
+                                            .await
+                                    };
+                                    match r {
+                                        Ok(()) => {
+                                            created.store(known + 1, Ordering::SeqCst);
+                                        }
+                                        Err(e) => assert!(
+                                            matches!(e.as_ref(), Error::NamespaceAlreadyExist(_)),
+                                            "create/fork: {e:?}"
+                                        ),
+                                    }
+                                }
+                                10 if known > 0 => {
+                                    store.inner.store.invalidate(&pick(&mut next)).await
+                                }
+                                11..=15 if known > 0 => {
+                                    // May fail with SQLITE_BUSY under concurrent writes.
+                                    let _ = store.checkpoint(pick(&mut next)).await;
+                                }
+                                _ if known > 0 => {
+                                    let name = pick(&mut next);
+                                    if let Err(e) = store.with(name.clone(), |_| ()).await {
+                                        panic!("lookup of {name}: {e:?}");
+                                    }
+                                }
+                                _ => tokio::task::yield_now().await,
+                            }
+                            ops += 1;
+                        }
+                        ops
+                    }
+                })
+            })
+            .collect();
+        let mut ops = 0;
+        for worker in workers {
+            ops += worker.await.unwrap();
+        }
+        let known = created.load(Ordering::SeqCst);
+        eprintln!("{ops} operations on {known} namespaces");
+        assert!(
+            ops > 1000 && known > 10,
+            "only {ops} operations, {known} namespaces"
+        );
+
+        store.inner.store.run_pending_tasks().await;
+        assert!(store.inner.in_flight.lock().is_empty());
+        for name in &names[..known] {
+            store.with(name.clone(), |_| ()).await.unwrap();
+            assert!(!tmp
+                .path()
+                .join("dbs")
+                .join(name.as_str())
+                .join(".incomplete")
+                .exists());
+        }
+        for (name, entry) in store.inner.store.iter() {
+            let lock = entry
+                .try_read()
+                .expect("nothing holds an entry locked any more");
+            assert!(lock.is_some(), "{name}: an unlocked empty entry was left");
+        }
     }
 
     #[tokio::test]
