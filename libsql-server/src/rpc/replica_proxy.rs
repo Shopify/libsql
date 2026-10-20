@@ -47,13 +47,22 @@ impl ReplicaProxyService {
 
         let auth = match namespace_jwt_keys {
             Ok(Some(key)) => Ok(Auth::new(Jwt::new(key))),
-            Ok(None) | Err(crate::error::Error::NamespaceDoesntExist(_)) => {
-                Ok(self.user_auth_strategy.clone())
+            Ok(None) => Ok(self.user_auth_strategy.clone()),
+            Err(e) => {
+                // `namespace_error_status` classifies the store's errors:
+                // `FAILED_PRECONDITION` is a missing namespace, `UNAVAILABLE`
+                // one that exists but cannot be served right now. Only a
+                // missing namespace falls back to the user strategy.
+                let status = super::namespace_error_status(&e);
+                match status.code() {
+                    tonic::Code::FailedPrecondition => Ok(self.user_auth_strategy.clone()),
+                    tonic::Code::Unavailable => Err(status),
+                    _ => Err(Status::internal(format!(
+                        "Can't fetch jwt key for a namespace: {}",
+                        e
+                    ))),
+                }
             }
-            Err(e) => Err(Status::internal(format!(
-                "Can't fetch jwt key for a namespace: {}",
-                e
-            ))),
         }?;
 
         let auth_context =
@@ -125,5 +134,41 @@ impl Proxy for ReplicaProxyService {
 
         let mut client = self.client.clone();
         client.describe(req).await
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::auth::Disabled;
+    use crate::connection::config::DatabaseConfig;
+    use crate::namespace::{make_test_store, NamespaceName, RestoreOption};
+
+    #[tokio::test]
+    async fn auth_while_the_store_is_shut_down_is_unavailable() {
+        let tmp = tempdir().unwrap();
+        let store = make_test_store(tmp.path()).await;
+        store
+            .create(
+                NamespaceName::default(),
+                RestoreOption::Latest,
+                DatabaseConfig::default(),
+            )
+            .await
+            .unwrap();
+        store.clone().shutdown().await.unwrap();
+        let service = ReplicaProxyService::new(
+            Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            Uri::from_static("http://127.0.0.1:1"),
+            store,
+            Auth::new(Disabled::new()),
+            true,
+        );
+
+        let status = service.do_auth(&mut Request::new(())).await.unwrap_err();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     }
 }
