@@ -16,6 +16,8 @@ use crate::stats::Stats;
 
 use self::meta_store::MetaStoreHandle;
 pub use self::name::NamespaceName;
+#[cfg(test)]
+pub(crate) use self::store::test::make_store as make_test_store;
 pub use self::store::NamespaceStore;
 
 pub mod broadcasters;
