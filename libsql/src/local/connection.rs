@@ -822,6 +822,24 @@ mod tests {
         OpenFlags,
     };
 
+    /// `LibsqlConnection::drop` calls `disconnect()`, then the inner
+    /// `Connection::drop` calls it again. The second call must not reach
+    /// `sqlite3_close_v2` with a handle that the first call already freed.
+    #[test]
+    fn disconnect_is_idempotent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("local.db");
+        let db = Database::new(path.to_str().unwrap().to_string(), OpenFlags::default());
+        let mut conn = Connection::connect(&db).unwrap();
+        assert!(!conn.raw.is_null());
+
+        conn.disconnect();
+        assert!(conn.raw.is_null());
+
+        conn.disconnect();
+        assert!(conn.raw.is_null());
+    }
+
     #[tokio::test]
     pub async fn test_kek() {
         let temp_dir = tempfile::tempdir().unwrap();
