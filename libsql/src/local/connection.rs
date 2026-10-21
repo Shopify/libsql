@@ -108,7 +108,10 @@ impl Connection {
     /// Disconnect from the database.
     pub fn disconnect(&mut self) {
         if Arc::get_mut(&mut self.drop_ref).is_some() {
-            unsafe { libsql_sys::ffi::sqlite3_close_v2(self.raw) };
+            unsafe {
+                libsql_sys::ffi::sqlite3_close_v2(self.raw);
+                self.raw = std::ptr::null_mut();
+            };
         }
     }
 
@@ -818,6 +821,45 @@ mod tests {
         params::Params,
         OpenFlags,
     };
+
+    /// `LibsqlConnection::drop` calls `disconnect()`, then the inner
+    /// `Connection::drop` calls it again. The second call must not reach
+    /// `sqlite3_close_v2` with a handle that the first call already freed.
+    #[test]
+    fn disconnect_is_idempotent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("local.db");
+        let db = Database::new(path.to_str().unwrap().to_string(), OpenFlags::default());
+        let mut conn = Connection::connect(&db).unwrap();
+        assert!(!conn.raw.is_null());
+
+        conn.disconnect();
+        assert!(conn.raw.is_null());
+
+        conn.disconnect();
+        assert!(conn.raw.is_null());
+    }
+
+    /// Drops a connection through the public API so both `Drop` impls run.
+    /// Passes on any allocator; under Guard Malloc or valgrind it faults in
+    /// `sqlite3SafetyCheckSickOrOk` if `disconnect()` closes the handle twice.
+    #[tokio::test]
+    async fn dropping_public_connection_closes_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("local.db");
+        for _ in 0..20 {
+            let db = crate::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE IF NOT EXISTS t(x INTEGER)", ())
+                .await
+                .unwrap();
+            drop(conn);
+            drop(db);
+        }
+    }
 
     #[tokio::test]
     pub async fn test_kek() {
