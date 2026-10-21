@@ -840,6 +840,27 @@ mod tests {
         assert!(conn.raw.is_null());
     }
 
+    /// Drops a connection through the public API so both `Drop` impls run.
+    /// Passes on any allocator; under Guard Malloc or valgrind it faults in
+    /// `sqlite3SafetyCheckSickOrOk` if `disconnect()` closes the handle twice.
+    #[tokio::test]
+    async fn dropping_public_connection_closes_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("local.db");
+        for _ in 0..20 {
+            let db = crate::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE IF NOT EXISTS t(x INTEGER)", ())
+                .await
+                .unwrap();
+            drop(conn);
+            drop(db);
+        }
+    }
+
     #[tokio::test]
     pub async fn test_kek() {
         let temp_dir = tempfile::tempdir().unwrap();
