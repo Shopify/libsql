@@ -637,6 +637,13 @@ where
         )
         .await?;
 
+        // Namespace creations the previous process died in the middle of leave marked
+        // directories (and tombstones of discarded ones) behind; clean them up before serving.
+        if let Err(e) = namespace::incomplete::sweep(&self.path, namespace_store.meta_store()).await
+        {
+            tracing::error!("failed to sweep unfinished namespace directories: {e}");
+        }
+
         self.spawn_monitoring_tasks(&mut task_manager, stats_receiver)?;
 
         // if namespaces are enabled, then bottomless must have set DB ID
