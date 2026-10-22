@@ -110,47 +110,46 @@ impl Reservation {
         name: NamespaceName,
         config: Arc<DatabaseConfig>,
     ) -> crate::Result<Self> {
-        // Wait on the entry an operation in progress holds, if any, rather than on the cache's
-        // (which may be a fresh one if that entry was evicted).
-        let pinned = store.inner.in_flight.lock().get(&name).cloned();
-        let entry = match pinned {
-            Some(entry) => entry,
-            None => {
-                store
-                    .inner
-                    .store
-                    .get_with(name.clone(), async { Default::default() })
-                    .await
+        loop {
+            // A name the metastore knows is rejected before its entry is touched: write-locking
+            // the entry of a loaded namespace would hold up its readers (the lock prefers
+            // writers) for an error. Only when no operation holds the name: an operation in
+            // progress has registered the name (`handle`) and its outcome is what decides.
+            if store.inner.in_flight.lock().get(&name).is_none()
+                && store.inner.metadata.exists(&name).await
+            {
+                return Err(Error::NamespaceAlreadyExist(name.to_string()));
             }
-        };
-        if entry.try_write().is_none() {
-            tracing::debug!(namespace = %name, "waiting for an operation in progress on the namespace");
-        }
-        let guard = entry.write_arc().await;
-        if guard.is_some() || store.inner.metadata.exists(&name).await {
-            if guard.is_none() {
-                // The namespace exists but is not loaded, and `get_with` just gave it an empty
-                // entry. Left there, lookups would find the empty entry before loading the
-                // namespace (see `load_namespace`); remove it again, but only if it is still
-                // that empty entry: a lookup may have loaded the namespace into a fresh one
-                // since the lock was released.
-                drop(guard);
-                store.evict_if_still_empty(&name, &entry).await;
+            let (entry, claim) = match store.claim(&name).await {
+                Some(claimed) => claimed,
+                // An operation held the name and has finished; start over from the metastore.
+                None => continue,
+            };
+            let guard = entry.write_arc().await;
+            if guard.is_some() || store.inner.metadata.exists(&name).await {
+                // Unpin before unlocking, like `publish`.
+                drop(claim);
+                if guard.is_none() {
+                    // The namespace exists but is not loaded, and `get_with` just gave it an
+                    // empty entry. Left there, lookups would find the empty entry before
+                    // loading the namespace (see `load_namespace`); remove it again, but only
+                    // if it is still that empty entry: a lookup may have loaded the namespace
+                    // into a fresh one since the lock was released.
+                    drop(guard);
+                    store.evict_if_still_empty(&name, &entry).await;
+                }
+                return Err(Error::NamespaceAlreadyExist(name.to_string()));
             }
-            return Err(Error::NamespaceAlreadyExist(name.to_string()));
+            // From here on the reservation unpins, in `publish` or in its cleanup.
+            claim.disarm();
+            return Ok(Self {
+                guard: Some(guard),
+                entry,
+                store: store.clone(),
+                name,
+                config,
+            });
         }
-        store
-            .inner
-            .in_flight
-            .lock()
-            .insert(name.clone(), entry.clone());
-        Ok(Self {
-            guard: Some(guard),
-            entry,
-            store: store.clone(),
-            name,
-            config,
-        })
     }
 
     /// Install the finished namespace and release the lock.
@@ -232,33 +231,29 @@ impl Drop for Reservation {
     }
 }
 
-/// Keeps a namespace entry pinned in [`InFlight`] while `reset` holds it locked (see
-/// [`Reservation`] for why). Must be created after the lock is taken and dropped before it is
-/// released.
-struct Pinned {
+/// A name pinned in [`InFlight`] for an operation about to lock its entry (see
+/// [`Reservation`] for why names are pinned). Dropping it unpins, so a pin claimed by a future
+/// that is dropped before it locked the entry is released again; an operation that got its
+/// lock takes the pin over with [`disarm`](Self::disarm) and unpins itself, after its cleanup
+/// and before it unlocks.
+struct PinClaim {
     in_flight: InFlight,
     name: NamespaceName,
     entry: NamespaceEntry,
+    armed: bool,
 }
 
-impl Pinned {
-    fn new(store: &NamespaceStore, name: NamespaceName, entry: NamespaceEntry) -> Self {
-        store
-            .inner
-            .in_flight
-            .lock()
-            .insert(name.clone(), entry.clone());
-        Self {
-            in_flight: store.inner.in_flight.clone(),
-            name,
-            entry,
-        }
+impl PinClaim {
+    fn disarm(mut self) {
+        self.armed = false;
     }
 }
 
-impl Drop for Pinned {
+impl Drop for PinClaim {
     fn drop(&mut self) {
-        unpin(&self.in_flight, &self.name, &self.entry);
+        if self.armed {
+            unpin(&self.in_flight, &self.name, &self.entry);
+        }
     }
 }
 
@@ -368,6 +363,43 @@ impl NamespaceStore {
         Ok(())
     }
 
+    /// Pin `name` for an operation that is about to write-lock its cache entry, and return the
+    /// entry to lock. The pin is claimed before the lock is taken, so the name is pinned at
+    /// every moment its entry is locked: the eviction listener then never waits on that lock
+    /// inline (which would hold moka's key lock against the operation's own `install`), and no
+    /// second operation can take a reservation on another entry for the same name.
+    ///
+    /// `None` when another operation held the name: this waited for it to finish (it unpins
+    /// before it unlocks), and the caller decides afresh what to do.
+    async fn claim(&self, name: &NamespaceName) -> Option<(NamespaceEntry, PinClaim)> {
+        let held = self.inner.in_flight.lock().get(name).cloned();
+        if let Some(entry) = held {
+            tracing::debug!(namespace = %name, "waiting for an operation in progress on the namespace");
+            drop(entry.read_arc().await);
+            return None;
+        }
+        let cached = self
+            .inner
+            .store
+            .get_with(name.clone(), async { Default::default() })
+            .await;
+        let mut in_flight = self.inner.in_flight.lock();
+        if in_flight.contains_key(name) {
+            // Claimed by someone else while the cache call ran; their entry is the one to
+            // wait on, and `cached` is left alone (it was theirs or is empty and unlocked).
+            return None;
+        }
+        in_flight.insert(name.clone(), cached.clone());
+        drop(in_flight);
+        let claim = PinClaim {
+            in_flight: self.inner.in_flight.clone(),
+            name: name.clone(),
+            entry: cached.clone(),
+            armed: true,
+        };
+        Some((cached, claim))
+    }
+
     pub async fn destroy(&self, namespace: NamespaceName, prune_all: bool) -> crate::Result<()> {
         self.refuse_if_shut_down()?;
 
@@ -387,12 +419,14 @@ impl NamespaceStore {
         let mut bottomless_db_id_init = NamespaceBottomlessDbIdInit::FetchFromConfig;
         // An operation in progress holds the namespace in its pinned entry (the cache's may be
         // a fresh, empty one if that entry was evicted): wait on that one, so that we destroy
-        // what the operation produces rather than racing it.
+        // what the operation produces rather than racing it. The cache's entry is taken too:
+        // the operation may just have installed its namespace into a fresh entry there.
         let pinned = self.inner.in_flight.lock().get(&namespace).cloned();
         let cached = self.inner.store.remove(&namespace).await;
-        if let Some(ns) = pinned.or(cached) {
+        let cached = cached.filter(|c| !pinned.as_ref().is_some_and(|p| Arc::ptr_eq(p, c)));
+        for entry in pinned.into_iter().chain(cached) {
             // deallocate in-memory resources
-            if let Some(ns) = ns.write().await.take() {
+            if let Some(ns) = entry.write().await.take() {
                 bottomless_db_id_init = NamespaceBottomlessDbIdInit::Provided(
                     NamespaceBottomlessDbId::from_config(&ns.db_config_store.get()),
                 );
@@ -433,14 +467,12 @@ impl NamespaceStore {
         // if it doesn't exist, insert an empty entry and take a lock on it
         // - destroy the old namespace
         // - create a new namespace and insert it in the held lock
-        let entry = self
-            .inner
-            .store
-            .get_with(namespace.clone(), async { Default::default() })
-            .await;
+        let (entry, pinned) = loop {
+            if let Some(claimed) = self.claim(&namespace).await {
+                break claimed;
+            }
+        };
         let mut lock = entry.write().await;
-        // Declared after the lock so that it is unpinned before the lock is released.
-        let _pinned = Pinned::new(self, namespace.clone(), entry.clone());
         if let Some(ns) = lock.take() {
             ns.destroy().await?;
         }
@@ -462,6 +494,10 @@ impl NamespaceStore {
         self.refuse_if_shut_down()?;
 
         self.install(&namespace, &entry, &mut lock, ns).await;
+        // Unpin before unlocking (see `Reservation::publish`).
+        drop(pinned);
+        drop(lock);
+        self.shut_down_if_stopped(&namespace).await;
 
         Ok(())
     }
@@ -501,10 +537,7 @@ impl NamespaceStore {
         let to_config = Arc::new(to_config);
         let reservation = Reservation::acquire(self, to.clone(), to_config.clone()).await?;
         match self.fork_reserved(&from, &to, to_config, timestamp).await {
-            Ok(to_ns) => {
-                self.publish(reservation, to_ns).await;
-                Ok(())
-            }
+            Ok(to_ns) => self.publish(reservation, to_ns).await,
             Err(e) => {
                 tracing::warn!(from = %from, to = %to, error = %e, "fork failed");
                 reservation.abort().await;
@@ -550,14 +583,48 @@ impl NamespaceStore {
     /// Visible first, then unmarked: a marker that outlives the namespace's publication is
     /// harmless (removed when the namespace is next loaded), a complete directory without one
     /// is not (it could not be told from a namespace that was never ours to discard).
-    async fn publish(&self, reservation: Reservation, ns: Namespace) {
-        let name = reservation.name.clone();
-        let marker_dir = ns.path.clone();
-        reservation.publish(ns).await;
-        if let Err(e) = super::remove_incomplete_marker(&marker_dir).await {
-            // The namespace is published and serves; the marker is removed at its next load. It
-            // matters only if the metastore is lost and rebuilt from the filesystem meanwhile.
-            tracing::error!(namespace = %name, "could not remove creation marker: {e}");
+    ///
+    /// Past the commit point the creation completes even if the request that started it is
+    /// dropped, so this runs in its own task. Dropped half-way, `install` could have put the
+    /// namespace in the cache already while the reservation's cleanup discards its row and
+    /// directory: the name would then answer "already exists" to `create` and "doesn't exist"
+    /// to everything else until the entry is evicted.
+    async fn publish(&self, reservation: Reservation, ns: Namespace) -> crate::Result<()> {
+        let store = self.clone();
+        let published = tokio::spawn(async move {
+            let name = reservation.name.clone();
+            let marker_dir = ns.path.clone();
+            reservation.publish(ns).await;
+            if let Err(e) = super::remove_incomplete_marker(&marker_dir).await {
+                // The namespace is published and serves; the marker is removed at its next
+                // load. It matters only if the metastore is lost and rebuilt from the
+                // filesystem meanwhile.
+                tracing::error!(namespace = %name, "could not remove creation marker: {e}");
+            }
+            store.shut_down_if_stopped(&name).await;
+        });
+        // Only a panic in the task gets here. The reservation's `Drop` ran there and undid
+        // the creation, so the caller must not report success.
+        published
+            .await
+            .map_err(|e| Error::Internal(format!("publishing the namespace failed: {e}")))
+    }
+
+    /// `shutdown` skips pinned entries and may have finished while an operation was between
+    /// its last shutdown check and its `install`; a namespace installed after it would never
+    /// be shut down. Called once the operation has unpinned: either `shutdown` collected the
+    /// entry, or this sees the flag.
+    async fn shut_down_if_stopped(&self, name: &NamespaceName) {
+        if !self.inner.has_shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(entry) = self.inner.store.get(name).await {
+            if let Some(ns) = entry.write().await.take() {
+                tracing::warn!(namespace = %name, "namespace was installed during shutdown; shutting it down");
+                if let Err(e) = ns.shutdown(self.inner.snapshot_at_shutdown).await {
+                    tracing::error!(namespace = %name, "error shutting down namespace: {e}");
+                }
+            }
         }
     }
 
@@ -715,6 +782,17 @@ impl NamespaceStore {
                     .store
                     .insert(name.clone(), Arc::new(RwLock::new(Some(ns))))
                     .await;
+                // A `destroy` that ran between the check above and the insert found neither
+                // entry filled and has cleaned up; the fresh entry must not outlive it. The
+                // eviction listener shuts the namespace down (the operation is still pinned,
+                // so off the maintenance path).
+                if !self.inner.metadata.exists(name).await {
+                    tracing::info!(
+                        namespace = %name,
+                        "namespace was destroyed while being re-inserted; dropping it"
+                    );
+                    self.inner.store.invalidate(name).await;
+                }
             }
         }
     }
@@ -893,7 +971,7 @@ impl NamespaceStore {
             .await
         {
             Ok(ns) => {
-                self.publish(reservation, ns).await;
+                self.publish(reservation, ns).await?;
                 tracing::info!(
                     namespace = %namespace,
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2294,6 +2372,109 @@ pub(crate) mod test {
                 .expect("nothing holds an entry locked any more");
             assert!(lock.is_some(), "{name}: an unlocked empty entry was left");
         }
+    }
+
+    /// `create` of a name the metastore knows is rejected without touching the entry: the lock
+    /// prefers writers, so a `write_arc` queued behind the namespace's readers would hold up
+    /// every new reader until it is granted, for an error.
+    #[tokio::test]
+    async fn create_of_a_loaded_namespace_does_not_wait_for_its_readers() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = create(&store, "foo").await;
+        let entry = store.inner.store.get(&foo).await.unwrap();
+        // A request in flight on the namespace.
+        let _reader = entry.read().await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.create(foo.clone(), RestoreOption::Latest, Default::default()),
+        )
+        .await
+        .expect("create waited for the reader")
+        .unwrap_err();
+        assert!(
+            matches!(error.as_ref(), Error::NamespaceAlreadyExist(_)),
+            "{error:?}"
+        );
+        assert!(store.inner.in_flight.lock().is_empty());
+    }
+
+    /// The pin is claimed before the entry is locked. A reservation attempt dropped while it
+    /// waits for the lock must release its claim, or the name stays pinned forever.
+    #[tokio::test]
+    async fn a_reservation_attempt_dropped_while_waiting_for_the_lock_unpins() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = create(&store, "foo").await;
+        let entry = store.inner.store.get(&foo).await.unwrap();
+        // A loaded entry for a name the metastore no longer knows (what a destroy racing a
+        // load can leave behind): `create` gets past its metastore check and claims the pin,
+        // then has to wait for the entry's readers.
+        tokio::task::spawn_blocking({
+            let (store, foo) = (store.clone(), foo.clone());
+            move || store.inner.metadata.remove(foo).unwrap()
+        })
+        .await
+        .unwrap();
+        let reader = entry.read().await;
+
+        let attempt = tokio::spawn({
+            let (store, foo) = (store.clone(), foo.clone());
+            async move {
+                store
+                    .create(foo, RestoreOption::Latest, Default::default())
+                    .await
+            }
+        });
+        wait_until_in_flight(&store, &foo).await;
+        attempt.abort();
+        assert!(attempt.await.unwrap_err().is_cancelled());
+        wait_until("the claim is released", || {
+            store.inner.in_flight.lock().is_empty()
+        })
+        .await;
+
+        // With the readers gone, the same attempt finds the loaded entry and is rejected,
+        // leaving nothing pinned.
+        drop(reader);
+        let error = store
+            .create(foo.clone(), RestoreOption::Latest, Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.as_ref(), Error::NamespaceAlreadyExist(_)),
+            "{error:?}"
+        );
+        assert!(store.inner.in_flight.lock().is_empty());
+    }
+
+    /// `destroy` while an operation has just installed its namespace into a fresh cache entry
+    /// (its own entry was evicted) and is still pinned: both entries are taken, so the
+    /// namespace is destroyed rather than left to the eviction listener.
+    #[tokio::test]
+    async fn destroy_takes_both_the_pinned_and_the_cached_entry() {
+        let tmp = tempdir().unwrap();
+        let store = make_store(tmp.path()).await;
+        let foo = create(&store, "foo").await;
+        let cached = store.inner.store.get(&foo).await.unwrap();
+        let pinned: NamespaceEntry = Default::default();
+        store
+            .inner
+            .in_flight
+            .lock()
+            .insert(foo.clone(), pinned.clone());
+
+        store.destroy(foo.clone(), true).await.unwrap();
+
+        assert!(
+            cached.read().await.is_none(),
+            "the loaded namespace was not taken"
+        );
+        assert!(pinned.read().await.is_none());
+        assert!(!store.exists(&foo).await);
+        assert!(!tmp.path().join("dbs").join("foo").exists());
+        store.inner.in_flight.lock().clear();
     }
 
     #[tokio::test]

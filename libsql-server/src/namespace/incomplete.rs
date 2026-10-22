@@ -133,6 +133,11 @@ pub(crate) async fn sweep(base: &Path, meta_store: &MetaStore) -> std::io::Resul
         return Ok(());
     };
     for entry in entries.flatten() {
+        // Only directories can be namespaces; `<file>/.incomplete` would fail with ENOTDIR
+        // and end the sweep.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         if !entry.path().join(INCOMPLETE_MARKER).try_exists()? {
             continue;
         }
@@ -223,8 +228,14 @@ mod test {
         create_marked_dir(&known).unwrap();
         let unmarked = base.join("dbs").join("unmarked");
         std::fs::create_dir_all(&unmarked).unwrap();
+        // A stray file is skipped, not an error that ends the sweep (`<file>/.incomplete`
+        // would fail with ENOTDIR). Named to sort before the directories.
+        let stray = base.join("dbs").join("a-stray-file");
+        std::fs::write(&stray, b"junk").unwrap();
 
         sweep(base, &store).await.unwrap();
+
+        assert!(stray.exists());
 
         assert!(!crashed.exists());
         assert!(

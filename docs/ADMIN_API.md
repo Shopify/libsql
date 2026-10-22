@@ -40,7 +40,8 @@ deleted). For callers:
 
 - `2xx`: the namespace is complete;
 - any other outcome, including a lost connection: retry the same request; a
-  `400 Namespace already exists` on the retry means the earlier attempt did complete.
+  `400 Namespace already exists` on the retry means the earlier attempt did complete. (Once
+  the configuration is persisted, the creation finishes even if the client has gone away.)
 
 In single-namespace mode (`--disable-namespaces`) creating the default namespace is a
 configuration upsert and always succeeds, except with a `dump_url`: a dump can only be imported
