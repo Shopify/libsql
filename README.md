@@ -33,8 +33,14 @@
 
 ---
 
-> [!NOTE]
-> This repository contains libSQL, a fork of SQLite developed by Turso. For the full SQLite rewriten in Rust (also by Turso), please visit [tursodatabase/turso](https://github.com/tursodatabase/turso).
+> [!IMPORTANT]
+> **Turso database and libSQL are two different projects from the same team.**
+>
+> **libSQL** (this repository) is an open-source fork of SQLite. It extends SQLite with features like embedded replicas and remote access, but inherits SQLite's fundamental limitations such as the single-writer model.
+>
+> **[Turso database](https://github.com/tursodatabase/turso)** is a SQLite-compatible database rewritten from scratch in Rust. It is **not** a fork of SQLite — it is a completely new implementation that goes beyond what any SQLite fork can offer, including concurrent writes and bi-directional sync with offline support. Turso is currently in beta.
+>
+> **If you're starting a new project, you probably want to look into [Turso](https://github.com/tursodatabase/turso).** libSQL is actively maintained, but new features are being developed in Turso.
 
 ## Documentation
 

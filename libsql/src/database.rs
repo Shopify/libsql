@@ -411,6 +411,15 @@ cfg_replication! {
             }
         }
 
+        /// Cancels the currently running v1 remote-replica sync, if any, for terminal shutdown/cleanup.
+        #[cfg(feature = "replication")]
+        pub fn cancel_current_sync_for_shutdown(&self) -> Result<bool> {
+            match &self.db_type {
+                DbType::Sync { db, encryption_config: _ } => db.cancel_current_sync_for_shutdown(),
+                _ => Err(Error::SyncNotSupported(format!("{:?}", self.db_type))),
+            }
+        }
+
         /// Sync database from remote until it gets to a given replication_index or further,
         /// and returns the committed frame_no after syncing, if applicable.
         pub async fn sync_until(&self, replication_index: FrameNo) -> Result<Replicated> {
