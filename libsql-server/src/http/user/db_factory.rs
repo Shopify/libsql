@@ -7,12 +7,12 @@ use hyper::HeaderMap;
 use libsql_replication::rpc::replication::NAMESPACE_METADATA_KEY;
 
 use crate::auth::Authenticated;
-use crate::connection::MakeConnection;
+use crate::connection::{MakeConnection, RequestContext};
 use crate::database::Connection;
 use crate::error::Error;
 use crate::namespace::NamespaceName;
 
-use super::AppState;
+use super::{authenticate_for_namespace, AppState};
 
 pub struct MakeConnectionExtractor(pub Arc<dyn MakeConnection<Connection = Connection>>);
 
@@ -90,25 +90,39 @@ fn try_namespace_from_metadata(metadata: &axum::http::HeaderValue) -> Result<Nam
         .and_then(|ns| NamespaceName::from_bytes(ns.into()))
 }
 
-pub struct MakeConnectionExtractorPath(pub Arc<dyn MakeConnection<Connection = Connection>>);
+/// Connection maker and request context for endpoints that select the namespace through a
+/// `:namespace` URL path segment (`/dev/:namespace/v:version/pipeline`).
+///
+/// Both fields are derived from the path namespace, so authentication (JWT key lookup),
+/// the connection, and the [`RequestContext`] that statement authorization later consults
+/// all refer to the same namespace. Any `x-namespace` / `Host` header on the request is
+/// ignored for namespace selection on these routes.
+pub struct PathNamespaceRequest {
+    pub connection_maker: Arc<dyn MakeConnection<Connection = Connection>>,
+    pub ctx: RequestContext,
+}
+
 #[async_trait::async_trait]
-impl FromRequestParts<AppState> for MakeConnectionExtractorPath {
+impl FromRequestParts<AppState> for PathNamespaceRequest {
     type Rejection = Error;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let auth = Authenticated::from_request_parts(parts, state).await?;
         let Path((ns, _)) = Path::<(NamespaceName, String)>::from_request_parts(parts, state)
             .await
             .map_err(|e| Error::InvalidPath(e.to_string()))?;
-        Ok(Self(
-            state
-                .namespaces
-                .with_authenticated(ns, auth, |ns| ns.db.connection_maker())
-                .await?,
-        ))
+        let auth = authenticate_for_namespace(parts, state, &ns).await?;
+        let connection_maker = state
+            .namespaces
+            .with_authenticated(ns.clone(), auth.clone(), |ns| ns.db.connection_maker())
+            .await?;
+        let ctx = RequestContext::new(auth, ns, state.namespaces.meta_store().clone());
+        Ok(Self {
+            connection_maker,
+            ctx,
+        })
     }
 }
 
