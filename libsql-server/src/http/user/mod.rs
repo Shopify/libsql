@@ -38,11 +38,11 @@ use tower_http::{compression::CompressionLayer, cors};
 use crate::auth::{Auth, AuthError, Authenticated, Jwt, Permission, UserAuthContext};
 use crate::connection::{Connection, RequestContext};
 use crate::error::Error;
-use crate::http::user::db_factory::MakeConnectionExtractorPath;
+use crate::http::user::db_factory::PathNamespaceRequest;
 use crate::http::user::timing::timings_middleware;
 use crate::http::user::types::HttpQuery;
 use crate::metrics::LEGACY_HTTP_CALL;
-use crate::namespace::NamespaceStore;
+use crate::namespace::{NamespaceName, NamespaceStore};
 use crate::net::Accept;
 use crate::query::{self, Query};
 use crate::query_analysis::{predict_final_state, Statement, TxnStatus};
@@ -203,10 +203,18 @@ async fn handle_fallback() -> impl IntoResponse {
     (StatusCode::NOT_FOUND).into_response()
 }
 
+/// Hrana pipeline endpoint routed by URL path (`/dev/:namespace/v:version/pipeline`).
+///
+/// Both the connection and the request context come from [`PathNamespaceRequest`], which
+/// derives them from the `:namespace` path segment. They must not be extracted
+/// independently: the header-based [`RequestContext`] extractor resolves the namespace
+/// from `x-namespace`/`Host`, which need not match the path.
 async fn handle_hrana_pipeline(
     AxumState(state): AxumState<AppState>,
-    MakeConnectionExtractorPath(connection_maker): MakeConnectionExtractorPath,
-    ctx: RequestContext,
+    PathNamespaceRequest {
+        connection_maker,
+        ctx,
+    }: PathNamespaceRequest,
     axum::extract::Path((_, version)): axum::extract::Path<(String, String)>,
     req: Request<Body>,
 ) -> Result<Response<Body>, Error> {
@@ -472,21 +480,34 @@ impl FromRequestParts<AppState> for Authenticated {
             state.disable_default_namespace,
             state.disable_namespaces,
         )?;
-        // todo dupe #auth
-        let namespace_jwt_keys = state
-            .namespaces
-            .with(ns.clone(), |ns| ns.jwt_keys())
-            .await??;
-
-        let auth = namespace_jwt_keys
-            .map(Jwt::new)
-            .map(Auth::new)
-            .unwrap_or_else(|| state.user_auth_strategy.clone());
-
-        let context = build_context(&parts.headers, &auth.user_strategy.required_fields());
-
-        Ok(auth.authenticate(context)?)
+        authenticate_for_namespace(parts, state, &ns).await
     }
+}
+
+/// Authenticate a request against `namespace`: use the namespace's own JWT keys when it has
+/// them, otherwise the server-wide user auth strategy.
+///
+/// Every extractor that produces an [`Authenticated`] or a [`RequestContext`] goes through
+/// here, so the namespace whose keys verify the token is always the one the caller is about
+/// to authorize against.
+pub(super) async fn authenticate_for_namespace(
+    parts: &Parts,
+    state: &AppState,
+    namespace: &NamespaceName,
+) -> Result<Authenticated, Error> {
+    let namespace_jwt_keys = state
+        .namespaces
+        .with(namespace.clone(), |ns| ns.jwt_keys())
+        .await??;
+
+    let auth = namespace_jwt_keys
+        .map(Jwt::new)
+        .map(Auth::new)
+        .unwrap_or_else(|| state.user_auth_strategy.clone());
+
+    let context = build_context(&parts.headers, &auth.user_strategy.required_fields());
+
+    Ok(auth.authenticate(context)?)
 }
 
 fn build_context(

@@ -9,3 +9,10 @@ serial-integration = { max-threads = 1 }
 filter = 'test(test::bottomless)'
 test-group = 'serial-integration'
 retries = 3
+
+[[profile.default.overrides]]
+# Under cfg(test) this test runs with TXN_TIMEOUT = 100 ms and a 100 ms SQLite
+# busy timeout. When other test binaries compete for the runner's CPUs it fails
+# with "database is locked" on every retry. Give it the whole runner.
+filter = 'test(connection::connection_core::test::test_many_concurrent)'
+threads-required = 'num-cpus'
